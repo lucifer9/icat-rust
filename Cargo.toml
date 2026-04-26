@@ -1,0 +1,49 @@
+[package]
+name = "icat"
+version = "0.5.2"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "icat"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+cosmic-text = "0.19"
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+fontdb = "0.23"
+glob = "0.3"
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+  "gif",
+  "bmp",
+  "webp",
+  "tiff",
+] }
+latex2mathml = "0.2"
+lopdf = "0.40"
+pulldown-cmark = "0.13"
+quick-xml = "0.39"
+rand = "0.10"
+rar5 = { git = "https://codeberg.org/librar/rar-rs.git", rev = "4189b38" }
+regex = "1.12"
+resvg = "0.47"
+rustix = { version = "1.1", features = ["fs", "process", "stdio", "termios"] }
+sevenz-rust2 = { version = "0.21", default-features = false, features = [
+  "aes256",
+  "compress",
+  "deflate",
+] }
+syntect = { version = "5.3", default-features = false, features = [
+  "default-fancy",
+] }
+tar = "0.4"
+tiny-skia = "0.12"
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+
+[dev-dependencies]
+proptest = "1"
+temp-env = "0.3"
+tempfile = "3"
