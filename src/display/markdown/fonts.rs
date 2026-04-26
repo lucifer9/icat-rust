@@ -2,12 +2,15 @@ use std::path::{Path, PathBuf};
 
 use cosmic_text::FontSystem;
 
+#[cfg(target_os = "macos")]
 const DARWIN_USER_FONT_ROOTS: &[&str] = &["~/Library/Fonts"];
+#[cfg(target_os = "macos")]
 const DARWIN_SYS_FONT_ROOTS: &[&str] = &["/Library/Fonts", "/System/Library/Fonts"];
 #[cfg(not(target_os = "macos"))]
 const LINUX_USER_FONT_ROOTS: &[&str] = &["~/.local/share/fonts"];
 #[cfg(not(target_os = "macos"))]
 const LINUX_SYS_FONT_ROOTS: &[&str] = &["/usr/share/fonts"];
+#[cfg(target_os = "macos")]
 const DARWIN_FALLBACK_FONT: &str = "/Library/Fonts/Arial Unicode.ttf";
 
 // The two preferred CJK families (both platforms, same order as Go)
