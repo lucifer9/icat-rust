@@ -80,11 +80,14 @@ fn has_image_extension(name: &str) -> bool {
             .extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| ext.to_ascii_lowercase()),
-        Some(ext)
-            if matches!(
-                ext.as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif"
-            )
+        Some(ext) if is_image_extension(&ext)
+    )
+}
+
+fn is_image_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif"
     )
 }
 
