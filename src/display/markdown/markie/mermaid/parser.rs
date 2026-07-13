@@ -629,10 +629,9 @@ fn parse_sequence_note(line: &str) -> Option<SequenceElement> {
         ("right", after)
     } else if let Some(after) = rest.strip_prefix("left of ") {
         ("left", after)
-    } else if let Some(after) = rest.strip_prefix("over ") {
-        ("over", after)
     } else {
-        return None;
+        let after = rest.strip_prefix("over ")?;
+        ("over", after)
     };
 
     let colon_pos = after_prefix.find(':')?;
@@ -1790,6 +1789,23 @@ sequenceDiagram
         } else {
             panic!("Expected sequence diagram");
         }
+    }
+
+    #[test]
+    fn test_parse_sequence_note_positions() {
+        assert!(matches!(
+            parse_sequence_note("Note left of Bob: hi"),
+            Some(SequenceElement::Note { position, participant, text })
+                if position == "left" && participant == "Bob" && text == "hi"
+        ));
+        assert!(matches!(
+            parse_sequence_note("Note over Alice: spanning"),
+            Some(SequenceElement::Note { position, participant, .. })
+                if position == "over" && participant == "Alice"
+        ));
+        assert!(parse_sequence_note("Note beside Alice: nope").is_none());
+        assert!(parse_sequence_note("Note over : no participant").is_none());
+        assert!(parse_sequence_note("Note over Alice no colon").is_none());
     }
 
     #[test]

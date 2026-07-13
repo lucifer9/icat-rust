@@ -6,6 +6,7 @@ pub(super) mod mermaid;
 pub(super) mod xml;
 
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight};
 use image::{DynamicImage, ImageBuffer, Rgba};
@@ -76,16 +77,26 @@ impl TextMeasure for FontSystemMeasure<'_> {
     }
 }
 
+// Loading system fonts can take hundreds of milliseconds; do it once and share
+// the database across every SVG render (formulas, Mermaid diagrams, ...).
+static SVG_FONTDB: OnceLock<Arc<fontdb::Database>> = OnceLock::new();
+
 pub(super) fn svg_to_image(svg: &str) -> Result<DynamicImage, String> {
-    let mut opts = usvg::Options::default();
-    {
-        let fontdb = opts.fontdb_mut();
-        fontdb.load_system_fonts();
-        let local_fonts = Path::new("fonts");
-        if local_fonts.is_dir() {
-            fontdb.load_fonts_dir(local_fonts);
-        }
-    }
+    let fontdb = SVG_FONTDB
+        .get_or_init(|| {
+            let mut db = fontdb::Database::new();
+            db.load_system_fonts();
+            let local_fonts = Path::new("fonts");
+            if local_fonts.is_dir() {
+                db.load_fonts_dir(local_fonts);
+            }
+            Arc::new(db)
+        })
+        .clone();
+    let opts = usvg::Options {
+        fontdb,
+        ..usvg::Options::default()
+    };
 
     let tree =
         usvg::Tree::from_str(svg, &opts).map_err(|err| format!("failed to parse SVG: {err}"))?;

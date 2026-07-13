@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use ::image::{DynamicImage, GrayImage, RgbImage};
 use lopdf::content::{Content, Operation};
-use lopdf::{Document, Object};
+use lopdf::{Document, LoadOptions, Object};
 use regex::Regex;
 
 use crate::display::image;
@@ -17,6 +17,11 @@ const MAX_PDF_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PDF_DECOMPRESSED_STREAM_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(test)]
 const MAX_PDF_DECOMPRESSED_STREAM_BYTES: usize = 128; // small limit for testing
+
+#[cfg(not(test))]
+const MAX_PDF_CMAP_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(test)]
+const MAX_PDF_CMAP_BYTES: usize = 512;
 
 static RE_RANGE_SECTION: OnceLock<Regex> = OnceLock::new();
 static RE_RANGE_ENTRY: OnceLock<Regex> = OnceLock::new();
@@ -95,7 +100,7 @@ fn run_pdf_strategies(
 /// Try to load a PDF, falling back to scanning for valid `%%EOF` boundaries
 /// when the standard loader fails (e.g. a malformed incremental-update /Prev pointer).
 fn load_pdf_lenient(data: &[u8]) -> Result<Document, lopdf::Error> {
-    if let Ok(doc) = Document::load_mem(data) {
+    if let Ok(doc) = load_pdf_mem_bounded(data) {
         return Ok(doc);
     }
     // Collect all %%EOF positions (last-to-first so we try the most-complete version first)
@@ -108,12 +113,19 @@ fn load_pdf_lenient(data: &[u8]) -> Result<Document, lopdf::Error> {
         .collect();
     positions.reverse();
     for end in positions {
-        if let Ok(doc) = Document::load_mem(&data[..end]) {
+        if let Ok(doc) = load_pdf_mem_bounded(&data[..end]) {
             return Ok(doc);
         }
     }
     // Last resort: full data again (will fail with the original error)
-    Document::load_mem(data)
+    load_pdf_mem_bounded(data)
+}
+
+fn load_pdf_mem_bounded(data: &[u8]) -> Result<Document, lopdf::Error> {
+    Document::load_mem_with_options(
+        data,
+        LoadOptions::with_max_decompressed_size(MAX_PDF_DECOMPRESSED_STREAM_BYTES),
+    )
 }
 
 fn prepare_pdf(
@@ -134,7 +146,7 @@ fn prepare_pdf(
                 image_data,
             });
         }
-        let text = extract_page_text(&document, effective_page as u32, scan_cmaps_from_raw(data))?;
+        let text = extract_page_text(&document, effective_page as u32, &scan_cmaps_from_raw(data))?;
         let trimmed = text.trim().to_string();
         if trimmed.len() >= MIN_PDF_TEXT_CHARS || !trimmed.is_empty() {
             return Ok(PdfResult {
@@ -146,7 +158,7 @@ fn prepare_pdf(
         return Err(format!("failed to extract content from PDF {label}").into());
     }
 
-    let text = extract_text_all_pages(&document, scan_cmaps_from_raw(data))?;
+    let text = extract_text_all_pages(&document, &scan_cmaps_from_raw(data))?;
     if text.trim().len() >= MIN_PDF_TEXT_CHARS {
         return Ok(PdfResult {
             warning,
@@ -192,11 +204,11 @@ fn clamp_pdf_page(page: usize, total: usize, label: &str) -> (usize, Option<Stri
 
 fn extract_text_all_pages(
     document: &Document,
-    raw_fallback: CidToUnicode,
+    raw_fallback: &CidToUnicode,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut out = String::new();
     for page_number in document.get_pages().keys().copied() {
-        let page_text = extract_page_text(document, page_number, raw_fallback.clone())?;
+        let page_text = extract_page_text(document, page_number, raw_fallback)?;
         let page_text = page_text.trim();
         if page_text.is_empty() {
             continue;
@@ -219,13 +231,20 @@ fn extract_text_all_pages(
 fn extract_page_text(
     document: &Document,
     page_number: u32,
-    raw_fallback: CidToUnicode,
+    raw_fallback: &CidToUnicode,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let pages = document.get_pages();
     let page_id = *pages
         .get(&page_number)
         .ok_or_else(|| format!("page {page_number} not found"))?;
-    let content = document.get_page_content(page_id)?;
+    let content = document
+        .get_page_content_with_limit(page_id, MAX_PDF_DECOMPRESSED_STREAM_BYTES)
+        .map_err(|err| {
+            format!(
+                "failed to read page content within {} byte limit: {err}",
+                MAX_PDF_DECOMPRESSED_STREAM_BYTES
+            )
+        })?;
     if content.len() > MAX_PDF_DECOMPRESSED_STREAM_BYTES {
         return Err(format!(
             "page content exceeds {} MiB limit",
@@ -234,15 +253,18 @@ fn extract_page_text(
         .into());
     }
     let operations = Content::decode(&content)?.operations;
-    let font_cmaps = collect_font_cmaps(document, page_id, raw_fallback);
-    Ok(extract_text_from_operations(&operations, &font_cmaps))
+    let font_cmaps = collect_font_cmaps(document, page_id)?;
+    Ok(extract_text_from_operations(
+        &operations,
+        &font_cmaps,
+        raw_fallback,
+    ))
 }
 
 fn collect_font_cmaps(
     document: &Document,
     page_id: lopdf::ObjectId,
-    raw_fallback: CidToUnicode,
-) -> HashMap<Vec<u8>, CidToUnicode> {
+) -> Result<HashMap<Vec<u8>, CidToUnicode>, Box<dyn std::error::Error>> {
     let mut result = HashMap::new();
     if let Ok(fonts) = document.get_page_fonts(page_id) {
         for (name, font) in fonts {
@@ -250,8 +272,19 @@ fn collect_font_cmaps(
                 && let Ok(reference) = to_unicode.as_reference()
                 && let Ok(object) = document.get_object(reference)
                 && let Ok(stream) = object.as_stream()
-                && let Ok(content) = stream.decompressed_content()
             {
+                let content = match stream.decompressed_content_with_limit(MAX_PDF_CMAP_BYTES) {
+                    Ok(content) => content,
+                    Err(lopdf::Error::Decompress(
+                        lopdf::DecompressError::MemoryLimitExceeded { .. },
+                    )) => {
+                        return Err(format!(
+                            "font ToUnicode CMap exceeds {MAX_PDF_CMAP_BYTES} byte limit"
+                        )
+                        .into());
+                    }
+                    Err(_) => continue,
+                };
                 let cmap = parse_cmap(&String::from_utf8_lossy(&content));
                 if !cmap.is_empty() {
                     result.insert(name.clone(), cmap);
@@ -259,10 +292,7 @@ fn collect_font_cmaps(
             }
         }
     }
-    if !raw_fallback.is_empty() {
-        result.insert(b"__raw_fallback__".to_vec(), raw_fallback);
-    }
-    result
+    Ok(result)
 }
 
 fn extract_largest_image(
@@ -273,22 +303,17 @@ fn extract_largest_image(
         .get_pages()
         .get(&page_number)
         .ok_or_else(|| format!("page {page_number} not found"))?;
-    let images = document.get_page_images(page_id)?;
-    let mut best_area = -1_i64;
-    let mut best = None;
+    let mut images = document.get_page_images(page_id)?;
+    // Decoding can be expensive (multi-MiB inflate + PNG encode); try images
+    // largest-first and stop at the first that decodes.
+    images.sort_by_key(|image| std::cmp::Reverse(image.width.saturating_mul(image.height)));
     for image in images {
-        let area = image.width.saturating_mul(image.height);
         let filters = image.filters.clone().unwrap_or_default();
-        let data = match decode_pdf_image(&filters, image.content, image.origin_dict) {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
-        if area > best_area {
-            best_area = area;
-            best = Some(data);
+        if let Ok(data) = decode_pdf_image(&filters, image.content, image.origin_dict) {
+            return Ok(data);
         }
     }
-    best.ok_or_else(|| String::from("no decodable images found on page").into())
+    Err(String::from("no decodable images found on page").into())
 }
 
 fn decode_pdf_image(
@@ -296,10 +321,14 @@ fn decode_pdf_image(
     content: &[u8],
     dict: &lopdf::Dictionary,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if filters.iter().any(|f| f == "DCTDecode") || ::image::guess_format(content).is_ok() {
-        return Ok(content.to_vec());
-    }
-    if filters.iter().any(|f| f == "JPXDecode") {
+    if filters
+        .iter()
+        .any(|f| matches!(f.as_str(), "DCTDecode" | "JPXDecode"))
+        || ::image::guess_format(content).is_ok()
+    {
+        // Encoded images are passed through unchanged, but validate them first
+        // so a corrupt or unsupported candidate does not block smaller images.
+        imgutil::decode_with_limits(content)?;
         return Ok(content.to_vec());
     }
     if filters.iter().any(|f| f == "CCITTFaxDecode") {
@@ -599,14 +628,16 @@ fn parse_cmap(data: &str) -> CidToUnicode {
 fn extract_text_from_operations(
     operations: &[Operation],
     font_cmaps: &HashMap<Vec<u8>, CidToUnicode>,
+    raw_fallback: &CidToUnicode,
 ) -> String {
-    let runs = collect_pdf_text_runs(operations, font_cmaps);
+    let runs = collect_pdf_text_runs(operations, font_cmaps, raw_fallback);
     render_pdf_text_runs(&runs)
 }
 
 fn collect_pdf_text_runs(
     operations: &[Operation],
     font_cmaps: &HashMap<Vec<u8>, CidToUnicode>,
+    raw_fallback: &CidToUnicode,
 ) -> Vec<PdfTextRun> {
     let mut runs = Vec::new();
     let mut current_font = Vec::new();
@@ -677,7 +708,7 @@ fn collect_pdf_text_runs(
             "Tj" => {
                 if let Some(text) = decode_pdf_text(
                     operation.operands.first(),
-                    current_cmap(font_cmaps, &current_font),
+                    current_cmap(font_cmaps, raw_fallback, &current_font),
                 ) {
                     append_pdf_run(
                         &mut runs,
@@ -695,9 +726,10 @@ fn collect_pdf_text_runs(
                 if let Some(Object::Array(items)) = operation.operands.first() {
                     let mut text = String::new();
                     for item in items {
-                        if let Some(part) =
-                            decode_pdf_text(Some(item), current_cmap(font_cmaps, &current_font))
-                        {
+                        if let Some(part) = decode_pdf_text(
+                            Some(item),
+                            current_cmap(font_cmaps, raw_fallback, &current_font),
+                        ) {
                             text.push_str(&part);
                         }
                     }
@@ -759,11 +791,12 @@ fn as_f64(object: &Object) -> Option<f64> {
 
 fn current_cmap<'a>(
     font_cmaps: &'a HashMap<Vec<u8>, CidToUnicode>,
+    raw_fallback: &'a CidToUnicode,
     current_font: &[u8],
 ) -> Option<&'a CidToUnicode> {
     font_cmaps
         .get(current_font)
-        .or_else(|| font_cmaps.get(b"__raw_fallback__".as_slice()))
+        .or_else(|| (!raw_fallback.is_empty()).then_some(raw_fallback))
 }
 
 fn decode_pdf_text(object: Option<&Object>, cmap: Option<&CidToUnicode>) -> Option<String> {
@@ -948,22 +981,25 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
-    use lopdf::dictionary;
+    use lopdf::{Stream, dictionary};
     use std::io::Write;
 
+    const SAMPLE_TEXT_CONTENT: &str = "BT\n/F1 12 Tf\n1 0 0 1 72 720 Tm\n<0001000200030004> Tj\nET";
+    const SAMPLE_TEXT_CMAP: &str = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n1 begincodespacerange\n<0001> <0004>\nendcodespacerange\n4 beginbfchar\n<0001> <4F60>\n<0002> <597D>\n<0003> <4E16>\n<0004> <754C>\nendbfchar\nendcmap\nend\nend";
+
     fn sample_text_pdf_data() -> Vec<u8> {
-        let content = "BT\n/F1 12 Tf\n1 0 0 1 72 720 Tm\n<0001000200030004> Tj\nET";
-        let cmap = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n1 begincodespacerange\n<0001> <0004>\nendcodespacerange\n4 beginbfchar\n<0001> <4F60>\n<0002> <597D>\n<0003> <4E16>\n<0004> <754C>\nendbfchar\nendcmap\nend\nend";
-        build_test_pdf(content, Some(cmap))
+        build_test_pdf(SAMPLE_TEXT_CONTENT, Some(SAMPLE_TEXT_CMAP), true)
     }
 
-    fn build_test_pdf(content: &str, cmap: Option<&str>) -> Vec<u8> {
+    /// `font_has_to_unicode: false` emits the cmap stream without linking it to
+    /// the font, so text extraction must rely on the raw-scan fallback.
+    fn build_test_pdf(content: &str, cmap: Option<&str>, font_has_to_unicode: bool) -> Vec<u8> {
         let mut objects = vec![
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
             "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
         ];
         objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".to_string());
-        objects.push(if cmap.is_some() {
+        objects.push(if cmap.is_some() && font_has_to_unicode {
             "<< /Type /Font /Subtype /Type0 /BaseFont /Helvetica /ToUnicode 6 0 R >>".to_string()
         } else {
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string()
@@ -1005,6 +1041,69 @@ mod tests {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(data).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn xref_stream_pdf(content: &[u8]) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.5\n");
+        let object_offset = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n");
+        pdf.extend_from_slice(
+            format!(
+                "<< /Type /XRef /Size 1 /W [1 1 1] /Root 1 0 R /Filter /FlateDecode /Length {} >>\n",
+                content.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(b"stream\n");
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        pdf.extend_from_slice(format!("startxref\n{object_offset}\n%%EOF").as_bytes());
+        pdf
+    }
+
+    fn build_pdf_doc_with_content_streams(streams: Vec<Stream>) -> Document {
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let content_refs = streams
+            .into_iter()
+            .map(|stream| Object::Reference(doc.add_object(stream)))
+            .collect::<Vec<_>>();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {},
+            "Contents" => Object::Array(content_refs),
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc
+    }
+
+    #[test]
+    fn load_pdf_lenient_bounds_xref_stream_decompression() {
+        let compressed = zlib_bytes(&[0; MAX_PDF_DECOMPRESSED_STREAM_BYTES + 1]);
+        assert!(compressed.len() < MAX_PDF_DECOMPRESSED_STREAM_BYTES);
+        let pdf = xref_stream_pdf(&compressed);
+
+        let err = load_pdf_lenient(&pdf).unwrap_err();
+
+        assert!(matches!(
+            err,
+            lopdf::Error::Decompress(lopdf::DecompressError::MemoryLimitExceeded { .. })
+        ));
     }
 
     #[test]
@@ -1055,7 +1154,7 @@ mod tests {
         let mut font_cmaps = HashMap::new();
         font_cmaps.insert(b"F1".to_vec(), cmap);
         assert_eq!(
-            extract_text_from_operations(&content.operations, &font_cmaps),
+            extract_text_from_operations(&content.operations, &font_cmaps, &CidToUnicode::new()),
             "你好"
         );
     }
@@ -1091,7 +1190,11 @@ mod tests {
             ],
         };
         assert_eq!(
-            extract_text_from_operations(&content.operations, &HashMap::new()),
+            extract_text_from_operations(
+                &content.operations,
+                &HashMap::new(),
+                &CidToUnicode::new()
+            ),
             "hello"
         );
     }
@@ -1118,7 +1221,11 @@ mod tests {
             ],
         };
         assert_eq!(
-            extract_text_from_operations(&content.operations, &HashMap::new()),
+            extract_text_from_operations(
+                &content.operations,
+                &HashMap::new(),
+                &CidToUnicode::new()
+            ),
             "first\nsecond"
         );
     }
@@ -1145,7 +1252,11 @@ mod tests {
             ],
         };
         assert_eq!(
-            extract_text_from_operations(&content.operations, &HashMap::new()),
+            extract_text_from_operations(
+                &content.operations,
+                &HashMap::new(),
+                &CidToUnicode::new()
+            ),
             "base\n indented"
         );
     }
@@ -1169,7 +1280,11 @@ mod tests {
             ],
         };
         assert_eq!(
-            extract_text_from_operations(&content.operations, &HashMap::new()),
+            extract_text_from_operations(
+                &content.operations,
+                &HashMap::new(),
+                &CidToUnicode::new()
+            ),
             "first\nsecond"
         );
     }
@@ -1180,6 +1295,38 @@ mod tests {
         let result = prepare_pdf(&data, "sample-text.pdf", 0).unwrap();
         assert_eq!(result.text.trim(), "你好世界");
         assert!(result.image_data.is_empty());
+    }
+
+    #[test]
+    fn prepare_pdf_uses_raw_cmap_fallback_when_font_lacks_tounicode() {
+        let data = build_test_pdf(SAMPLE_TEXT_CONTENT, Some(SAMPLE_TEXT_CMAP), false);
+        let result = prepare_pdf(&data, "raw-fallback.pdf", 0).unwrap();
+        assert_eq!(result.text.trim(), "你好世界");
+    }
+
+    #[test]
+    fn current_cmap_prefers_font_then_nonempty_fallback() {
+        let mut font_map = CidToUnicode::new();
+        font_map.insert(1, 'A');
+        let mut cmaps = HashMap::new();
+        cmaps.insert(b"F1".to_vec(), font_map);
+        let mut fallback = CidToUnicode::new();
+        fallback.insert(1, 'B');
+
+        assert_eq!(
+            current_cmap(&cmaps, &fallback, b"F1").unwrap().get(&1),
+            Some(&'A'),
+            "the font's own cmap wins"
+        );
+        assert_eq!(
+            current_cmap(&cmaps, &fallback, b"F2").unwrap().get(&1),
+            Some(&'B'),
+            "unknown fonts use the non-empty fallback"
+        );
+        assert!(
+            current_cmap(&cmaps, &CidToUnicode::new(), b"F2").is_none(),
+            "an empty fallback yields no cmap"
+        );
     }
 
     #[test]
@@ -1198,13 +1345,99 @@ mod tests {
             oversized_content.len() > 128,
             "sanity: content must exceed test limit"
         );
-        let pdf_data = build_test_pdf(&oversized_content, None);
+        let pdf_data = build_test_pdf(&oversized_content, None, false);
         let err = prepare_pdf(&pdf_data, "big.pdf", 1).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("page content") || msg.contains("limit"),
             "expected 'page content' or 'limit' in error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn extract_page_text_bounds_flate_decompression() {
+        let compressed = zlib_bytes(&[b' '; MAX_PDF_DECOMPRESSED_STREAM_BYTES + 1]);
+        assert!(
+            compressed.len() < MAX_PDF_DECOMPRESSED_STREAM_BYTES,
+            "fixture should be small before decompression"
+        );
+        let doc = build_pdf_doc_with_content_streams(vec![Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            compressed,
+        )]);
+
+        let err = extract_page_text(&doc, 1, &CidToUnicode::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("limit"),
+            "expected bounded decompression error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_page_text_reads_flate_content_within_limit() {
+        let content = zlib_bytes(b"BT (hello) Tj ET");
+        let doc = build_pdf_doc_with_content_streams(vec![Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            content,
+        )]);
+
+        let text = extract_page_text(&doc, 1, &CidToUnicode::new()).unwrap();
+
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn extract_page_text_separates_multiple_content_streams_after_comment() {
+        let doc = build_pdf_doc_with_content_streams(vec![
+            Stream::new(
+                lopdf::Dictionary::new(),
+                b"BT (hello) Tj % comment at stream end".to_vec(),
+            ),
+            Stream::new(lopdf::Dictionary::new(), b"(world) Tj ET".to_vec()),
+        ]);
+
+        let text = extract_page_text(&doc, 1, &CidToUnicode::new()).unwrap();
+
+        assert_eq!(text, "hello\nworld");
+    }
+
+    #[test]
+    fn collect_font_cmaps_bounds_tounicode_decompression() {
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let cmap_id = doc.add_object(Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            zlib_bytes(&[b'A'; MAX_PDF_CMAP_BYTES + 1]),
+        ));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "Helvetica",
+            "ToUnicode" => cmap_id,
+        });
+        let content_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), Vec::new()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+            "Contents" => content_id,
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+
+        let err = collect_font_cmaps(&doc, page_id).unwrap_err();
+
+        assert!(err.to_string().contains("ToUnicode CMap"));
+        assert!(err.to_string().contains("limit"));
     }
 
     #[test]
@@ -1248,6 +1481,114 @@ mod tests {
         let png = decode_flate_raw_image(&content, &dict).unwrap();
 
         assert!(imgutil::is_png(&png));
+    }
+
+    /// Build an in-memory document whose single page holds the given DeviceRGB
+    /// images as (width, height, filter, raw stream bytes).
+    fn build_pdf_doc_with_images(images: &[(i64, i64, &str, Vec<u8>)]) -> Document {
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let mut xobject = lopdf::Dictionary::new();
+        for (i, (width, height, filter, data)) in images.iter().enumerate() {
+            let dict = dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => *width,
+                "Height" => *height,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => Object::Name(filter.as_bytes().to_vec()),
+            };
+            let id = doc.add_object(Stream::new(dict, data.clone()));
+            xobject.set(format!("Im{i}").into_bytes(), id);
+        }
+        let content_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), Vec::new()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "XObject" => Object::Dictionary(xobject) },
+            "Contents" => content_id,
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc
+    }
+
+    fn png_dimensions(data: &[u8]) -> (u32, u32) {
+        let img = ::image::load_from_memory(data).unwrap();
+        (img.width(), img.height())
+    }
+
+    #[test]
+    fn extract_largest_image_picks_largest_decodable() {
+        let doc = build_pdf_doc_with_images(&[
+            (1, 1, "FlateDecode", zlib_bytes(&[10, 20, 30])),
+            (2, 1, "FlateDecode", zlib_bytes(&[1, 2, 3, 4, 5, 6])),
+        ]);
+        let png = extract_largest_image(&doc, 1).unwrap();
+        assert!(imgutil::is_png(&png));
+        assert_eq!(png_dimensions(&png), (2, 1));
+    }
+
+    #[test]
+    fn extract_largest_image_accepts_valid_dct_jpeg() {
+        let image = ::image::RgbImage::from_pixel(2, 2, ::image::Rgb([20, 40, 60]));
+        let mut jpeg = Vec::new();
+        ::image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode_image(&DynamicImage::ImageRgb8(image))
+            .unwrap();
+        let doc = build_pdf_doc_with_images(&[
+            (2, 2, "DCTDecode", jpeg),
+            (1, 1, "FlateDecode", zlib_bytes(&[10, 20, 30])),
+        ]);
+
+        let encoded = extract_largest_image(&doc, 1).unwrap();
+
+        assert_eq!(png_dimensions(&encoded), (2, 2));
+    }
+
+    #[test]
+    fn extract_largest_image_falls_back_when_largest_is_corrupt() {
+        let doc = build_pdf_doc_with_images(&[
+            (4, 4, "FlateDecode", b"not zlib data".to_vec()),
+            (1, 1, "FlateDecode", zlib_bytes(&[10, 20, 30])),
+        ]);
+        let png = extract_largest_image(&doc, 1).unwrap();
+        assert!(imgutil::is_png(&png));
+        assert_eq!(png_dimensions(&png), (1, 1));
+    }
+
+    #[test]
+    fn extract_largest_image_errors_when_nothing_decodes() {
+        let doc = build_pdf_doc_with_images(&[(2, 2, "FlateDecode", b"broken".to_vec())]);
+        let err = extract_largest_image(&doc, 1).unwrap_err();
+        assert!(err.to_string().contains("no decodable images"));
+    }
+
+    #[test]
+    fn extract_largest_image_skips_corrupt_dct_and_unsupported_jpx() {
+        let doc = build_pdf_doc_with_images(&[
+            (4, 4, "DCTDecode", b"not a jpeg".to_vec()),
+            (3, 3, "JPXDecode", b"not a jpeg 2000 image".to_vec()),
+            (1, 1, "FlateDecode", zlib_bytes(&[10, 20, 30])),
+        ]);
+
+        let png = extract_largest_image(&doc, 1).unwrap();
+
+        assert!(imgutil::is_png(&png));
+        assert_eq!(png_dimensions(&png), (1, 1));
     }
 
     #[test]

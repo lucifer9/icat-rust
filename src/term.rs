@@ -248,11 +248,6 @@ mod tests {
     }
 
     #[test]
-    fn is_terminal_stdout() {
-        let _ = is_terminal(&std::io::stdout());
-    }
-
-    #[test]
     fn size_from_full_winsize_requires_all_non_zero() {
         let ws = Winsize {
             ws_row: 24,

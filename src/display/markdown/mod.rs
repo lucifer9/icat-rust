@@ -9,9 +9,9 @@ use std::sync::{Mutex, OnceLock};
 
 use cosmic_text::{
     Attrs, Buffer, Color, Family, FontSystem, LayoutRun, Metrics, PhysicalGlyph, Renderer, Shaping,
-    SwashCache, Weight, render_decoration,
+    Style, SwashCache, UnderlineStyle, Weight, render_decoration,
 };
-use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba, imageops};
+use image::{DynamicImage, ImageBuffer, Rgba, imageops};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use tiny_skia::{BlendMode, Paint as SkPaint, Pixmap, Rect as SkRect, Transform};
 
@@ -737,8 +737,15 @@ fn collect_list_items(events: &[Event<'_>], idx: &mut usize) -> (Vec<Vec<InlineT
                             }
                         }
                         _ => {
+                            let before = *idx;
                             let toks = collect_inline_tokens(events, idx, InlineState::regular());
                             item_tokens.extend(toks);
+                            // collect_inline_tokens stops before unmatched End events
+                            // (e.g. a blockquote nested in the item); skip them so the
+                            // loop always makes progress.
+                            if *idx == before {
+                                *idx += 1;
+                            }
                         }
                     }
                 }
@@ -1013,9 +1020,19 @@ fn layout_blocks_inner(
                         rendered_blocks.push(RenderBlock::Image { image, x, y });
                         y += rendered_blocks.last().unwrap().height() + (font_size * 0.6) as u32;
                     }
-                } else if !flatten_tokens(tokens).trim().is_empty() {
-                    let layout =
-                        layout_inline_tokens(font_system, tokens, content_width, font_size as f32)?;
+                } else if !flatten_tokens(tokens).trim().is_empty()
+                    || tokens
+                        .iter()
+                        .any(|t| matches!(t, InlineToken::Image { .. }))
+                {
+                    let layout = layout_inline_tokens(
+                        font_system,
+                        tokens,
+                        content_width,
+                        font_size as f32,
+                        base_dir,
+                        &mut image_cache,
+                    )?;
                     if layout.height > 0 {
                         rendered_blocks.push(RenderBlock::Inline {
                             layout,
@@ -1049,6 +1066,8 @@ fn layout_blocks_inner(
                         item,
                         content_width.saturating_sub(40),
                         font_size as f32,
+                        base_dir,
+                        &mut image_cache,
                     )?;
                     rendered_blocks.push(RenderBlock::Text {
                         layout: marker,
@@ -1195,6 +1214,8 @@ fn layout_blocks_inner(
                             cell_inner,
                             font_size as f32,
                             *is_header,
+                            base_dir,
+                            &mut image_cache,
                         )?;
                         max_h = max_h.max(layout.height);
                         cell_layouts.push(layout);
@@ -1206,6 +1227,8 @@ fn layout_blocks_inner(
                             &[],
                             cell_inner,
                             font_size as f32,
+                            base_dir,
+                            &mut image_cache,
                         )?);
                     }
                     all_row_data.push((cell_layouts, max_h + padding * 2, *is_header));
@@ -1445,6 +1468,40 @@ fn attrs_for_kind(kind: FontKind, color: Option<u32>) -> Attrs<'static> {
     attrs
 }
 
+#[derive(Debug, Clone, Copy)]
+struct InlineStyle {
+    bold: bool,
+    italic: bool,
+    mono: bool,
+    color: Option<u32>,
+    underline: bool,
+}
+
+fn inline_attrs(style: InlineStyle) -> Attrs<'static> {
+    let mut attrs = Attrs::new().family(if style.mono {
+        Family::Monospace
+    } else {
+        Family::SansSerif
+    });
+    if style.bold {
+        attrs = attrs.weight(Weight::BOLD);
+    }
+    if style.italic {
+        attrs = attrs.style(Style::Italic);
+    }
+    if let Some(color) = style.color {
+        attrs = attrs.color(Color::rgb(
+            ((color >> 16) & 0xff) as u8,
+            ((color >> 8) & 0xff) as u8,
+            (color & 0xff) as u8,
+        ));
+    }
+    if style.underline {
+        attrs = attrs.underline(UnderlineStyle::Single);
+    }
+    attrs
+}
+
 fn text_layout_from_buffer(buffer: Buffer, color: Color) -> TextLayout {
     let mut text_width = 0_f32;
     let mut text_height = 0_f32;
@@ -1482,8 +1539,18 @@ fn layout_inline_tokens(
     tokens: &[InlineToken],
     width: u32,
     font_size: f32,
+    base_dir: &Path,
+    image_cache: &mut HashMap<PathBuf, DynamicImage>,
 ) -> Result<InlineLayout, Box<dyn std::error::Error>> {
-    layout_inline_tokens_with_defaults(font_system, tokens, width, font_size, false)
+    layout_inline_tokens_with_defaults(
+        font_system,
+        tokens,
+        width,
+        font_size,
+        false,
+        base_dir,
+        image_cache,
+    )
 }
 
 fn layout_inline_tokens_with_defaults(
@@ -1492,8 +1559,9 @@ fn layout_inline_tokens_with_defaults(
     width: u32,
     font_size: f32,
     default_bold: bool,
+    base_dir: &Path,
+    image_cache: &mut HashMap<PathBuf, DynamicImage>,
 ) -> Result<InlineLayout, Box<dyn std::error::Error>> {
-    let space_width = measure_inline_text_width(font_system, " ", font_size, FontKind::Regular);
     let line_height = (font_size * 1.4).ceil() as u32;
     let mut lines: Vec<InlineLine> = vec![InlineLine::default()];
 
@@ -1502,36 +1570,19 @@ fn layout_inline_tokens_with_defaults(
             InlineToken::Text {
                 text,
                 bold,
-                italic: _,
+                italic,
                 mono,
                 color,
-                underline: _,
+                underline,
             } => {
-                let kind = if *mono {
-                    FontKind::Mono
-                } else if *bold || default_bold {
-                    FontKind::Bold
-                } else {
-                    FontKind::Regular
+                let style = InlineStyle {
+                    bold: *bold || default_bold,
+                    italic: *italic,
+                    mono: *mono,
+                    color: *color,
+                    underline: *underline,
                 };
-                for (idx, part) in text.split_inclusive(char::is_whitespace).enumerate() {
-                    if part.is_empty() {
-                        continue;
-                    }
-                    let part = if idx == 0 { part } else { part.trim_start() };
-                    if part.is_empty() {
-                        continue;
-                    }
-                    push_inline_text(
-                        font_system,
-                        &mut lines,
-                        part,
-                        width,
-                        font_size,
-                        kind,
-                        *color,
-                    )?;
-                }
+                push_inline_words(font_system, &mut lines, text, width, font_size, style)?;
             }
             InlineToken::Math { text, display } => {
                 let rendered = math::render_math(text, font_system, font_size, *display)
@@ -1539,11 +1590,17 @@ fn layout_inline_tokens_with_defaults(
                 push_inline_image(&mut lines, rendered.image, rendered.baseline, width);
             }
             InlineToken::SoftBreak => {
-                let current = lines.last_mut().unwrap();
-                current.width += space_width;
+                let space_width = cached_space_width(font_system, font_size);
+                lines.last_mut().unwrap().width += space_width;
             }
             InlineToken::HardBreak => lines.push(InlineLine::default()),
-            InlineToken::Image { .. } => {}
+            InlineToken::Image { path, .. } => {
+                let resolved = resolve_image_path(base_dir, path);
+                if let Some(image) = load_inline_image(&resolved, image_cache)? {
+                    let baseline = image.height();
+                    push_inline_image(&mut lines, image, baseline, width);
+                }
+            }
         }
     }
 
@@ -1607,39 +1664,158 @@ enum InlineLineItem {
     },
 }
 
-fn push_inline_text(
+// Lay out one styled text token: split it into wrap segments, measure them in a
+// single shaping pass, then emit one merged buffer per line instead of one
+// buffer per segment.
+fn push_inline_words(
     font_system: &mut FontSystem,
     lines: &mut Vec<InlineLine>,
     text: &str,
     max_width: u32,
     font_size: f32,
-    kind: FontKind,
-    color: Option<u32>,
+    style: InlineStyle,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let layout = layout_text_with_attrs(
-        font_system,
-        text,
-        max_width,
-        font_size,
-        attrs_for_kind(kind, color),
-    )?;
-    if lines.last().unwrap().width > 0
-        && lines.last().unwrap().width.saturating_add(layout.width) > max_width
-    {
-        lines.push(InlineLine::default());
+    let segments = split_inline_segments(text, style.mono);
+    if segments.is_empty() {
+        return Ok(());
     }
-    let line = lines.last_mut().unwrap();
-    let x = line.width;
-    line.width = line.width.saturating_add(layout.width);
-    let baseline = (font_size * 0.9) as u32;
-    line.baseline = line.baseline.max(baseline);
-    line.descent = line.descent.max(layout.height.saturating_sub(baseline));
-    line.items.push(InlineLineItem::Text {
-        layout,
-        x,
-        baseline,
-    });
+
+    let widths = measure_segment_widths(font_system, &segments, font_size, style);
+    let mut i = 0;
+    while i < segments.len() {
+        if lines.last().unwrap().width > 0
+            && lines.last().unwrap().width.saturating_add(widths[i]) > max_width
+        {
+            lines.push(InlineLine::default());
+        }
+        let avail = max_width.saturating_sub(lines.last().unwrap().width);
+        let start = i;
+        let mut total = widths[i];
+        i += 1;
+        while i < segments.len() && total.saturating_add(widths[i]) <= avail {
+            total += widths[i];
+            i += 1;
+        }
+        let segment: String = segments[start..i].concat();
+        // The segment was measured to fit on one line, so lay it out unbounded;
+        // a lone word wider than the content width keeps wrapping internally.
+        let layout_width = if i - start == 1 && widths[start] > max_width {
+            max_width
+        } else {
+            u32::MAX / 2
+        };
+        let layout = layout_text_with_attrs(
+            font_system,
+            &segment,
+            layout_width,
+            font_size,
+            inline_attrs(style),
+        )?;
+        let line = lines.last_mut().unwrap();
+        let x = line.width;
+        line.width = line.width.saturating_add(layout.width);
+        let baseline = (font_size * 0.9) as u32;
+        line.baseline = line.baseline.max(baseline);
+        line.descent = line.descent.max(layout.height.saturating_sub(baseline));
+        line.items.push(InlineLineItem::Text {
+            layout,
+            x,
+            baseline,
+        });
+    }
     Ok(())
+}
+
+fn split_inline_segments(text: &str, preserve_whitespace: bool) -> Vec<String> {
+    if preserve_whitespace {
+        let mut segments = Vec::new();
+        let mut current = String::new();
+        let mut in_whitespace = false;
+        for ch in text.chars() {
+            if ch.is_whitespace() {
+                current.push(ch);
+                in_whitespace = true;
+            } else {
+                if in_whitespace {
+                    segments.push(std::mem::take(&mut current));
+                }
+                current.push(ch);
+                in_whitespace = false;
+            }
+        }
+        if !current.is_empty() {
+            segments.push(current);
+        }
+        return segments;
+    }
+
+    // Markdown collapses ASCII prose whitespace to one space. Keep Unicode
+    // spacing characters intact because they can carry width or no-break semantics.
+    text.split_inclusive(|ch: char| ch.is_ascii_whitespace())
+        .enumerate()
+        .filter_map(|(idx, part)| {
+            let part = if idx == 0 {
+                part
+            } else {
+                part.trim_start_matches(|ch: char| ch.is_ascii_whitespace())
+            };
+            if part.is_empty() {
+                return None;
+            }
+            Some(
+                match part.strip_suffix(|ch: char| ch.is_ascii_whitespace()) {
+                    Some(stripped) => format!("{stripped} "),
+                    None => part.to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
+// Measure every segment with one shaping pass, then assign each glyph's advance
+// to the segment owning its byte range.
+fn measure_segment_widths(
+    font_system: &mut FontSystem,
+    segments: &[String],
+    font_size: f32,
+    style: InlineStyle,
+) -> Vec<u32> {
+    let joined: String = segments.concat();
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, font_size * 1.4));
+    buffer.set_size(None, None);
+    buffer.set_text(&joined, &inline_attrs(style), Shaping::Advanced, None);
+    buffer.shape_until_scroll(font_system, false);
+
+    let mut starts = Vec::with_capacity(segments.len());
+    let mut offset = 0;
+    for segment in segments {
+        starts.push(offset);
+        offset += segment.len();
+    }
+
+    let mut widths = vec![0.0_f32; segments.len()];
+    for run in buffer.layout_runs() {
+        for glyph in run.glyphs {
+            let segment_idx = starts.partition_point(|&s| s <= glyph.start) - 1;
+            widths[segment_idx] += glyph.w;
+        }
+    }
+    widths.into_iter().map(|w| w.ceil() as u32).collect()
+}
+
+// Space width only depends on the font size; cache it instead of re-measuring
+// for every paragraph and table cell.
+static SPACE_WIDTH_CACHE: OnceLock<Mutex<HashMap<u32, u32>>> = OnceLock::new();
+
+fn cached_space_width(font_system: &mut FontSystem, font_size: f32) -> u32 {
+    let cache = SPACE_WIDTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = font_size.to_bits();
+    if let Some(width) = cache.lock().unwrap().get(&key) {
+        return *width;
+    }
+    let width = measure_inline_text_width(font_system, " ", font_size, FontKind::Regular);
+    cache.lock().unwrap().insert(key, width);
+    width
 }
 
 fn push_inline_image(
@@ -2156,6 +2332,17 @@ fn sk_overlay_image_slice(
     if src_x_start >= src_x_end {
         return;
     }
+    // Avoid DynamicImage::get_pixel's per-pixel enum dispatch: borrow the RGBA8
+    // buffer directly (converting once only when the image is another format).
+    let converted;
+    let rgba = match image.as_rgba8() {
+        Some(buffer) => buffer,
+        None => {
+            converted = image.to_rgba8();
+            &converted
+        }
+    };
+    let src_data = rgba.as_raw();
     let data = pixmap.data_mut();
     for src_y in src_y_start..src_y_end {
         let py = y_off + src_y as i32;
@@ -2167,7 +2354,8 @@ fn sk_overlay_image_slice(
             if px < 0 || px >= pw {
                 continue;
             }
-            let src = image.get_pixel(src_x, src_y);
+            let src_idx = ((src_y * iw + src_x) * 4) as usize;
+            let src = &src_data[src_idx..src_idx + 4];
             let a = src[3];
             if a == 0 {
                 continue;
@@ -2326,7 +2514,7 @@ pub fn markdown_chunk_rects(width: u32, height: u32) -> Vec<(u32, u32, u32, u32)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::GenericImage;
+    use image::{GenericImage, GenericImageView, ImageEncoder};
 
     fn non_white_bounds(image: &DynamicImage) -> (u32, u32, u32, u32) {
         let rgba = image.to_rgba8();
@@ -2643,15 +2831,150 @@ $$
     }
 
     #[test]
-    fn render_markdown_uses_base_dir_for_images() {
+    fn render_markdown_solo_image_uses_base_dir() {
         let dir = tempfile::tempdir().unwrap();
         let image_path = dir.path().join("inline.png");
         let mut image = DynamicImage::new_rgba8(32, 24);
         image.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
         std::fs::write(&image_path, imgutil::encode_png(&image).unwrap()).unwrap();
         let rendered = render_markdown(b"![alt](inline.png)\n", dir.path(), 800).unwrap();
-        assert_eq!(rendered.width(), 800);
-        assert!(rendered.height() > 0);
+        assert!(
+            rendered
+                .to_rgba8()
+                .pixels()
+                .any(|pixel| pixel[0] > 200 && pixel[1] < 60 && pixel[2] < 60),
+            "the relative solo image should be rendered"
+        );
+    }
+
+    #[test]
+    fn render_markdown_inline_image_mixed_with_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_path = dir.path().join("inline.png");
+        let image = image::RgbImage::from_pixel(24, 16, image::Rgb([255, 0, 0]));
+        let mut encoded = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut encoded)
+            .write_image(
+                image.as_raw(),
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        std::fs::write(&image_path, encoded).unwrap();
+
+        let rendered =
+            render_markdown(b"before ![alt](inline.png) after\n", dir.path(), 800).unwrap();
+        let rgba = rendered.to_rgba8();
+        let has_red = rgba
+            .pixels()
+            .any(|p| p[0] > 200 && p[1] < 60 && p[2] < 60 && p[3] > 200);
+        assert!(has_red, "inline image mixed with text should be rendered");
+    }
+
+    #[test]
+    fn render_markdown_inline_image_missing_file_keeps_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let rendered =
+            render_markdown(b"before ![alt](missing.png) after\n", dir.path(), 800).unwrap();
+        let before = render_markdown(b"before\n", dir.path(), 800).unwrap();
+        let after = render_markdown(b"after\n", dir.path(), 800).unwrap();
+        let (left, _, right, _) = non_white_bounds(&rendered);
+        let (before_left, _, before_right, _) = non_white_bounds(&before);
+        let (after_left, _, after_right, _) = non_white_bounds(&after);
+        let rendered_width = right - left + 1;
+        let widest_single_word = (before_right - before_left + 1).max(after_right - after_left + 1);
+        assert!(
+            rendered_width > widest_single_word,
+            "both text runs around a missing inline image should remain visible"
+        );
+    }
+
+    #[test]
+    fn render_markdown_oversized_word_wraps_within_canvas() {
+        let word = "w".repeat(200);
+        let markdown = format!("start {word} end\n");
+        let image = render_markdown(markdown.as_bytes(), Path::new(""), 800).unwrap();
+        let (_, _, right, _) = non_white_bounds(&image);
+
+        assert!(
+            right + 1 < image.width(),
+            "an unbreakable word should wrap at glyph level instead of overflowing: right={right}"
+        );
+        // Its glyph-wrapped lines make the paragraph taller than a one-liner.
+        let one_liner = render_markdown(b"start w end\n", Path::new(""), 800).unwrap();
+        assert!(image.height() > one_liner.height());
+    }
+
+    #[test]
+    fn render_markdown_inline_code_preserves_whitespace() {
+        let tabbed = render_markdown(b"`a\tb`\n", Path::new(""), 800).unwrap();
+        let double_spaced = render_markdown(b"`a  b`\n", Path::new(""), 800).unwrap();
+        let single_spaced = render_markdown(b"`a b`\n", Path::new(""), 800).unwrap();
+        let (tab_left, _, tab_right, _) = non_white_bounds(&tabbed);
+        let (double_left, _, double_right, _) = non_white_bounds(&double_spaced);
+        let (single_left, _, single_right, _) = non_white_bounds(&single_spaced);
+        let single_width = single_right - single_left;
+
+        assert!(
+            tab_right - tab_left > single_width,
+            "a tab inside inline code should occupy more space than one ordinary space"
+        );
+        assert!(
+            double_right - double_left > single_width,
+            "repeated spaces inside inline code should not collapse"
+        );
+    }
+
+    #[test]
+    fn render_markdown_preserves_unicode_space_width() {
+        let em_spaced = render_markdown("a\u{2003}b\n".as_bytes(), Path::new(""), 800).unwrap();
+        let ordinarily_spaced = render_markdown(b"a b\n", Path::new(""), 800).unwrap();
+        let (em_left, _, em_right, _) = non_white_bounds(&em_spaced);
+        let (ordinary_left, _, ordinary_right, _) = non_white_bounds(&ordinarily_spaced);
+
+        assert!(
+            em_right - em_left > ordinary_right - ordinary_left,
+            "an em space should not be collapsed to an ordinary Markdown space"
+        );
+    }
+
+    #[test]
+    fn render_markdown_italic_text_differs_from_plain_text() {
+        let italic = render_markdown(b"*italic sample*\n", Path::new(""), 800).unwrap();
+        let plain = render_markdown(b"italic sample\n", Path::new(""), 800).unwrap();
+
+        assert_ne!(
+            italic.to_rgba8().as_raw(),
+            plain.to_rgba8().as_raw(),
+            "italic Markdown should produce different glyphs from plain text"
+        );
+    }
+
+    #[test]
+    fn render_markdown_link_draws_underline() {
+        let image =
+            render_markdown(b"[click here](https://example.com)\n", Path::new(""), 800).unwrap();
+        let rgba = image.to_rgba8();
+        // The underline is a solid link-blue rectangle spanning the text, which
+        // produces a much longer horizontal run than any anti-aliased glyph.
+        let mut longest_run = 0_u32;
+        for y in 0..rgba.height() {
+            let mut run = 0_u32;
+            for x in 0..rgba.width() {
+                let p = rgba.get_pixel(x, y);
+                if p[0] == 0x06 && p[1] == 0x4F && p[2] == 0xBD {
+                    run += 1;
+                    longest_run = longest_run.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+        }
+        assert!(
+            longest_run >= 30,
+            "link should have a continuous underline, longest blue run: {longest_run}"
+        );
     }
 
     #[test]
@@ -2725,6 +3048,55 @@ $$
     }
 
     #[test]
+    fn parse_markdown_list_item_with_block_child_terminates() {
+        // Regression: a blockquote (or any block element) nested in a list item
+        // used to leave an unconsumed End event and spin collect_list_items forever.
+        let md = b"- item\n\n  > quote\n\nAfter list.\n";
+        let blocks = parse_markdown_blocks(md);
+
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                Block::List { items, .. } if items.iter().any(|item| {
+                    let text = flatten_tokens(item);
+                    text.contains("item") && text.contains("quote")
+                })
+            )),
+            "the list should retain both its paragraph and nested quote text: {blocks:?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::Paragraph(tokens) if flatten_tokens(tokens) == "After list.")),
+            "parser should continue past the list: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn parse_markdown_list_item_with_code_block_terminates() {
+        // The other hang trigger: a fenced code block nested in a list item.
+        let md = b"- item\n\n  ```rust\n  let x = 1;\n  ```\n\nAfter list.\n";
+        let blocks = parse_markdown_blocks(md);
+
+        assert!(
+            blocks.iter().any(|block| matches!(
+                block,
+                Block::List { items, .. } if items.iter().any(|item| {
+                    let text = flatten_tokens(item);
+                    text.contains("item") && text.contains("let x = 1;")
+                })
+            )),
+            "the list should retain its paragraph and nested code text: {blocks:?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::Paragraph(tokens) if flatten_tokens(tokens) == "After list.")),
+            "parser should continue past the list: {blocks:?}"
+        );
+    }
+
+    #[test]
     fn parse_markdown_continues_after_nested_list() {
         let md = b"- parent\n  - child\n- sibling\n\nAfter list.\n";
         let blocks = parse_markdown_blocks(md);
@@ -2751,36 +3123,16 @@ $$
     }
 
     #[test]
-    fn inline_tokens_link_color_and_underline() {
-        let md = b"[click here](https://example.com)\n";
-        let blocks = parse_markdown_blocks(md);
-        if let Block::Paragraph(tokens) = &blocks[0] {
-            let link_tok = tokens.iter().find(|t| {
-                matches!(
-                    t,
-                    InlineToken::Text {
-                        underline: true,
-                        color: Some(0x064FBD),
-                        ..
-                    }
-                )
-            });
-            assert!(
-                link_tok.is_some(),
-                "link text should have 0x064FBD color and underline"
-            );
-        }
-    }
-
-    #[test]
     fn render_markdown_tight_list_smaller_than_loose() {
         let tight_md = b"- alpha\n- beta\n- gamma\n";
         let loose_md = b"- alpha\n\n- beta\n\n- gamma\n";
         let tight = render_markdown(tight_md, Path::new(""), 800).unwrap();
         let loose = render_markdown(loose_md, Path::new(""), 800).unwrap();
         assert!(
-            loose.height() >= tight.height(),
-            "loose list should be at least as tall as tight list"
+            loose.height() > tight.height(),
+            "loose list ({}) should be taller than tight list ({})",
+            loose.height(),
+            tight.height()
         );
     }
 
@@ -2789,7 +3141,13 @@ $$
         let md = b"# Title\n\n> This is a blockquote with some text.\n\nNormal paragraph.\n";
         let image = render_markdown(md, Path::new(""), 800).unwrap();
         assert_eq!(image.width(), 800);
-        assert!(image.height() > 0);
+        // The quote bar is a solid 4px-wide (180,180,180) rectangle at the left margin.
+        let rgba = image.to_rgba8();
+        let found_bar = (0..rgba.height()).any(|y| {
+            let p = rgba.get_pixel(DEFAULT_MARKDOWN_MARGIN, y);
+            p[0] == 180 && p[1] == 180 && p[2] == 180
+        });
+        assert!(found_bar, "blockquote should draw its vertical bar");
     }
 
     #[test]
@@ -2803,28 +3161,28 @@ $$
         .unwrap();
         let two_rows = render_markdown(md, Path::new(""), 800).unwrap();
         assert!(
-            two_rows.height() >= one_row.height(),
-            "more rows should produce taller image"
+            two_rows.height() > one_row.height(),
+            "two rows ({}) should be taller than one row ({})",
+            two_rows.height(),
+            one_row.height()
         );
     }
 
     #[test]
-    fn cosmic_text_rich_text_compiles() {
-        let mut fs = FontSystem::new();
-        let mut buf = Buffer::new(&mut fs, Metrics::new(12.0, 16.0));
-        buf.set_size(Some(400.0), None);
-        let spans: Vec<(&str, Attrs)> = vec![
-            ("hello ", Attrs::new().family(Family::Monospace)),
-            (
-                "world",
-                Attrs::new()
-                    .family(Family::Monospace)
-                    .color(Color::rgb(255, 0, 0)),
-            ),
-        ];
-        let default_attrs = Attrs::new().family(Family::Monospace);
-        buf.set_rich_text(spans, &default_attrs, Shaping::Advanced, None);
-        buf.shape_until_scroll(&mut fs, false);
+    fn rust_code_highlighting_loads_theme_and_multiple_styles() {
+        let source = "fn main() { let value = 42; }\n";
+        let spans = highlight_code_spans("rust", source);
+        let rendered_text: String = spans.iter().map(|(text, ..)| text.as_str()).collect();
+        let colors = spans
+            .iter()
+            .map(|(_, r, g, b, _)| (*r, *g, *b))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(rendered_text, source);
+        assert!(
+            colors.len() > 1,
+            "Rust highlighting should produce multiple foreground colors: {spans:?}"
+        );
     }
 
     #[test]

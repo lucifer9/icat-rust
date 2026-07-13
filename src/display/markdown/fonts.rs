@@ -13,8 +13,10 @@ const LINUX_SYS_FONT_ROOTS: &[&str] = &["/usr/share/fonts"];
 #[cfg(target_os = "macos")]
 const DARWIN_FALLBACK_FONT: &str = "/Library/Fonts/Arial Unicode.ttf";
 
-// The two preferred CJK families (both platforms, same order as Go)
-const PREFERRED_FAMILIES: &[&str] = &["pingfang", "notosanscjk"];
+// Preferred Simplified Chinese families. Put the region-specific names before
+// their broader family prefixes so PingFang SC / Noto Sans CJK SC win over
+// Hong Kong, Traditional Chinese, Japanese, or Korean variants.
+const PREFERRED_FAMILIES: &[&str] = &["pingfangsc", "pingfang", "notosanscjksc", "notosanscjk"];
 
 // Test string for Chinese glyph coverage check
 const CJK_TEST_CHARS: &str = "中国银行卡号金额";
@@ -208,9 +210,30 @@ fn font_system_can_render_cjk(fs: &mut FontSystem) -> bool {
     saw_glyph
 }
 
+fn preferred_cjk_sans_family(fs: &FontSystem) -> Option<String> {
+    fs.db()
+        .faces()
+        .flat_map(|face| face.families.iter().map(|(name, _)| name))
+        .filter_map(|name| {
+            let rank = family_rank(name);
+            (rank != usize::MAX).then_some((rank, name))
+        })
+        .min_by(|(rank_a, name_a), (rank_b, name_b)| {
+            rank_a.cmp(rank_b).then_with(|| name_a.cmp(name_b))
+        })
+        .map(|(_, name)| name.clone())
+}
+
+fn configure_preferred_cjk_sans_family(fs: &mut FontSystem) -> Option<String> {
+    let family = preferred_cjk_sans_family(fs)?;
+    fs.db_mut().set_sans_serif_family(family.clone());
+    Some(family)
+}
+
 /// Resolve fonts for Markdown rendering, returning a ready FontSystem and optional warning.
 pub fn resolve_fonts() -> FontResolution {
     let mut fs = FontSystem::new();
+    configure_preferred_cjk_sans_family(&mut fs);
     let warning = if font_system_can_render_cjk(&mut fs) {
         None
     } else {
@@ -220,6 +243,7 @@ pub fn resolve_fonts() -> FontResolution {
             last_attempt = Some((
                 path.clone(),
                 if fs.db_mut().load_font_file(path).is_ok() {
+                    configure_preferred_cjk_sans_family(&mut fs);
                     "font does not cover CJK characters".to_string()
                 } else {
                     "no faces loaded".to_string()
@@ -350,6 +374,42 @@ mod tests {
             family_rank("pingfangsc.ttf") < family_rank("notosanscjksc-regular.otf"),
             "pingfang should rank before notosanscjk"
         );
+    }
+
+    #[test]
+    fn test_preferred_cjk_family_keeps_bold_heading_in_one_family() {
+        use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Weight};
+
+        let mut fs = FontSystem::new();
+        let Some(family) = configure_preferred_cjk_sans_family(&mut fs) else {
+            return;
+        };
+        assert_eq!(fs.db().family_name(&Family::SansSerif), family);
+
+        let mut buffer = Buffer::new(&mut fs, Metrics::new(32.0, 44.0));
+        buffer.set_text(
+            "环境要求构建",
+            &Attrs::new().family(Family::SansSerif).weight(Weight::BOLD),
+            Shaping::Advanced,
+            None,
+        );
+        buffer.shape_until_scroll(&mut fs, false);
+
+        let mut glyph_count = 0;
+        for run in buffer.layout_runs() {
+            for glyph in run.glyphs {
+                glyph_count += 1;
+                let face = fs.db().face(glyph.font_id).unwrap();
+                assert!(
+                    face.families.iter().any(|(name, _)| name == &family),
+                    "glyph {}..{} used {:?}, expected {family}",
+                    glyph.start,
+                    glyph.end,
+                    face.families
+                );
+            }
+        }
+        assert!(glyph_count > 0);
     }
 
     #[test]

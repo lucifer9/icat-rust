@@ -1,6 +1,6 @@
 [package]
 name = "icat"
-version = "0.5.2"
+version = "0.5.5"
 edition = "2024"
 license = "MIT"
 
@@ -23,12 +23,12 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
 ] }
 latex2mathml = "0.2"
-lopdf = "0.40"
+lopdf = "0.44"
 pulldown-cmark = "0.13"
-quick-xml = "0.39"
+quick-xml = "0.41"
 rand = "0.10"
 rar5 = { git = "https://codeberg.org/librar/rar-rs.git", rev = "4189b38" }
-regex = "1.12"
+regex = "1.13"
 resvg = "0.47"
 rustix = { version = "1.1", features = ["fs", "process", "stdio", "termios"] }
 sevenz-rust2 = { version = "0.21", default-features = false, features = [

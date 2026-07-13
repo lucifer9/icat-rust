@@ -1,6 +1,8 @@
 use crate::display::markdown::markie::TextMeasure;
 use latex2mathml::{DisplayStyle, latex_to_mathml};
-use quick_xml::events::Event as XmlEvent;
+use quick_xml::XmlVersion;
+use quick_xml::encoding::Decoder;
+use quick_xml::events::{BytesStart, Event as XmlEvent};
 use quick_xml::reader::Reader as XmlReader;
 
 #[derive(Debug)]
@@ -93,34 +95,32 @@ fn preprocess_latex(latex: &str) -> String {
     let latex = latex.replace("\\end{cases}", "\\end{matrix}\\right.");
 
     // Single-pass scan for \begin{array}{...} → \begin{matrix}
-    let bytes = latex.as_bytes();
-    let len = bytes.len();
-    let begin_array = b"\\begin{array}";
-    let pat_len = begin_array.len();
-    let mut i = 0;
+    let begin_array = "\\begin{array}";
+    let mut rest = latex.as_str();
 
-    while i < len {
-        if i + pat_len <= len && &bytes[i..i + pat_len] == begin_array {
-            result.push_str("\\begin{matrix}");
-            i += pat_len;
-            // Skip the optional column-alignment spec: {cc}, {l|r}, etc.
-            if i < len && bytes[i] == b'{' {
-                let mut depth = 1;
-                i += 1;
-                while i < len && depth > 0 {
-                    if bytes[i] == b'{' {
-                        depth += 1;
-                    } else if bytes[i] == b'}' {
-                        depth -= 1;
+    while let Some(pos) = rest.find(begin_array) {
+        result.push_str(&rest[..pos]);
+        result.push_str("\\begin{matrix}");
+        rest = &rest[pos + begin_array.len()..];
+        // Skip the optional column-alignment spec: {cc}, {l|r}, etc.
+        if rest.starts_with('{') {
+            let mut depth = 0;
+            let mut end = rest.len();
+            for (i, ch) in rest.char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
                     }
-                    i += 1;
                 }
             }
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            rest = &rest[end..];
         }
     }
+    result.push_str(rest);
 
     result = result.replace("\\end{array}", "\\end{matrix}");
 
@@ -166,6 +166,33 @@ struct MathBox {
 
 type Attrs = Vec<(String, String)>;
 
+fn parse_mathml_attrs(element: &BytesStart<'_>, decoder: Decoder) -> Result<Attrs, String> {
+    element
+        .attributes()
+        // latex2mathml emits a few legacy unquoted attributes such as
+        // `columnalign=left`; ignore only those malformed attributes while
+        // decoding and normalizing every valid attribute through quick-xml.
+        .filter_map(Result::ok)
+        .map(|attribute| {
+            let value = attribute
+                .decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
+                .map_err(|err| format!("XML attribute decode error: {err}"))?;
+            Ok((
+                String::from_utf8_lossy(attribute.key.as_ref()).into_owned(),
+                value.into_owned(),
+            ))
+        })
+        .collect()
+}
+
+fn push_mathml_text(stack: &mut [(String, Vec<MathNode>, Attrs)], text: String) {
+    if !text.is_empty()
+        && let Some((_, children, _)) = stack.last_mut()
+    {
+        children.push(MathNode::Text(text));
+    }
+}
+
 fn parse_mathml(mathml: &str) -> Result<MathNode, String> {
     let mut reader = XmlReader::from_str(mathml);
     reader.config_mut().trim_text(true);
@@ -184,16 +211,7 @@ fn parse_mathml(mathml: &str) -> Result<MathNode, String> {
         match reader.read_event_into(&mut buf) {
             Ok(XmlEvent::Start(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                let attrs: Attrs = e
-                    .attributes()
-                    .filter_map(|a| a.ok())
-                    .map(|a| {
-                        (
-                            String::from_utf8_lossy(a.key.as_ref()).to_string(),
-                            String::from_utf8_lossy(&a.value).to_string(),
-                        )
-                    })
-                    .collect();
+                let attrs = parse_mathml_attrs(e, reader.decoder())?;
 
                 if name == "mtable" {
                     in_table += 1;
@@ -210,12 +228,25 @@ fn parse_mathml(mathml: &str) -> Result<MathNode, String> {
                 stack.push((name, Vec::new(), attrs));
             }
             Ok(XmlEvent::Text(ref e)) => {
-                let text = e.decode().unwrap_or_default().to_string();
-                if !text.is_empty()
-                    && let Some((_, children, _)) = stack.last_mut()
-                {
-                    children.push(MathNode::Text(text));
-                }
+                let text = e
+                    .decode()
+                    .map_err(|err| format!("XML text decode error: {err}"))?;
+                push_mathml_text(&mut stack, text.into_owned());
+            }
+            Ok(XmlEvent::CData(ref e)) => {
+                let text = e
+                    .decode()
+                    .map_err(|err| format!("XML CDATA decode error: {err}"))?;
+                push_mathml_text(&mut stack, text.into_owned());
+            }
+            Ok(XmlEvent::GeneralRef(ref e)) => {
+                let reference = e
+                    .decode()
+                    .map_err(|err| format!("XML reference decode error: {err}"))?;
+                let encoded = format!("&{reference};");
+                let text = quick_xml::escape::unescape(&encoded)
+                    .map_err(|err| format!("XML reference error: {err}"))?;
+                push_mathml_text(&mut stack, text.into_owned());
             }
             Ok(XmlEvent::End(ref e)) => {
                 let _name = String::from_utf8_lossy(e.name().as_ref()).to_string();
@@ -256,16 +287,7 @@ fn parse_mathml(mathml: &str) -> Result<MathNode, String> {
             }
             Ok(XmlEvent::Empty(ref e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                let attrs: Attrs = e
-                    .attributes()
-                    .filter_map(|a| a.ok())
-                    .map(|a| {
-                        (
-                            String::from_utf8_lossy(a.key.as_ref()).to_string(),
-                            String::from_utf8_lossy(&a.value).to_string(),
-                        )
-                    })
-                    .collect();
+                let attrs = parse_mathml_attrs(e, reader.decoder())?;
 
                 if name == "mspace" {
                     let mut width_em = 0.0;
@@ -282,7 +304,12 @@ fn parse_mathml(mathml: &str) -> Result<MathNode, String> {
                     }
                 }
             }
-            Ok(XmlEvent::Eof) => break,
+            Ok(XmlEvent::Eof) => {
+                if let Some((tag, _, _)) = stack.last() {
+                    return Err(format!("XML parse error: unclosed <{tag}> element"));
+                }
+                break;
+            }
             Err(e) => return Err(format!("XML parse error: {}", e)),
             _ => {}
         }
@@ -1293,6 +1320,30 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_mathml_decodes_references_and_empty_element_attributes() {
+        let operator = parse_mathml("<math><mo>&lt;</mo></math>").unwrap();
+        assert!(matches!(operator, MathNode::Operator(ref op) if op == "<"));
+
+        let space = parse_mathml(r#"<math><mspace width="0.5&#x65;m"/></math>"#).unwrap();
+        assert!(matches!(space, MathNode::Space(width) if (width - 0.5).abs() < f32::EPSILON));
+    }
+
+    #[test]
+    fn test_parse_mathml_rejects_unclosed_elements() {
+        let err = parse_mathml("<math><mi>x</mi>").unwrap_err();
+        assert!(err.contains("unclosed <math>"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_render_math_spacing_uses_mspace_width() {
+        let mut measure = MockMeasure;
+        let compact = render_math("xy", 16.0, "#000000", &mut measure, false).unwrap();
+        let spaced = render_math(r"x\,y", 16.0, "#000000", &mut measure, false).unwrap();
+
+        assert!(spaced.width > compact.width);
+    }
+
+    #[test]
     fn test_render_math_basic() {
         let mut measure = MockMeasure;
         let result = render_math("x + 1", 16.0, "#000000", &mut measure, false);
@@ -1437,6 +1488,28 @@ mod tests {
         );
         let res = result.unwrap();
         assert!(res.width > 0.0);
+    }
+
+    #[test]
+    fn test_preprocess_latex_handles_unclosed_array_spec() {
+        // Malformed input must terminate and still rewrite the environment.
+        let processed = preprocess_latex(r"\begin{array}{cc 1 & 2");
+        assert!(processed.starts_with(r"\begin{matrix}"));
+
+        // A spec-less array keeps its body.
+        let processed = preprocess_latex(r"\begin{array} a \end{array}");
+        assert_eq!(processed, r"\begin{matrix} a \end{matrix}");
+    }
+
+    #[test]
+    fn test_render_math_with_chinese_text() {
+        let mut measure = MockMeasure;
+        let result = render_math(r"\text{价格} > 0", 16.0, "#000000", &mut measure, false).unwrap();
+        assert!(
+            result.svg_fragment.contains("价格"),
+            "Chinese text should survive preprocessing: {}",
+            result.svg_fragment
+        );
     }
 
     #[test]
