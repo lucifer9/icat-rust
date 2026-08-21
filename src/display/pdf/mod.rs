@@ -823,8 +823,9 @@ fn decode_hex_like_object(object: &Object, cmap: Option<&CidToUnicode>) -> Optio
         return None;
     }
     let mut out = String::new();
-    for chunk in bytes.chunks_exact(2) {
-        let cid = u16::from_be_bytes([chunk[0], chunk[1]]);
+    // Length is verified even above, so the remainder from as_chunks is empty.
+    for chunk in bytes.as_chunks::<2>().0 {
+        let cid = u16::from_be_bytes(*chunk);
         if let Some(ch) = cmap.get(&cid) {
             out.push(*ch);
         }

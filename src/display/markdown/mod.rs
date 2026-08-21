@@ -2100,7 +2100,7 @@ fn draw_text_layout(
                 continue;
             }
             let physical_glyph = glyph.physical((0.0, run.line_y), 1.0);
-            let glyph_color = glyph.color_opt.map_or(layout.color, |some| some);
+            let glyph_color = glyph.color_opt.unwrap_or(layout.color);
             renderer.glyph(physical_glyph, glyph_color);
         }
         render_decoration(&mut renderer, &run, layout.color);
