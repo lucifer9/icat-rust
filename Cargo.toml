@@ -1,6 +1,6 @@
 [package]
 name = "icat"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 license = "MIT"
 
@@ -9,10 +9,10 @@ name = "icat"
 path = "src/main.rs"
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 cosmic-text = "0.19"
 flate2 = { version = "1", default-features = false, features = ["zlib"] }
-fontdb = "0.23"
+fontdb = "0.24"
 glob = "0.3"
 image = { version = "0.25", default-features = false, features = [
   "png",
@@ -29,7 +29,7 @@ quick-xml = "0.41"
 rand = "0.10"
 rar5 = { git = "https://codeberg.org/librar/rar-rs.git", rev = "4189b38" }
 regex = "1.13"
-resvg = "0.47"
+resvg = "0.48"
 rustix = { version = "1.1", features = ["fs", "process", "stdio", "termios"] }
 sevenz-rust2 = { version = "0.21", default-features = false, features = [
   "aes256",
