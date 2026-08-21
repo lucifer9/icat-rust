@@ -3116,6 +3116,24 @@ $$
     }
 
     #[test]
+    fn render_markdown_malformed_inline_markup_completes() {
+        // Unclosed inline constructs must be consumed, not hang or error: the
+        // trailing paragraph proves the parser made it to the end of input.
+        let md = b"Unclosed **bold and *italic\n\nUnclosed [link text\n\nUnclosed `code span\n\nUnclosed $x^2+y^2 math\n\nStill here.\n";
+        let image = render_markdown(md, Path::new(""), 800).unwrap();
+        assert_eq!(image.width(), 800);
+        assert!(image.height() > 0);
+
+        let blocks = parse_markdown_blocks(md);
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block, Block::Paragraph(tokens) if flatten_tokens(tokens) == "Still here.")),
+            "parser should reach content after malformed inline markup: {blocks:?}"
+        );
+    }
+
+    #[test]
     fn inline_tokens_emphasis_escalation() {
         // Bold inside italic → bold+italic for nested text
         let md = b"*outer **inner** end*\n";

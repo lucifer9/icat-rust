@@ -65,12 +65,12 @@ fn minimal_text_pdf() -> Vec<u8> {
 }
 
 /// Run `icat` with the given args and env, piping `stdin_data` on stdin.
-/// Returns (stdout bytes, exit status success).
-fn run_icat(
+/// Returns (stdout bytes, stderr bytes, exit status success).
+fn run_icat_full(
     args: &[&str],
     stdin_data: Option<&[u8]>,
     extra_env: &[(&str, &str)],
-) -> (Vec<u8>, bool) {
+) -> (Vec<u8>, Vec<u8>, bool) {
     let mut cmd = Command::new(icat_bin());
     cmd.args(args);
     // Provide terminal size and strip TMUX so tests run in non-tmux mode by default
@@ -85,7 +85,7 @@ fn run_icat(
     } else {
         cmd.stdin(Stdio::null());
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd.spawn().expect("failed to spawn icat");
     if let Some(data) = stdin_data {
@@ -94,10 +94,46 @@ fn run_icat(
         drop(stdin);
     }
     let output = child.wait_with_output().unwrap();
-    (output.stdout, output.status.success())
+    (output.stdout, output.stderr, output.status.success())
+}
+
+fn run_icat(
+    args: &[&str],
+    stdin_data: Option<&[u8]>,
+    extra_env: &[(&str, &str)],
+) -> (Vec<u8>, bool) {
+    let (stdout, _, ok) = run_icat_full(args, stdin_data, extra_env);
+    (stdout, ok)
 }
 
 // ── Helper assertions ─────────────────────────────────────────────────────────
+
+/// Reassemble the (possibly chunked) base64 PNG payload from raw Kitty output
+/// and return the decoded image's pixel dimensions.
+fn kitty_png_dimensions(stdout: &[u8]) -> (u32, u32) {
+    use base64::Engine as _;
+    let text = String::from_utf8_lossy(stdout);
+    let mut b64 = String::new();
+    for (index, chunk) in text.split("\x1b_G").skip(1).enumerate() {
+        let Some((header, rest)) = chunk.split_once(';') else {
+            continue;
+        };
+        // Only the first chunk carries the full header; continuations are `m=...`
+        if index == 0 {
+            assert!(
+                header.contains("f=100"),
+                "expected PNG payload, got: {header}"
+            );
+        }
+        let payload = rest.split("\x1b\\").next().unwrap_or(rest);
+        b64.push_str(payload.trim_end());
+    }
+    assert!(!b64.is_empty(), "no kitty payload found in stdout");
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .expect("kitty payload should be valid base64");
+    icat::imgutil::png_dimensions(&png).expect("kitty payload should be a valid PNG")
+}
 
 fn assert_kitty_output(stdout: &[u8], tmux: bool) {
     assert!(!stdout.is_empty(), "stdout should not be empty");
@@ -207,4 +243,69 @@ fn tmux_mode_produces_tmux_header() {
         "icat should exit 0 in tmux mode with working tmux binary"
     );
     assert_kitty_output(&stdout, true);
+}
+
+#[test]
+fn missing_file_exits_nonzero_with_error() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("no-such-file.png");
+    let (_, stderr, ok) = run_icat_full(&[missing.to_str().unwrap()], None, &[]);
+    assert!(!ok, "icat should exit non-zero for a missing file");
+    assert!(
+        String::from_utf8_lossy(&stderr).starts_with("error: "),
+        "expected error message on stderr, got: {:?}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
+fn invalid_md_font_size_exits_nonzero_with_error() {
+    let (_, stderr, ok) = run_icat_full(&["--markdown", "--md-font-size", "abc"], None, &[]);
+    assert!(!ok, "icat should exit non-zero for invalid --md-font-size");
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("--md-font-size"),
+        "expected --md-font-size error on stderr, got: {:?}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
+fn unknown_option_exits_nonzero_with_error() {
+    let (_, stderr, ok) = run_icat_full(&["--frobnicate"], None, &[]);
+    assert!(!ok, "icat should exit non-zero for an unknown option");
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("unknown option"),
+        "expected unknown-option error on stderr, got: {:?}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
+fn md_font_size_changes_rendered_image_height() {
+    let md = b"# Title\n\nParagraph text that gives the renderer something to lay out.\n\n- one\n- two\n";
+    let (small, ok_small) = run_icat(&["--markdown", "--md-font-size", "8"], Some(md), &[]);
+    let (large, ok_large) = run_icat(&["--markdown", "--md-font-size", "32"], Some(md), &[]);
+    assert!(ok_small && ok_large);
+    let small_h = kitty_png_dimensions(&small).1;
+    let large_h = kitty_png_dimensions(&large).1;
+    assert!(
+        large_h > small_h,
+        "larger font should render a taller image: small={small_h}, large={large_h}"
+    );
+}
+
+#[test]
+fn md_font_size_default_matches_explicit_default() {
+    // Pins the CLI default to the markdown module's constant: omitting the flag
+    // must render exactly like passing DEFAULT_MARKDOWN_FONT_PT explicitly.
+    let default = format!("{}", icat::display::markdown::DEFAULT_MARKDOWN_FONT_PT);
+    let md = b"# Title\n\nParagraph text.\n";
+    let (implicit, ok_implicit) = run_icat(&["--markdown"], Some(md), &[]);
+    let (explicit, ok_explicit) =
+        run_icat(&["--markdown", "--md-font-size", &default], Some(md), &[]);
+    assert!(ok_implicit && ok_explicit);
+    assert_eq!(
+        implicit, explicit,
+        "default and explicit --md-font-size {default} should produce identical output"
+    );
 }

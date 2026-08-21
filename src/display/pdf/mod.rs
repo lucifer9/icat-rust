@@ -1293,6 +1293,38 @@ mod tests {
     }
 
     #[test]
+    fn text_without_tf_uses_default_font_metrics() {
+        // No Tf at all: leading, line grouping, and indentation must fall back
+        // to DEFAULT_PDF_FONT_SIZE (12pt → leading 14.4, indent step 48).
+        let content = Content {
+            operations: vec![
+                Operation::new(
+                    "Tm",
+                    vec![1.into(), 0.into(), 0.into(), 1.into(), 0.into(), 100.into()],
+                ),
+                Operation::new("Tj", vec![Object::string_literal("first")]),
+                Operation::new("T*", vec![]),
+                Operation::new("Tj", vec![Object::string_literal("second")]),
+                Operation::new(
+                    "Tm",
+                    vec![1.into(), 0.into(), 0.into(), 1.into(), 96.into(), 60.into()],
+                ),
+                Operation::new("Tj", vec![Object::string_literal("indented")]),
+                Operation::new("ET", vec![]),
+            ],
+        };
+        assert_eq!(
+            extract_text_from_operations(
+                &content.operations,
+                &HashMap::new(),
+                &CidToUnicode::new()
+            ),
+            // 14.4 leading keeps the T* line separate; 96 / 48 = 2 spaces of indent
+            "first\nsecond\n  indented"
+        );
+    }
+
+    #[test]
     fn prepare_pdf_sample_text() {
         let data = sample_text_pdf_data();
         let result = prepare_pdf(&data, "sample-text.pdf", 0).unwrap();
