@@ -7,6 +7,9 @@ use super::layout::{LayoutEngine, LayoutPos};
 use super::types::*;
 use super::{MermaidDiagram, parse_mermaid};
 
+/// Font size used when a diagram is rendered without a Markdown base size.
+const DEFAULT_DIAGRAM_FONT_SIZE: f32 = 13.0;
+
 /// Style configuration for diagram rendering
 #[derive(Debug, Clone)]
 pub struct DiagramStyle {
@@ -30,7 +33,7 @@ impl Default for DiagramStyle {
             edge_text: "#666666".to_string(),
             background: "transparent".to_string(),
             font_family: "sans-serif".to_string(),
-            font_size: 13.0,
+            font_size: DEFAULT_DIAGRAM_FONT_SIZE,
         }
     }
 }
@@ -51,7 +54,7 @@ impl DiagramStyle {
             edge_text: label_fg,
             background: background.to_string(),
             font_family: "sans-serif".to_string(),
-            font_size: 13.0,
+            font_size: DEFAULT_DIAGRAM_FONT_SIZE,
         }
     }
 }

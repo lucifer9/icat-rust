@@ -10,6 +10,9 @@ use rustix::termios::{Winsize, tcgetwinsize};
 
 pub const DEFAULT_CELL_WIDTH: u32 = 8;
 pub const DEFAULT_CELL_HEIGHT: u32 = 16;
+// Assumed terminal pixel size when neither ioctl nor cell geometry is available.
+pub const DEFAULT_PIXEL_WIDTH: u32 = 640;
+pub const DEFAULT_PIXEL_HEIGHT: u32 = 384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
@@ -77,8 +80,8 @@ pub fn get_size() -> Size {
     }
 
     Size {
-        pixel_width: 640,
-        pixel_height: 384,
+        pixel_width: DEFAULT_PIXEL_WIDTH,
+        pixel_height: DEFAULT_PIXEL_HEIGHT,
         cols: 80,
         rows: 24,
     }

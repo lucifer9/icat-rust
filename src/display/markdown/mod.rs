@@ -2462,7 +2462,7 @@ pub fn markdown_page_height(size: Size) -> u32 {
     } else if size.rows > 0 {
         size.rows * term::DEFAULT_CELL_HEIGHT
     } else {
-        384
+        term::DEFAULT_PIXEL_HEIGHT
     };
     let reserved = if size.rows > 0 && size.pixel_height > 0 {
         2 * (size.pixel_height / size.rows.max(1)).max(1)

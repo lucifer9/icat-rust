@@ -11,6 +11,8 @@ use crate::imgutil;
 use crate::term::Size;
 
 const MIN_PDF_TEXT_CHARS: usize = 50;
+// PDF viewers conventionally assume 12pt when content omits Tf.
+const DEFAULT_PDF_FONT_SIZE: f64 = 12.0;
 const MAX_PDF_TEXT_BYTES: usize = 8 * 1024 * 1024;
 
 #[cfg(not(test))]
@@ -641,7 +643,7 @@ fn collect_pdf_text_runs(
 ) -> Vec<PdfTextRun> {
     let mut runs = Vec::new();
     let mut current_font = Vec::new();
-    let mut font_size = 12.0;
+    let mut font_size = DEFAULT_PDF_FONT_SIZE;
     let mut line_leading = font_size * 1.2;
     let mut cur_x = f64::NAN;
     let mut cur_y = f64::NAN;
@@ -947,7 +949,7 @@ fn render_pdf_line(out: &mut String, line: &mut PdfTextLine, base_x: f64) {
     let font_size = if line.font_size > 0.0 {
         line.font_size
     } else {
-        12.0
+        DEFAULT_PDF_FONT_SIZE
     };
     let space_width = (font_size * 0.5).max(1.0);
     let indent_width = (font_size * 4.0).max(1.0);
