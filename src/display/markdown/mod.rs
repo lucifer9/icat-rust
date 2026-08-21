@@ -21,7 +21,7 @@ use crate::term::{self, Size};
 
 const DEFAULT_MARKDOWN_WIDTH: u32 = 1024;
 const DEFAULT_MARKDOWN_MARGIN: u32 = 48;
-pub const DEFAULT_MARKDOWN_FONT_PT: f64 = 18.0;
+pub const DEFAULT_MARKDOWN_FONT_PT: f64 = 24.0;
 pub const MIN_MARKDOWN_WIDTH: u32 = 480;
 const MARKDOWN_CHUNK_HEIGHT: u32 = 8192;
 
@@ -2577,7 +2577,13 @@ mod tests {
     fn render_markdown_with_font_size_affects_layout() {
         let data = b"# Title\n\nParagraph text that wraps enough to make font size visible in layout.\n\n- one\n- two\n";
         let default = render_markdown(data, Path::new(""), 800).unwrap();
-        let large = render_markdown_with_font_size(data, Path::new(""), 800, 24.0).unwrap();
+        let large = render_markdown_with_font_size(
+            data,
+            Path::new(""),
+            800,
+            DEFAULT_MARKDOWN_FONT_PT * 1.5,
+        )
+        .unwrap();
         assert!(large.height() > default.height());
     }
 

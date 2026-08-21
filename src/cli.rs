@@ -4,7 +4,9 @@ use std::path::Path;
 
 use glob::glob;
 
-pub const DEFAULT_MARKDOWN_FONT_PT: f64 = 18.0;
+// Single source of truth lives in the markdown renderer; the CLI default must
+// track it, otherwise editing the renderer constant silently has no effect.
+use crate::display::markdown::DEFAULT_MARKDOWN_FONT_PT;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {
@@ -228,7 +230,7 @@ pub fn safe_err(err: &dyn Error) -> String {
 
 pub fn print_usage() {
     eprintln!(
-        "Usage: icat [--markdown] [--md-font-size N] [-pN | -p N] [files/patterns...]\n\nDisplay images in the terminal using Kitty graphics protocol.\n\nOptions:\n  --markdown         Treat input as Markdown and render it to an image\n  --md-font-size N   Markdown base font size in points (default 18)\n  -p N               PDF page, archive index, or Markdown page (1-based)\n  -                  Read from stdin\n  -h                 Show this help\n\nExamples:\n  icat image.png\n  icat *.jpg\n  icat document.pdf\n  icat README.md\n  cat README.md | icat --markdown\n  icat -p3 document.pdf\n  icat photos.zip\n  icat -p 2 photos.zip\n  cat image.png | icat"
+        "Usage: icat [--markdown] [--md-font-size N] [-pN | -p N] [files/patterns...]\n\nDisplay images in the terminal using Kitty graphics protocol.\n\nOptions:\n  --markdown         Treat input as Markdown and render it to an image\n  --md-font-size N   Markdown base font size in points (default {DEFAULT_MARKDOWN_FONT_PT})\n  -p N               PDF page, archive index, or Markdown page (1-based)\n  -                  Read from stdin\n  -h                 Show this help\n\nExamples:\n  icat image.png\n  icat *.jpg\n  icat document.pdf\n  icat README.md\n  cat README.md | icat --markdown\n  icat -p3 document.pdf\n  icat photos.zip\n  icat -p 2 photos.zip\n  cat image.png | icat"
     );
 }
 
