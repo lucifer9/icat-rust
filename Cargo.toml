@@ -25,13 +25,13 @@ image = { version = "0.25", default-features = false, features = [
 latex2mathml = "0.2"
 lopdf = "0.44"
 pulldown-cmark = "0.13"
-quick-xml = "0.41"
+quick-xml = "0.42"
 rand = "0.10"
 rar5 = { git = "https://codeberg.org/librar/rar-rs.git", rev = "4189b38" }
 regex = "1.13"
 resvg = "0.48"
 rustix = { version = "1.1", features = ["fs", "process", "stdio", "termios"] }
-sevenz-rust2 = { version = "0.21", default-features = false, features = [
+sevenz-rust2 = { version = "0.22", default-features = false, features = [
   "aes256",
   "compress",
   "deflate",
