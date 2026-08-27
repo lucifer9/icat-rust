@@ -1,7 +1,6 @@
 use crate::display::markdown::markie::TextMeasure;
 use latex2mathml::{DisplayStyle, latex_to_mathml};
 use quick_xml::XmlVersion;
-use quick_xml::encoding::Decoder;
 use quick_xml::events::{BytesStart, Event as XmlEvent};
 use quick_xml::reader::Reader as XmlReader;
 
@@ -166,19 +165,19 @@ struct MathBox {
 
 type Attrs = Vec<(String, String)>;
 
-fn parse_mathml_attrs(element: &BytesStart<'_>, decoder: Decoder) -> Result<Attrs, String> {
+fn parse_mathml_attrs(element: &BytesStart<'_>) -> Result<Attrs, String> {
     element
         .attributes()
         // latex2mathml emits a few legacy unquoted attributes such as
         // `columnalign=left`; ignore only those malformed attributes while
-        // decoding and normalizing every valid attribute through quick-xml.
+        // normalizing every valid attribute through quick-xml.
         .filter_map(Result::ok)
         .map(|attribute| {
             let value = attribute
-                .decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
+                .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|err| format!("XML attribute decode error: {err}"))?;
             Ok((
-                String::from_utf8_lossy(attribute.key.as_ref()).into_owned(),
+                attribute.key.as_ref().to_string(),
                 value.into_owned(),
             ))
         })
@@ -210,8 +209,8 @@ fn parse_mathml(mathml: &str) -> Result<MathNode, String> {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(XmlEvent::Start(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                let attrs = parse_mathml_attrs(e, reader.decoder())?;
+                let name = e.name().as_ref().to_string();
+                let attrs = parse_mathml_attrs(e)?;
 
                 if name == "mtable" {
                     in_table += 1;
@@ -228,28 +227,21 @@ fn parse_mathml(mathml: &str) -> Result<MathNode, String> {
                 stack.push((name, Vec::new(), attrs));
             }
             Ok(XmlEvent::Text(ref e)) => {
-                let text = e
-                    .decode()
-                    .map_err(|err| format!("XML text decode error: {err}"))?;
+                let text = e.xml_content(XmlVersion::Implicit1_0);
                 push_mathml_text(&mut stack, text.into_owned());
             }
             Ok(XmlEvent::CData(ref e)) => {
-                let text = e
-                    .decode()
-                    .map_err(|err| format!("XML CDATA decode error: {err}"))?;
+                let text = e.xml_content(XmlVersion::Implicit1_0);
                 push_mathml_text(&mut stack, text.into_owned());
             }
             Ok(XmlEvent::GeneralRef(ref e)) => {
-                let reference = e
-                    .decode()
-                    .map_err(|err| format!("XML reference decode error: {err}"))?;
+                let reference = e.xml_content(XmlVersion::Implicit1_0);
                 let encoded = format!("&{reference};");
                 let text = quick_xml::escape::unescape(&encoded)
                     .map_err(|err| format!("XML reference error: {err}"))?;
                 push_mathml_text(&mut stack, text.into_owned());
             }
-            Ok(XmlEvent::End(ref e)) => {
-                let _name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+            Ok(XmlEvent::End(_)) => {
                 if let Some((tag, children, attrs)) = stack.pop() {
                     // Handle table elements specially
                     if tag == "mtd" && in_table == 1 && in_row == 1 {
@@ -286,8 +278,8 @@ fn parse_mathml(mathml: &str) -> Result<MathNode, String> {
                 }
             }
             Ok(XmlEvent::Empty(ref e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                let attrs = parse_mathml_attrs(e, reader.decoder())?;
+                let name = e.name().as_ref().to_string();
+                let attrs = parse_mathml_attrs(e)?;
 
                 if name == "mspace" {
                     let mut width_em = 0.0;
