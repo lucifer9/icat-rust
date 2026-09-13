@@ -23,7 +23,7 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
 ] }
 latex2mathml = "0.2"
-lopdf = "0.44"
+lopdf = "0.45"
 pulldown-cmark = "0.13"
 quick-xml = "0.42"
 rand = "0.10"
