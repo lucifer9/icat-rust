@@ -2579,6 +2579,108 @@ fn render_er_cardinality_marker(
 mod tests {
     use super::*;
 
+    #[test]
+    fn complex_diagrams_render_labels_and_visible_nodes_and_edges() {
+        use quick_xml::{Reader, events::Event};
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "flowchart",
+                r#"flowchart TB
+subgraph Workers
+    A([Start]) --> B[[Routine]]
+    B --> C[(Store)]
+    C --> D{{Decision}}
+    D --> E[/Input/]
+    E --> F[\Output\]
+    F --> G[/Batch\]
+    G --> H[\Tail/]
+    H --> I((Done))
+end"#,
+                &[
+                    "Workers", "Start", "Routine", "Store", "Decision", "Input", "Output", "Batch",
+                    "Tail", "Done",
+                ],
+            ),
+            (
+                "sequence",
+                r#"sequenceDiagram
+participant Alice
+participant Bob
+Note right of Alice: Start here
+alt success
+    Alice->>Bob: do work
+    Bob->>Bob: local work
+else retry
+    Bob-->>Alice: try again
+end"#,
+                &[
+                    "Alice",
+                    "Bob",
+                    "Start here",
+                    "do work",
+                    "local work",
+                    "try again",
+                ],
+            ),
+            (
+                "state",
+                r#"stateDiagram
+state Parent {
+    state Child
+    Child --> Child: loop
+}
+Note right of Child: child note"#,
+                &["Parent", "Child", "loop", "child note"],
+            ),
+        ];
+        let style = DiagramStyle {
+            node_fill: "#ff0000".into(),
+            edge_stroke: "#0000ff".into(),
+            ..DiagramStyle::default()
+        };
+        for (name, source, labels) in cases {
+            let (content, width, height) =
+                render_diagram(source, &style, &mut MockMeasure).unwrap();
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">{content}</svg>"#
+            );
+            let mut reader = Reader::from_str(&svg);
+            let mut visible_text = Vec::new();
+            loop {
+                match reader.read_event().unwrap() {
+                    Event::Text(text) => visible_text.push(text.xml10_content().into_owned()),
+                    Event::Eof => break,
+                    _ => {}
+                }
+            }
+            for label in *labels {
+                assert!(
+                    visible_text.iter().any(|text| text.contains(label)),
+                    "{name}: missing visible label {label}"
+                );
+            }
+            let image = crate::display::markdown::markie::svg_to_image(&svg)
+                .unwrap()
+                .to_rgba8();
+            let node_pixels = image
+                .pixels()
+                .filter(|p| p[3] > 32 && p[0] > 180 && p[1] < 60 && p[2] < 60)
+                .count();
+            let edge_pixels = image
+                .pixels()
+                .filter(|p| p[3] > 32 && p[2] > 180 && p[0] < 60 && p[1] < 60)
+                .count();
+            assert!(
+                node_pixels > 100,
+                "{name}: nodes must be visible after rasterization, got {node_pixels}"
+            );
+            assert!(
+                edge_pixels > 20,
+                "{name}: edges must be visible after rasterization, got {edge_pixels}"
+            );
+        }
+    }
+
     struct MockMeasure;
 
     impl TextMeasure for MockMeasure {

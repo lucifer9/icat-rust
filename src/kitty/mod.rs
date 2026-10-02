@@ -83,6 +83,7 @@ pub fn write_static_image(
         ("\x1b_G", "\x1b\\")
     };
 
+    let mut encoded = [0u8; CHUNK_SIZE];
     let mut first = true;
     for chunk in png_data.chunks(RAW_CHUNK_SIZE) {
         writer.write_all(esc_prefix.as_bytes())?;
@@ -96,8 +97,9 @@ pub fn write_static_image(
             1
         };
         write!(writer, "m={more};")?;
-        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(chunk);
-        writer.write_all(encoded.as_bytes())?;
+        let encoded_len =
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode_slice(chunk, &mut encoded)?;
+        writer.write_all(&encoded[..encoded_len])?;
         writer.write_all(esc_suffix.as_bytes())?;
     }
 
@@ -170,6 +172,7 @@ pub fn write_static_image_rgba_zlib(
         ("\x1b_G", "\x1b\\")
     };
 
+    let mut encoded = [0u8; CHUNK_SIZE];
     let mut first = true;
     for chunk in zlib_data.chunks(RAW_CHUNK_SIZE) {
         writer.write_all(esc_prefix.as_bytes())?;
@@ -183,8 +186,9 @@ pub fn write_static_image_rgba_zlib(
             1
         };
         write!(writer, "m={more};")?;
-        let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(chunk);
-        writer.write_all(encoded.as_bytes())?;
+        let encoded_len =
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode_slice(chunk, &mut encoded)?;
+        writer.write_all(&encoded[..encoded_len])?;
         writer.write_all(esc_suffix.as_bytes())?;
     }
 
@@ -261,11 +265,60 @@ mod tests {
     }
 
     #[test]
-    fn raw_base64_no_padding() {
-        for len in [1_usize, 2, 3, 4, 5, 6, 10, 100, 1000] {
-            let data: Vec<u8> = (0..len as u8).collect();
-            let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(data);
-            assert!(!encoded.contains('='));
+    fn image_chunks_round_trip_at_base64_boundaries() {
+        for len in [
+            0,
+            1,
+            2,
+            3,
+            RAW_CHUNK_SIZE - 1,
+            RAW_CHUNK_SIZE,
+            RAW_CHUNK_SIZE + 1,
+            RAW_CHUNK_SIZE + 2,
+            2 * RAW_CHUNK_SIZE,
+            2 * RAW_CHUNK_SIZE + 2,
+        ] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            for tmux in [false, true] {
+                for rgba in [false, true] {
+                    let mut output = Vec::new();
+                    let size = Size {
+                        pixel_width: 8,
+                        pixel_height: 16,
+                        cols: 1,
+                        rows: 1,
+                    };
+                    let write_image = if rgba {
+                        write_static_image_rgba_zlib
+                    } else {
+                        write_static_image
+                    };
+                    write_image(&mut output, &data, 8, 16, size, tmux, 0x0102_0304).unwrap();
+                    let output = String::from_utf8(output).unwrap();
+                    let (prefix, suffix) = if tmux {
+                        ("\x1bPtmux;\x1b\x1b_G", "\x1b\x1b\\\x1b\\")
+                    } else {
+                        ("\x1b_G", "\x1b\\")
+                    };
+                    let chunks: Vec<_> = output.split(prefix).skip(1).collect();
+                    assert_eq!(chunks.len(), len.div_ceil(RAW_CHUNK_SIZE));
+                    let mut decoded = Vec::new();
+                    for (index, chunk) in chunks.iter().enumerate() {
+                        let (command, _) = chunk.split_once(suffix).unwrap();
+                        let (header, payload) = command.split_once(';').unwrap();
+                        let more = usize::from(index + 1 < chunks.len());
+                        assert!(header.ends_with(&format!("m={more}")));
+                        assert!(payload.len() <= CHUNK_SIZE);
+                        assert!(!payload.contains('='));
+                        decoded.extend(
+                            base64::engine::general_purpose::STANDARD_NO_PAD
+                                .decode(payload)
+                                .unwrap(),
+                        );
+                    }
+                    assert_eq!(decoded, data, "len={len}, tmux={tmux}, rgba={rgba}");
+                }
+            }
         }
     }
 

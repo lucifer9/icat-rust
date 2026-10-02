@@ -103,8 +103,22 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(rendered.image.width() > 20);
-        assert!(rendered.image.height() > 20);
+        assert_ink_has_padding("matrix", &rendered.image);
+        let (left, top, right, bottom) = alpha_bounds(&rendered.image);
+        // Exclude the brackets; each of the four cells must contain a glyph.
+        let inset = (right - left) / 5;
+        let xs = [left + inset, (left + right) / 2, right - inset];
+        let ys = [top, (top + bottom) / 2, bottom + 1];
+        let pixels = rendered.image.to_rgba8();
+        for row in 0..2 {
+            for col in 0..2 {
+                assert!(
+                    (ys[row]..ys[row + 1])
+                        .any(|y| (xs[col]..xs[col + 1]).any(|x| pixels.get_pixel(x, y)[3] > 8)),
+                    "matrix cell ({row}, {col}) must have visible ink"
+                );
+            }
+        }
     }
 
     #[test]

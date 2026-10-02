@@ -1369,8 +1369,7 @@ fn parse_er(input: &str) -> Result<ErDiagram, String> {
     let mut new_entities = Vec::new();
     for rel in &relationships {
         for name in [&rel.from, &rel.to] {
-            if !existing.contains(name.as_str()) {
-                existing.insert(name.as_str());
+            if existing.insert(name.as_str()) {
                 new_entities.push(ErEntity {
                     name: name.clone(),
                     attributes: Vec::new(),

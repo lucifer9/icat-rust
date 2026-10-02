@@ -2539,6 +2539,20 @@ mod tests {
         (left, top, right, bottom)
     }
 
+    fn assert_rendered_content(image: &DynamicImage) {
+        let (left, top, right, bottom) = non_white_bounds(image);
+        assert!(
+            right > left + 8 && bottom > top + 8,
+            "visible content must occupy an area"
+        );
+        assert!(
+            left > 0 && top > 0 && right + 1 < image.width() && bottom + 1 < image.height(),
+            "content must fit inside the canvas: ({left}, {top})..({right}, {bottom}) in {}x{}",
+            image.width(),
+            image.height()
+        );
+    }
+
     #[test]
     fn markdown_render_width_cases() {
         assert_eq!(markdown_render_width(0), DEFAULT_MARKDOWN_WIDTH);
@@ -2555,6 +2569,7 @@ mod tests {
             800,
         )
         .unwrap();
+        assert_rendered_content(&image);
         assert_eq!(image.width(), 800);
         assert!(image.height() > 0);
         let encoded = imgutil::encode_png(&image).unwrap();
@@ -2569,6 +2584,7 @@ mod tests {
             800,
         )
         .unwrap();
+        assert_rendered_content(&image);
         assert_eq!(image.width(), 800);
         assert!(image.height() > 0);
     }
@@ -2599,6 +2615,7 @@ c & d
 $$
 "#;
         let image = render_markdown(md, Path::new(""), 800).unwrap();
+        assert_rendered_content(&image);
         assert_eq!(image.width(), 800);
         assert!(image.height() > 120);
     }
@@ -2607,6 +2624,7 @@ $$
     fn render_markdown_with_mermaid() {
         let md = b"```mermaid\nflowchart TD\n    A[Start] --> B{Decision}\n    B -->|Yes| C[Continue]\n    B -->|No| D[Retry]\n```\n";
         let image = render_markdown(md, Path::new(""), 800).unwrap();
+        assert_rendered_content(&image);
         assert_eq!(image.width(), 800);
         assert!(image.height() > 180);
     }
@@ -2616,6 +2634,7 @@ $$
         let md = b"```mermaid\nsequenceDiagram\n    participant User\n    participant System\n    participant Database\n\n    User->>System: Login Request\n    System->>Database: Query User\n    Database-->>System: User Data\n    System-->>User: Login Success\n```\n";
         let image = render_markdown(md, Path::new(""), 800).unwrap();
 
+        assert_rendered_content(&image);
         assert_eq!(image.width(), 800);
         assert!(
             image.height() > 280,
@@ -2645,6 +2664,7 @@ $$
 
         for (name, md, min_height) in diagrams {
             let image = render_markdown(md, Path::new(""), 800).unwrap();
+            assert_rendered_content(&image);
             assert_eq!(image.width(), 800, "{name} diagram width");
             assert!(
                 image.height() > *min_height,
@@ -2664,6 +2684,7 @@ $$
 "#;
         let image = render_markdown(md, Path::new(""), 800).unwrap();
 
+        assert_rendered_content(&image);
         assert_eq!(image.width(), 800);
         assert!(
             image.height() > 150,

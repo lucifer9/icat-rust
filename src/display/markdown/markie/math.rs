@@ -176,10 +176,7 @@ fn parse_mathml_attrs(element: &BytesStart<'_>) -> Result<Attrs, String> {
             let value = attribute
                 .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|err| format!("XML attribute decode error: {err}"))?;
-            Ok((
-                attribute.key.as_ref().to_string(),
-                value.into_owned(),
-            ))
+            Ok((attribute.key.as_ref().to_string(), value.into_owned()))
         })
         .collect()
 }
