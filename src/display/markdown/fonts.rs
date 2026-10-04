@@ -21,6 +21,39 @@ const PREFERRED_FAMILIES: &[&str] = &["pingfangsc", "pingfang", "notosanscjksc",
 // Test string for Chinese glyph coverage check
 const CJK_TEST_CHARS: &str = "中国银行卡号金额";
 
+/// Whether `ch` belongs to a CJK block (ideographs, kana, Hangul, CJK and
+/// full-width punctuation) that should render with the preferred CJK family.
+pub fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2E80}'..='\u{2FDF}'
+            | '\u{3000}'..='\u{33FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE30}'..='\u{FE4F}'
+            | '\u{FF00}'..='\u{FFEF}'
+            | '\u{20000}'..='\u{3FFFF}'
+    )
+}
+
+/// Splits `text` into maximal runs of CJK and non-CJK characters.
+pub fn cjk_runs(text: &str) -> impl Iterator<Item = (&str, bool)> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let first = rest.chars().next()?;
+        let cjk = is_cjk_char(first);
+        let end = rest
+            .char_indices()
+            .find(|&(_, ch)| is_cjk_char(ch) != cjk)
+            .map_or(rest.len(), |(idx, _)| idx);
+        let (run, tail) = rest.split_at(end);
+        rest = tail;
+        Some((run, cjk))
+    })
+}
+
 pub struct FontResolution {
     pub font_system: FontSystem,
     pub warning: Option<String>,

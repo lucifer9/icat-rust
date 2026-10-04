@@ -1141,14 +1141,14 @@ fn layout_blocks_inner(
                 {
                     let rich: Vec<(&str, Attrs)> = spans_data
                         .iter()
-                        .map(|(s, r, g, b, bold)| {
+                        .flat_map(|(s, r, g, b, bold)| {
                             let mut a = Attrs::new()
                                 .family(Family::Monospace)
                                 .color(Color::rgb(*r, *g, *b));
                             if *bold {
                                 a = a.weight(Weight::BOLD);
                             }
-                            (s.as_str(), a)
+                            route_monospace_cjk(s, &a)
                         })
                         .collect();
                     let default_attrs = Attrs::new().family(Family::Monospace);
@@ -1447,9 +1447,42 @@ fn layout_text_with_attrs(
 ) -> Result<TextLayout, Box<dyn std::error::Error>> {
     let mut buffer = Buffer::new(font_system, Metrics::new(size, size * 1.4));
     buffer.set_size(Some(width as f32), None);
-    buffer.set_text(text, &attrs, Shaping::Advanced, None);
+    set_buffer_text(&mut buffer, text, &attrs);
     buffer.shape_until_scroll(font_system, false);
     Ok(text_layout_from_buffer(buffer, Color::rgb(0, 0, 0)))
+}
+
+fn set_buffer_text(buffer: &mut Buffer, text: &str, attrs: &Attrs) {
+    if has_monospace_cjk(text, attrs) {
+        let spans = route_monospace_cjk(text, attrs);
+        buffer.set_rich_text(spans, attrs, Shaping::Advanced, None);
+    } else {
+        buffer.set_text(text, attrs, Shaping::Advanced, None);
+    }
+}
+
+// cosmic-text's monospace fallback picks any monospaced CJK face (BIZ UDGothic
+// on macOS) before the configured CJK family, so code would mix two CJK
+// typefaces. Send CJK runs to SansSerif, which resolve_fonts() points at the
+// preferred CJK family (PingFang SC on macOS, Noto Sans CJK SC on Linux).
+fn route_monospace_cjk<'t, 'a>(text: &'t str, attrs: &Attrs<'a>) -> Vec<(&'t str, Attrs<'a>)> {
+    if !has_monospace_cjk(text, attrs) {
+        return vec![(text, attrs.clone())];
+    }
+    fonts::cjk_runs(text)
+        .map(|(run, cjk)| {
+            let family = if cjk {
+                Family::SansSerif
+            } else {
+                Family::Monospace
+            };
+            (run, attrs.clone().family(family))
+        })
+        .collect()
+}
+
+fn has_monospace_cjk(text: &str, attrs: &Attrs) -> bool {
+    attrs.family == Family::Monospace && text.chars().any(fonts::is_cjk_char)
 }
 
 fn attrs_for_kind(kind: FontKind, color: Option<u32>) -> Attrs<'static> {
@@ -1783,7 +1816,7 @@ fn measure_segment_widths(
     let joined: String = segments.concat();
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, font_size * 1.4));
     buffer.set_size(None, None);
-    buffer.set_text(&joined, &inline_attrs(style), Shaping::Advanced, None);
+    set_buffer_text(&mut buffer, &joined, &inline_attrs(style));
     buffer.shape_until_scroll(font_system, false);
 
     let mut starts = Vec::with_capacity(segments.len());
@@ -2515,6 +2548,7 @@ pub fn markdown_chunk_rects(width: u32, height: u32) -> Vec<(u32, u32, u32, u32)
 mod tests {
     use super::*;
     use image::{GenericImage, GenericImageView, ImageEncoder};
+    use std::collections::BTreeSet;
 
     fn non_white_bounds(image: &DynamicImage) -> (u32, u32, u32, u32) {
         let rgba = image.to_rgba8();
@@ -3257,5 +3291,54 @@ $$
             800,
         );
         assert_eq!(cjk.unwrap().height(), ascii.unwrap().height());
+    }
+
+    // Font faces used by CJK glyphs, grouped by prose, inline code, and code block.
+    fn cjk_faces_by_context(markdown: &str) -> [BTreeSet<cosmic_text::fontdb::ID>; 3] {
+        fn collect(layout: &TextLayout, faces: &mut BTreeSet<cosmic_text::fontdb::ID>) {
+            for run in layout.buffer.layout_runs() {
+                for glyph in run.glyphs {
+                    if run.text[glyph.start..glyph.end]
+                        .chars()
+                        .any(fonts::is_cjk_char)
+                    {
+                        faces.insert(glyph.font_id);
+                    }
+                }
+            }
+        }
+
+        let mut font_system = fonts::resolve_fonts().font_system;
+        let blocks = parse_markdown_blocks(markdown.as_bytes());
+        let (rendered, _) =
+            layout_blocks_inner(&blocks, Path::new(""), &mut font_system, 800, 24.0).unwrap();
+        let [mut prose, mut inline_code, mut code_block] = Default::default();
+        for block in &rendered {
+            match block {
+                RenderBlock::Inline { layout, .. } => {
+                    for item in &layout.items {
+                        if let InlineRenderItem::Text { layout, .. } = item {
+                            let mono = layout.buffer.lines.iter().any(|line| {
+                                line.attrs_list().defaults().family == Family::Monospace
+                            });
+                            collect(layout, if mono { &mut inline_code } else { &mut prose });
+                        }
+                    }
+                }
+                RenderBlock::Code { layout, .. } => collect(layout, &mut code_block),
+                _ => {}
+            }
+        }
+        [prose, inline_code, code_block]
+    }
+
+    #[test]
+    fn monospace_cjk_uses_same_face_as_prose() {
+        let [prose, inline_code, code_block] = cjk_faces_by_context(
+            "把外套改成深绿色，保持背景不变。\n\n`把外套改成深绿色，保持背景不变。`\n\n```bash\n--prompt \"把外套改成深绿色，保持背景不变。\"\n```\n",
+        );
+        assert_eq!(prose.len(), 1, "prose CJK should use one face: {prose:?}");
+        assert_eq!(inline_code, prose);
+        assert_eq!(code_block, prose);
     }
 }
