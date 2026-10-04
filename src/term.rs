@@ -1,18 +1,22 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::fs::{Access, access};
 use rustix::io::Errno;
 use rustix::process::{Pid, test_kill_process};
-use rustix::termios::{Winsize, tcgetwinsize};
+use rustix::termios::{
+    LocalModes, OptionalActions, SpecialCodeIndex, Winsize, tcgetattr, tcgetwinsize, tcsetattr,
+};
 
 pub const DEFAULT_CELL_WIDTH: u32 = 8;
 pub const DEFAULT_CELL_HEIGHT: u32 = 16;
 // Assumed terminal pixel size when neither ioctl nor cell geometry is available.
 pub const DEFAULT_PIXEL_WIDTH: u32 = 640;
 pub const DEFAULT_PIXEL_HEIGHT: u32 = 384;
+// Upper bound on waiting for the terminal to answer the cell-size query.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
@@ -71,9 +75,11 @@ pub fn get_size() -> Size {
     }
 
     if best_cols > 0 && best_rows > 0 {
+        let (cell_width, cell_height) =
+            query_cell_size().unwrap_or((DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT));
         return Size {
-            pixel_width: best_cols * DEFAULT_CELL_WIDTH,
-            pixel_height: best_rows * DEFAULT_CELL_HEIGHT,
+            pixel_width: best_cols * cell_width,
+            pixel_height: best_rows * cell_height,
             cols: best_cols,
             rows: best_rows,
         };
@@ -85,6 +91,64 @@ pub fn get_size() -> Size {
         cols: 80,
         rows: 24,
     }
+}
+
+// Some pty layers (e.g. `atuin pty-proxy`) forward rows/cols but zero the pixel
+// fields, so ask the terminal for its cell size with XTWINOPS `CSI 16 t`. The
+// trailing DA1 query is answered by nearly every terminal, so terminals that
+// ignore `16 t` end the wait without hitting the timeout.
+fn query_cell_size() -> Option<(u32, u32)> {
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    let original = tcgetattr(&tty).ok()?;
+    let mut raw = original.clone();
+    raw.local_modes
+        .remove(LocalModes::ICANON | LocalModes::ECHO);
+    raw.special_codes[SpecialCodeIndex::VMIN] = 0;
+    raw.special_codes[SpecialCodeIndex::VTIME] = 1;
+    tcsetattr(&tty, OptionalActions::Now, &raw).ok()?;
+    let reply = read_query_reply(&mut tty);
+    if let Err(err) = tcsetattr(&tty, OptionalActions::Now, &original) {
+        eprintln!("warning: failed to restore terminal mode: {err}");
+    }
+    parse_cell_size_reply(&reply)
+}
+
+fn read_query_reply(tty: &mut File) -> Vec<u8> {
+    let mut reply = Vec::new();
+    if tty.write_all(b"\x1b[16t\x1b[c").is_err() {
+        return reply;
+    }
+    let deadline = Instant::now() + QUERY_TIMEOUT;
+    let mut buf = [0_u8; 64];
+    while Instant::now() < deadline && !has_da1_reply(&reply) {
+        match tty.read(&mut buf) {
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    reply
+}
+
+fn has_da1_reply(reply: &[u8]) -> bool {
+    reply
+        .windows(3)
+        .position(|w| w == b"\x1b[?")
+        .is_some_and(|start| reply[start..].contains(&b'c'))
+}
+
+/// Parses `ESC [ 6 ; height ; width t` from a terminal reply into (width, height).
+fn parse_cell_size_reply(reply: &[u8]) -> Option<(u32, u32)> {
+    let text = std::str::from_utf8(reply).ok()?;
+    let (_, rest) = text.split_once("\x1b[6;")?;
+    let (body, _) = rest.split_once('t')?;
+    let (height, width) = body.split_once(';')?;
+    let height = height.parse::<u32>().ok().filter(|&v| v > 0)?;
+    let width = width.parse::<u32>().ok().filter(|&v| v > 0)?;
+    Some((width, height))
 }
 
 pub fn tmux_socket_and_pid(value: &str) -> Option<(String, i32)> {
@@ -285,6 +349,16 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn parse_cell_size_reply_reads_xtwinops_cell_size() {
+        assert_eq!(
+            parse_cell_size_reply(b"\x1b[6;37;17t\x1b[?62;52;c"),
+            Some((17, 37))
+        );
+        assert_eq!(parse_cell_size_reply(b"\x1b[?62;52;c"), None);
+        assert_eq!(parse_cell_size_reply(b"\x1b[6;0;17t\x1b[?62c"), None);
     }
 
     #[test]
