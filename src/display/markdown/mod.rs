@@ -2490,20 +2490,7 @@ pub fn markdown_font_size(value: f64) -> f64 {
 }
 
 pub fn markdown_page_height(size: Size) -> u32 {
-    let mut height = if size.pixel_height > 0 {
-        size.pixel_height
-    } else if size.rows > 0 {
-        size.rows * term::DEFAULT_CELL_HEIGHT
-    } else {
-        term::DEFAULT_PIXEL_HEIGHT
-    };
-    let reserved = if size.rows > 0 && size.pixel_height > 0 {
-        2 * (size.pixel_height / size.rows.max(1)).max(1)
-    } else {
-        2 * term::DEFAULT_CELL_HEIGHT
-    };
-    height = height.saturating_sub(reserved);
-    height.max(120)
+    size.image_area_height()
 }
 
 pub fn markdown_total_pages(total_height: u32, page_height: u32) -> usize {

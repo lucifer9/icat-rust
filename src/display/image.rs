@@ -33,7 +33,8 @@ fn encode_and_send(raw: &[u8], size: Size, tmux: bool) -> Result<(), Box<dyn std
         && let Some((width, height)) = imgutil::png_dimensions(raw)
         && imgutil::check_limits(width, height)
     {
-        let (sw, sh) = imgutil::fit_to_width(width, height, size.pixel_width);
+        let (sw, sh) =
+            imgutil::fit_within(width, height, size.pixel_width, size.image_area_height());
         if sw == width && sh == height {
             return kitty::send_static_image(raw, width, height, size, tmux);
         }
@@ -43,7 +44,7 @@ fn encode_and_send(raw: &[u8], size: Size, tmux: bool) -> Result<(), Box<dyn std
     let mut image =
         imgutil::decode_with_limits(raw).map_err(|e| format!("failed to decode image: {e}"))?;
     let (width, height) = image.dimensions();
-    let (sw, sh) = imgutil::fit_to_width(width, height, size.pixel_width);
+    let (sw, sh) = imgutil::fit_within(width, height, size.pixel_width, size.image_area_height());
     if sw != width || sh != height {
         image = imgutil::scale(&image, sw, sh);
     }
@@ -64,7 +65,8 @@ pub fn prepare_image(
         if !imgutil::check_limits(width, height) {
             return Err(String::from("image too large").into());
         }
-        let (scaled_width, scaled_height) = imgutil::fit_to_width(width, height, max_pixel_width);
+        let (scaled_width, scaled_height) =
+            imgutil::fit_within(width, height, max_pixel_width, u32::MAX);
         if scaled_width == width && scaled_height == height {
             return Ok(PreparedImage {
                 png_data: raw.to_vec(),
@@ -77,7 +79,8 @@ pub fn prepare_image(
     let mut image =
         imgutil::decode_with_limits(raw).map_err(|err| format!("failed to decode image: {err}"))?;
     let (width, height) = image.dimensions();
-    let (scaled_width, scaled_height) = imgutil::fit_to_width(width, height, max_pixel_width);
+    let (scaled_width, scaled_height) =
+        imgutil::fit_within(width, height, max_pixel_width, u32::MAX);
     if scaled_width != width || scaled_height != height {
         image = imgutil::scale(&image, scaled_width, scaled_height);
     }

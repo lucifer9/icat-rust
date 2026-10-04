@@ -149,11 +149,18 @@ pub fn scale(image: &DynamicImage, dst_width: u32, dst_height: u32) -> DynamicIm
     image.resize_exact(dst_width, dst_height, FilterType::CatmullRom)
 }
 
-pub fn fit_to_width(image_width: u32, image_height: u32, max_pixel_width: u32) -> (u32, u32) {
-    if image_width <= max_pixel_width {
+/// Scales down, preserving aspect ratio, until the image fits both bounds.
+pub fn fit_within(
+    image_width: u32,
+    image_height: u32,
+    max_width: u32,
+    max_height: u32,
+) -> (u32, u32) {
+    if image_width <= max_width && image_height <= max_height {
         return (image_width, image_height);
     }
-    let scale = max_pixel_width as f64 / image_width as f64;
+    let scale =
+        (max_width as f64 / image_width as f64).min(max_height as f64 / image_height as f64);
     let width = (image_width as f64 * scale).round().max(1.0) as u32;
     let height = (image_height as f64 * scale).round().max(1.0) as u32;
     (width, height)
@@ -271,11 +278,13 @@ mod tests {
     }
 
     #[test]
-    fn fit_to_width_behaviour() {
-        assert_eq!(fit_to_width(100, 100, 800), (100, 100));
-        assert_eq!(fit_to_width(1600, 400, 800), (800, 200));
-        assert_eq!(fit_to_width(200, 2000, 800), (200, 2000));
-        assert_eq!(fit_to_width(800, 600, 800), (800, 600));
+    fn fit_within_behaviour() {
+        assert_eq!(fit_within(100, 100, 800, 600), (100, 100));
+        assert_eq!(fit_within(1600, 400, 800, 600), (800, 200));
+        assert_eq!(fit_within(200, 2000, 800, 600), (60, 600));
+        assert_eq!(fit_within(800, 600, 800, 600), (800, 600));
+        assert_eq!(fit_within(1600, 1600, 800, 600), (600, 600));
+        assert_eq!(fit_within(200, 2000, 800, u32::MAX), (200, 2000));
     }
 
     #[test]

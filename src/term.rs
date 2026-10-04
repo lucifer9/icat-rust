@@ -26,6 +26,27 @@ pub struct Size {
     pub rows: u32,
 }
 
+impl Size {
+    /// Tallest image, in pixels, that leaves the last two rows visible for the
+    /// newline after the image and the shell or pager prompt. Kitty draws
+    /// images above text, so a taller image would cover the prompt.
+    pub fn image_area_height(&self) -> u32 {
+        let height = if self.pixel_height > 0 {
+            self.pixel_height
+        } else if self.rows > 0 {
+            self.rows * DEFAULT_CELL_HEIGHT
+        } else {
+            DEFAULT_PIXEL_HEIGHT
+        };
+        let reserved = if self.rows > 0 && self.pixel_height > 0 {
+            2 * (self.pixel_height / self.rows).max(1)
+        } else {
+            2 * DEFAULT_CELL_HEIGHT
+        };
+        height.saturating_sub(reserved).max(120)
+    }
+}
+
 pub fn size_from_full_winsize(ws: &Winsize) -> Option<Size> {
     if ws.ws_xpixel == 0 || ws.ws_ypixel == 0 || ws.ws_col == 0 || ws.ws_row == 0 {
         return None;
