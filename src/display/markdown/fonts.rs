@@ -232,7 +232,7 @@ fn configure_preferred_cjk_sans_family(fs: &mut FontSystem) -> Option<String> {
 
 /// Resolve fonts for Markdown rendering, returning a ready FontSystem and optional warning.
 pub fn resolve_fonts() -> FontResolution {
-    let mut fs = FontSystem::new();
+    let mut fs = without_zero_width_monospace_faces(FontSystem::new());
     configure_preferred_cjk_sans_family(&mut fs);
     let warning = if font_system_can_render_cjk(&mut fs) {
         None
@@ -279,6 +279,42 @@ pub fn resolve_fonts() -> FontResolution {
         font_system: fs,
         warning,
     }
+}
+
+// cosmic-text sizes monospace fallback glyphs by the face's space advance per
+// em. It skips faces without a space glyph but not faces whose space advance is
+// zero (macOS GB18030Bitmap), which yields an infinite glyph size: every CJK
+// character in a code block becomes its own NaN-height line.
+fn without_zero_width_monospace_faces(fs: FontSystem) -> FontSystem {
+    use cosmic_text::skrifa::instance::{LocationRef, Size};
+    use cosmic_text::skrifa::{FontRef, MetadataProvider};
+
+    let broken: Vec<_> = fs
+        .db()
+        .faces()
+        .filter(|face| face.monospaced)
+        .filter(|face| {
+            fs.db()
+                .with_face_data(face.id, |data, index| {
+                    let font = FontRef::from_index(data, index).ok()?;
+                    let space = font.charmap().map(' ')?;
+                    font.glyph_metrics(Size::unscaled(), LocationRef::default())
+                        .advance_width(space)
+                })
+                .flatten()
+                == Some(0.0)
+        })
+        .map(|face| face.id)
+        .collect();
+    if broken.is_empty() {
+        return fs;
+    }
+    // FontSystem caches its monospace face list at construction, so rebuild it.
+    let (locale, mut db) = fs.into_locale_and_db();
+    for id in broken {
+        db.remove_face(id);
+    }
+    FontSystem::new_with_locale_and_db(locale, db)
 }
 
 /// Build the warning message matching Go's text exactly.

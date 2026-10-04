@@ -3247,4 +3247,15 @@ $$
             "code block should have gray (245,245,245) background"
         );
     }
+
+    #[test]
+    fn render_markdown_cjk_code_line_keeps_single_line_height() {
+        let ascii = render_markdown(b"```bash\n--prompt \"abcdef\"\n```\n", Path::new(""), 800);
+        let cjk = render_markdown(
+            "```bash\n--prompt \"把衣服换成深绿色\"\n```\n".as_bytes(),
+            Path::new(""),
+            800,
+        );
+        assert_eq!(cjk.unwrap().height(), ascii.unwrap().height());
+    }
 }
