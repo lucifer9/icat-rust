@@ -1259,10 +1259,14 @@ impl RouteSlot {
     }
 }
 
-/// Where a line at `angle` from the center leaves `rect`; small square
-/// states are start/end circles.
+/// Small square states are drawn as start/end circles.
+fn is_round_state(rect: &Rect) -> bool {
+    rect.w == rect.h && rect.w < 30.0
+}
+
+/// Where a line at `angle` from the center leaves `rect`.
 fn state_anchor(rect: &Rect, angle: f32) -> (f32, f32) {
-    if rect.w == rect.h && rect.w < 30.0 {
+    if is_round_state(rect) {
         let (cx, cy) = rect.center();
         (
             cx + angle.cos() * (rect.w / 2.0),
@@ -1270,6 +1274,20 @@ fn state_anchor(rect: &Rect, angle: f32) -> (f32, f32) {
         )
     } else {
         rect_boundary_point(rect, angle)
+    }
+}
+
+/// Where a vertical line at `x` leaves `rect` through its bottom or top.
+fn state_vertical_anchor(rect: &Rect, x: f32, bottom: bool) -> f32 {
+    let sign = if bottom { 1.0 } else { -1.0 };
+    if is_round_state(rect) {
+        let (cx, cy) = rect.center();
+        let r = rect.w / 2.0;
+        cy + sign * (r * r - (x - cx).powi(2)).sqrt()
+    } else if bottom {
+        rect.bottom()
+    } else {
+        rect.y
     }
 }
 
@@ -1358,7 +1376,7 @@ struct StateEdge<'a> {
     end: (f32, f32),
     slot: RouteSlot,
     /// The states share a column and sit far enough apart vertically that
-    /// the transition takes a side lane.
+    /// the transition runs vertically, directly or through a side lane.
     verticalish: bool,
 }
 
@@ -1385,6 +1403,9 @@ impl<'a> StateEdge<'a> {
 
     fn route(&self, blockers: &Blockers) -> StateRoute {
         if self.verticalish {
+            if let Some(route) = self.vertical_route(blockers) {
+                return route;
+            }
             let max_half_width = (self.from.w / 2.0).max(self.to.w / 2.0);
             let lane_x = self.side_lane(blockers).map_or(
                 self.from_center.0 + self.slot.side * (max_half_width + 30.0),
@@ -1420,6 +1441,29 @@ impl<'a> StateEdge<'a> {
                 self.straight_route(((x1 + x2) / 2.0, (y1 + y2) / 2.0))
             }
         }
+    }
+
+    /// Joins vertically aligned states with a vertical line through the
+    /// columns they share, shifted per parallel transition, if it is clear.
+    fn vertical_route(&self, blockers: &Blockers) -> Option<StateRoute> {
+        let x = (self.from_center.0 + self.to_center.0) / 2.0 + self.slot.lane_offset;
+        let spans = |r: &Rect| (x - r.center().0).abs() < r.w / 2.0;
+        if !spans(self.from) || !spans(self.to) {
+            return None;
+        }
+        let down = self.to_center.1 > self.from_center.1;
+        let (y1, y2) = (
+            state_vertical_anchor(self.from, x, down),
+            state_vertical_anchor(self.to, x, !down),
+        );
+        let points = vec![(x, y1), (x, y2)];
+        if !blockers.orthogonal_clear(&points) {
+            return None;
+        }
+        Some(StateRoute {
+            points,
+            label_anchor: (x, (y1 + y2) / 2.0),
+        })
     }
 
     fn straight_route(&self, label_anchor: (f32, f32)) -> StateRoute {
@@ -2359,6 +2403,30 @@ Note right of Child: child note"#,
             near_outside >= 20,
             "arrowhead must be visible just outside B, got {near_outside} pixels"
         );
+    }
+
+    #[test]
+    fn vertically_aligned_states_are_joined_by_straight_line() {
+        let image = rasterize(&render_svg("stateDiagram-v2\nA --> B"));
+        let bands = node_bands(&image);
+        assert_eq!(bands.len(), 2, "expected A above B, got {bands:?}");
+        let ((left, _, right, a_bottom), (_, b_top, _, _)) = (bands[0], bands[1]);
+        let center = (left + right) / 2;
+        let ink = |x: u32, y: u32| image.get_pixel(x, y)[3] > 32;
+        let gap_rows = a_bottom + 3..b_top - 3;
+        let unjoined_rows: Vec<u32> = gap_rows
+            .clone()
+            .filter(|&y| !(center - 2..=center + 2).any(|x| ink(x, y)))
+            .collect();
+        assert!(
+            unjoined_rows.is_empty(),
+            "no line at x={center} on rows {unjoined_rows:?}"
+        );
+        let side_ink = gap_rows
+            .flat_map(|y| (0..image.width()).map(move |x| (x, y)))
+            .filter(|&(x, y)| (x + 3 < left || x > right + 3) && ink(x, y))
+            .count();
+        assert_eq!(side_ink, 0, "edge detours beside the states");
     }
 
     #[test]
