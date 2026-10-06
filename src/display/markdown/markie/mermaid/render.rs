@@ -231,20 +231,18 @@ fn render_sequence(
         .fold(f32::MIN, f32::max);
     let lifeline_start_y = participant_bottom + 8.0;
 
-    let mut message_y = participant_bottom + 34.0;
-
-    let mut activation_starts: HashMap<String, Vec<f32>> = HashMap::new();
-    let elements_svg = render_sequence_elements(&mut RenderSequenceContext {
-        elements: &diagram.elements,
-        participant_centers: &participant_centers,
+    let mut renderer = SequenceRenderer {
+        centers: &participant_centers,
         style,
         measure,
-        message_y: &mut message_y,
-        block_depth: 0,
+        y: participant_bottom + 34.0,
         left_edge,
         right_edge,
-        activation_starts: &mut activation_starts,
-    });
+        activation_starts: HashMap::new(),
+        svg: String::new(),
+    };
+    renderer.render_elements(&diagram.elements, 0);
+    let message_y = renderer.y;
 
     let lifeline_end_y = (message_y + 6.0).max(lifeline_start_y + 24.0);
     for participant in &diagram.participants {
@@ -255,21 +253,9 @@ fn render_sequence(
             ));
         }
     }
-    svg.push_str(&elements_svg);
+    svg.push_str(&renderer.svg);
 
     (svg, diagram_right + padding, message_y + 20.0 + padding)
-}
-
-struct RenderSequenceContext<'a, T: TextMeasure> {
-    elements: &'a [SequenceElement],
-    participant_centers: &'a HashMap<&'a str, f32>,
-    style: &'a DiagramStyle,
-    measure: &'a mut T,
-    message_y: &'a mut f32,
-    block_depth: usize,
-    left_edge: f32,
-    right_edge: f32,
-    activation_starts: &'a mut HashMap<String, Vec<f32>>,
 }
 
 fn sequence_arrowhead(kind: &MessageKind) -> ArrowHead {
@@ -279,284 +265,284 @@ fn sequence_arrowhead(kind: &MessageKind) -> ArrowHead {
     }
 }
 
-fn render_sequence_elements<T: TextMeasure>(ctx: &mut RenderSequenceContext<'_, T>) -> String {
-    let elements = ctx.elements;
-    let participant_centers = ctx.participant_centers;
-    let style = ctx.style;
-    let measure = &mut *ctx.measure;
-    let message_y = &mut *ctx.message_y;
-    let block_depth = ctx.block_depth;
-    let left_edge = ctx.left_edge;
-    let right_edge = ctx.right_edge;
-    let activation_starts = &mut *ctx.activation_starts;
+fn message_dash(msg: &SequenceMessage) -> &'static str {
+    if msg.msg_type == MessageType::Dotted || msg.kind == MessageKind::Reply {
+        " stroke-dasharray=\"4,4\""
+    } else {
+        ""
+    }
+}
 
-    let mut svg = String::new();
-    for element in elements {
-        match element {
-            SequenceElement::Message(msg) => {
-                if let (Some(x1), Some(x2)) = (
-                    participant_centers.get(msg.from.as_str()),
-                    participant_centers.get(msg.to.as_str()),
-                ) {
-                    if (x1 - x2).abs() < 0.5 {
-                        // Self-message: draw a loop to the right
-                        let cx = *x1;
-                        let loop_w = 40.0;
-                        let loop_h = 36.0;
-                        let y_top = *message_y;
-                        let y_bot = y_top + loop_h;
+/// Draws sequence elements top to bottom, advancing `y` past each one.
+struct SequenceRenderer<'a, T: TextMeasure> {
+    centers: &'a HashMap<&'a str, f32>,
+    style: &'a DiagramStyle,
+    measure: &'a mut T,
+    y: f32,
+    left_edge: f32,
+    right_edge: f32,
+    activation_starts: HashMap<String, Vec<f32>>,
+    svg: String,
+}
 
-                        let dash = if msg.msg_type == MessageType::Dotted
-                            || msg.kind == MessageKind::Reply
-                        {
-                            " stroke-dasharray=\"4,4\""
-                        } else {
-                            ""
-                        };
-
-                        svg.push_str(&format!(
-                            r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75"{} />"#,
-                            cx, y_top,
-                            cx + loop_w, y_top,
-                            cx + loop_w, y_bot,
-                            cx, y_bot,
-                            style.edge_stroke, dash
-                        ));
-
-                        // Arrowhead pointing left at return point
-                        svg.push_str(&arrowhead(
-                            sequence_arrowhead(&msg.kind),
-                            cx,
-                            y_bot,
-                            std::f32::consts::PI,
-                            style,
-                        ));
-
-                        if !msg.label.is_empty() {
-                            let label_font = style.font_size * 0.82;
-                            let (pill_w, _) = pill_size(measure, &msg.label, label_font);
-                            let center = (cx + loop_w + 4.0 + pill_w / 2.0, y_top + loop_h / 2.0);
-                            let (pill, _) =
-                                label_pill(measure, style, &msg.label, label_font, center);
-                            svg.push_str(&pill);
-                        }
-
-                        *message_y = y_bot + 20.0;
-                    } else {
-                        let is_right = x2 > x1;
-                        let dash = if msg.msg_type == MessageType::Dotted
-                            || msg.kind == MessageKind::Reply
-                        {
-                            " stroke-dasharray=\"4,4\""
-                        } else {
-                            ""
-                        };
-
-                        svg.push_str(&format!(
-                            r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="0.75"{} />"#,
-                            x1, *message_y, x2, *message_y, style.edge_stroke, dash
-                        ));
-
-                        let angle = if is_right { 0.0 } else { std::f32::consts::PI };
-                        svg.push_str(&arrowhead(
-                            sequence_arrowhead(&msg.kind),
-                            *x2,
-                            *message_y,
-                            angle,
-                            style,
-                        ));
-
-                        if !msg.label.is_empty() {
-                            let center = ((x1 + x2) / 2.0, *message_y - 10.0);
-                            let label_font = style.font_size * 0.82;
-                            let (pill, _) =
-                                label_pill(measure, style, &msg.label, label_font, center);
-                            svg.push_str(&pill);
-                        }
-
-                        *message_y += 50.0;
-                    }
+impl<T: TextMeasure> SequenceRenderer<'_, T> {
+    fn render_elements(&mut self, elements: &[SequenceElement], depth: usize) {
+        for element in elements {
+            match element {
+                SequenceElement::Message(msg) => self.render_message(msg),
+                SequenceElement::Activation(activation) => {
+                    self.render_activation(&activation.participant)
                 }
-            }
-            SequenceElement::Activation(activation) => {
-                if let Some(cx) = participant_centers.get(activation.participant.as_str()) {
-                    activation_starts
-                        .entry(activation.participant.clone())
-                        .or_default()
-                        .push(*message_y - 10.0);
-                    svg.push_str(&format!(
-                        r#"<rect x="{:.2}" y="{:.2}" width="8" height="16" fill="{}" stroke="{}" stroke-width="1" />"#,
-                        cx - 4.0,
-                        *message_y - 10.0,
-                        style.node_fill,
-                        style.node_stroke
-                    ));
+                SequenceElement::Deactivation(activation) => {
+                    self.render_deactivation(&activation.participant)
                 }
-                *message_y += 24.0;
-            }
-            SequenceElement::Deactivation(activation) => {
-                if let Some(cx) = participant_centers.get(activation.participant.as_str())
-                    && let Some(start) = activation_starts
-                        .entry(activation.participant.clone())
-                        .or_default()
-                        .pop()
-                {
-                    svg.push_str(&format!(
-                            r#"<rect x="{:.2}" y="{:.2}" width="8" height="{:.2}" fill="{}" fill-opacity="0.35" stroke="{}" stroke-width="1" />"#,
-                            cx - 4.0,
-                            start,
-                            (*message_y - start).max(16.0),
-                            style.node_fill,
-                            style.node_stroke
-                        ));
-                }
-                *message_y += 24.0;
-            }
-            SequenceElement::Note {
-                participant,
-                position,
-                text,
-            } => {
-                if let Some(cx) = participant_centers.get(participant.as_str()) {
-                    let cleaned = sanitize_xml_text(text);
-                    let note_width = (measure.measure_width(
-                        &cleaned,
-                        style.font_size * 0.8,
-                        false,
-                        false,
-                        false,
-                    ) + 20.0)
-                        .clamp(80.0, 220.0);
-                    let x = match position.as_str() {
-                        "left" => cx - note_width - 12.0,
-                        "right" => cx + 12.0,
-                        _ => cx - note_width / 2.0,
-                    };
-                    let y = *message_y - 18.0;
-                    svg.push_str(&format!(
-                        r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="28" rx="3" fill="{}" fill-opacity="0.25" stroke="{}" stroke-width="1" />"#,
-                        x,
-                        y,
-                        note_width,
-                        style.node_fill,
-                        style.node_stroke
-                    ));
-                    svg.push_str(&format!(
-                        r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}">{}</text>"#,
-                        x + 8.0,
-                        y + 18.0,
-                        style.font_family,
-                        style.font_size * 0.8,
-                        style.node_text,
-                        escape_xml(&cleaned)
-                    ));
-                }
-                *message_y += 42.0;
-            }
-            SequenceElement::Block(block) => {
-                *message_y += 12.0;
-                let start_y = *message_y - 20.0;
-                let inset = block_depth as f32 * 8.0;
-                let block_left = left_edge - 36.0 + inset;
-                let block_right = right_edge + 36.0 - inset;
-                let block_kind = match block.block_type {
-                    SequenceBlockType::Alt => "alt",
-                    SequenceBlockType::Opt => "opt",
-                    SequenceBlockType::Loop => "loop",
-                    SequenceBlockType::Par => "par",
-                    SequenceBlockType::Critical => "critical",
-                };
-                let title = if block.label.is_empty() {
-                    block_kind.to_string()
-                } else {
-                    format!("{} {}", block_kind, block.label)
-                };
-
-                let title_font = style.font_size * 0.8;
-                let cleaned_title = sanitize_xml_text(&title);
-                let title_w = measure.measure_width(&cleaned_title, title_font, false, true, false);
-                let np_pad_x = 6.0;
-                let np_pad_y = 3.0;
-                let np_w = title_w + np_pad_x * 2.0;
-                let np_h = title_font + np_pad_y * 2.0;
-                let np_x = block_left + 10.0 - np_pad_x;
-                let np_y = *message_y - title_font - np_pad_y + 2.0;
-                svg.push_str(&format!(
-                    r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="{}" stroke="{}" stroke-width="0.75" />"#,
-                    np_x, np_y, np_w, np_h,
-                    style.node_fill, style.node_stroke
-                ));
-                svg.push_str(&format!(
-                    r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}" font-weight="bold">{}</text>"#,
-                    block_left + 10.0,
-                    *message_y,
-                    style.font_family,
-                    title_font,
-                    style.node_text,
-                    escape_xml(&title)
-                ));
-                *message_y += 22.0;
-
-                svg.push_str(&render_sequence_elements(&mut RenderSequenceContext {
-                    elements: &block.messages,
-                    participant_centers,
-                    style,
-                    measure,
-                    message_y,
-                    block_depth: block_depth + 1,
-                    left_edge,
-                    right_edge,
-                    activation_starts,
-                }));
-
-                for (label, branch_elements) in &block.else_branches {
-                    let separator_y = *message_y + 2.0;
-                    svg.push_str(&format!(
-                        r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="1" stroke-dasharray="5,3" />"#,
-                        block_left,
-                        separator_y,
-                        block_right,
-                        separator_y,
-                        style.edge_stroke
-                    ));
-                    if !label.is_empty() {
-                        svg.push_str(&format!(
-                            r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}">{}</text>"#,
-                            block_left + 10.0,
-                            separator_y - 12.0,
-                            style.font_family,
-                            style.font_size * 0.78,
-                            style.node_text,
-                            escape_xml(label)
-                        ));
-                    }
-                    *message_y = separator_y + 30.0;
-                    svg.push_str(&render_sequence_elements(&mut RenderSequenceContext {
-                        elements: branch_elements,
-                        participant_centers,
-                        style,
-                        measure,
-                        message_y,
-                        block_depth: block_depth + 1,
-                        left_edge,
-                        right_edge,
-                        activation_starts,
-                    }));
-                }
-
-                svg.push_str(&format!(
-                    r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="none" stroke="{}" stroke-width="1" stroke-dasharray="5,3" />"#,
-                    block_left,
-                    start_y,
-                    (block_right - block_left).max(24.0),
-                    (*message_y - start_y + 16.0).max(28.0),
-                    style.edge_stroke
-                ));
-                *message_y += 10.0;
+                SequenceElement::Note {
+                    participant,
+                    position,
+                    text,
+                } => self.render_note(participant, position, text),
+                SequenceElement::Block(block) => self.render_block(block, depth),
             }
         }
     }
-    svg
+
+    fn render_message(&mut self, msg: &SequenceMessage) {
+        let (Some(&x1), Some(&x2)) = (
+            self.centers.get(msg.from.as_str()),
+            self.centers.get(msg.to.as_str()),
+        ) else {
+            return;
+        };
+        if (x1 - x2).abs() < 0.5 {
+            self.render_self_message(msg, x1);
+            return;
+        }
+
+        let style = self.style;
+        let y = self.y;
+        self.svg.push_str(&format!(
+            r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="0.75"{} />"#,
+            x1,
+            y,
+            x2,
+            y,
+            style.edge_stroke,
+            message_dash(msg)
+        ));
+        let angle = if x2 > x1 { 0.0 } else { std::f32::consts::PI };
+        self.svg.push_str(&arrowhead(
+            sequence_arrowhead(&msg.kind),
+            x2,
+            y,
+            angle,
+            style,
+        ));
+
+        if !msg.label.is_empty() {
+            let center = ((x1 + x2) / 2.0, y - 10.0);
+            let label_font = style.font_size * 0.82;
+            let (pill, _) = label_pill(self.measure, style, &msg.label, label_font, center);
+            self.svg.push_str(&pill);
+        }
+
+        self.y += 50.0;
+    }
+
+    /// Draws a message to the sender itself as a loop to the right.
+    fn render_self_message(&mut self, msg: &SequenceMessage, cx: f32) {
+        let style = self.style;
+        let loop_w = 40.0;
+        let loop_h = 36.0;
+        let y_top = self.y;
+        let y_bot = y_top + loop_h;
+
+        self.svg.push_str(&format!(
+            r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75"{} />"#,
+            cx,
+            y_top,
+            cx + loop_w,
+            y_top,
+            cx + loop_w,
+            y_bot,
+            cx,
+            y_bot,
+            style.edge_stroke,
+            message_dash(msg)
+        ));
+        // Arrowhead pointing left at the return point
+        self.svg.push_str(&arrowhead(
+            sequence_arrowhead(&msg.kind),
+            cx,
+            y_bot,
+            std::f32::consts::PI,
+            style,
+        ));
+
+        if !msg.label.is_empty() {
+            let label_font = style.font_size * 0.82;
+            let (pill_w, _) = pill_size(self.measure, &msg.label, label_font);
+            let center = (cx + loop_w + 4.0 + pill_w / 2.0, y_top + loop_h / 2.0);
+            let (pill, _) = label_pill(self.measure, style, &msg.label, label_font, center);
+            self.svg.push_str(&pill);
+        }
+
+        self.y = y_bot + 20.0;
+    }
+
+    fn render_activation(&mut self, participant: &str) {
+        if let Some(&cx) = self.centers.get(participant) {
+            let start = self.y - 10.0;
+            self.activation_starts
+                .entry(participant.to_string())
+                .or_default()
+                .push(start);
+            self.svg.push_str(&format!(
+                r#"<rect x="{:.2}" y="{:.2}" width="8" height="16" fill="{}" stroke="{}" stroke-width="1" />"#,
+                cx - 4.0,
+                start,
+                self.style.node_fill,
+                self.style.node_stroke
+            ));
+        }
+        self.y += 24.0;
+    }
+
+    fn render_deactivation(&mut self, participant: &str) {
+        if let Some(&cx) = self.centers.get(participant)
+            && let Some(start) = self
+                .activation_starts
+                .get_mut(participant)
+                .and_then(Vec::pop)
+        {
+            self.svg.push_str(&format!(
+                r#"<rect x="{:.2}" y="{:.2}" width="8" height="{:.2}" fill="{}" fill-opacity="0.35" stroke="{}" stroke-width="1" />"#,
+                cx - 4.0,
+                start,
+                (self.y - start).max(16.0),
+                self.style.node_fill,
+                self.style.node_stroke
+            ));
+        }
+        self.y += 24.0;
+    }
+
+    fn render_note(&mut self, participant: &str, position: &str, text: &str) {
+        if let Some(&cx) = self.centers.get(participant) {
+            let style = self.style;
+            let cleaned = sanitize_xml_text(text);
+            let note_width =
+                (self
+                    .measure
+                    .measure_width(&cleaned, style.font_size * 0.8, false, false, false)
+                    + 20.0)
+                    .clamp(80.0, 220.0);
+            let x = match position {
+                "left" => cx - note_width - 12.0,
+                "right" => cx + 12.0,
+                _ => cx - note_width / 2.0,
+            };
+            let y = self.y - 18.0;
+            self.svg.push_str(&format!(
+                r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="28" rx="3" fill="{}" fill-opacity="0.25" stroke="{}" stroke-width="1" />"#,
+                x,
+                y,
+                note_width,
+                style.node_fill,
+                style.node_stroke
+            ));
+            self.svg.push_str(&format!(
+                r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}">{}</text>"#,
+                x + 8.0,
+                y + 18.0,
+                style.font_family,
+                style.font_size * 0.8,
+                style.node_text,
+                escape_xml(&cleaned)
+            ));
+        }
+        self.y += 42.0;
+    }
+
+    /// Draws an `alt`/`loop`/... frame around its branches, inset by nesting `depth`.
+    fn render_block(&mut self, block: &SequenceBlock, depth: usize) {
+        let style = self.style;
+        self.y += 12.0;
+        let start_y = self.y - 20.0;
+        let inset = depth as f32 * 8.0;
+        let block_left = self.left_edge - 36.0 + inset;
+        let block_right = self.right_edge + 36.0 - inset;
+        let block_kind = match block.block_type {
+            SequenceBlockType::Alt => "alt",
+            SequenceBlockType::Opt => "opt",
+            SequenceBlockType::Loop => "loop",
+            SequenceBlockType::Par => "par",
+            SequenceBlockType::Critical => "critical",
+        };
+        let title = if block.label.is_empty() {
+            block_kind.to_string()
+        } else {
+            format!("{} {}", block_kind, block.label)
+        };
+
+        let title_font = style.font_size * 0.8;
+        let cleaned_title = sanitize_xml_text(&title);
+        let title_w = self
+            .measure
+            .measure_width(&cleaned_title, title_font, false, true, false);
+        let np_pad_x = 6.0;
+        let np_pad_y = 3.0;
+        let np_w = title_w + np_pad_x * 2.0;
+        let np_h = title_font + np_pad_y * 2.0;
+        let np_x = block_left + 10.0 - np_pad_x;
+        let np_y = self.y - title_font - np_pad_y + 2.0;
+        self.svg.push_str(&format!(
+            r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="{}" stroke="{}" stroke-width="0.75" />"#,
+            np_x, np_y, np_w, np_h, style.node_fill, style.node_stroke
+        ));
+        self.svg.push_str(&format!(
+            r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}" font-weight="bold">{}</text>"#,
+            block_left + 10.0,
+            self.y,
+            style.font_family,
+            title_font,
+            style.node_text,
+            escape_xml(&title)
+        ));
+        self.y += 22.0;
+
+        self.render_elements(&block.messages, depth + 1);
+
+        for (label, branch_elements) in &block.else_branches {
+            let separator_y = self.y + 2.0;
+            self.svg.push_str(&format!(
+                r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="1" stroke-dasharray="5,3" />"#,
+                block_left, separator_y, block_right, separator_y, style.edge_stroke
+            ));
+            if !label.is_empty() {
+                self.svg.push_str(&format!(
+                    r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}">{}</text>"#,
+                    block_left + 10.0,
+                    separator_y - 12.0,
+                    style.font_family,
+                    style.font_size * 0.78,
+                    style.node_text,
+                    escape_xml(label)
+                ));
+            }
+            self.y = separator_y + 30.0;
+            self.render_elements(branch_elements, depth + 1);
+        }
+
+        self.svg.push_str(&format!(
+            r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="none" stroke="{}" stroke-width="1" stroke-dasharray="5,3" />"#,
+            block_left,
+            start_y,
+            (block_right - block_left).max(24.0),
+            (self.y - start_y + 16.0).max(28.0),
+            style.edge_stroke
+        ));
+        self.y += 10.0;
+    }
 }
 
 // ============================================
@@ -887,49 +873,18 @@ fn render_state(
                 && !child_state_ids.contains(transition.to.as_str())
         })
         .collect();
-
-    let mut pair_totals: HashMap<(String, String), usize> = HashMap::new();
-    for transition in &visible_transitions {
-        *pair_totals
-            .entry(state_pair_key(&transition.from, &transition.to))
-            .or_insert(0) += 1;
-    }
-
     let state_obstacles: Vec<Rect> = positions.values().map(|p| p.expanded(8.0)).collect();
-
-    let mut transition_min_x = f32::MAX;
-    let mut transition_max_x = f32::MIN;
-    let mut transition_max_y = f32::MIN;
-
-    let mut pair_seen: HashMap<(String, String), usize> = HashMap::new();
-    let mut occupied_labels: Vec<Rect> = Vec::new();
-    for transition in visible_transitions {
-        let key = state_pair_key(&transition.from, &transition.to);
-        let route_index = pair_seen.get(&key).copied().unwrap_or(0);
-        pair_seen.insert(key.clone(), route_index + 1);
-        let route_total = pair_totals.get(&key).copied().unwrap_or(1);
-
-        let from_pos = positions.get(&transition.from);
-        let to_pos = positions.get(&transition.to);
-
-        if let (Some(from), Some(to)) = (from_pos, to_pos) {
-            let (t_svg, ext) = render_state_transition(&mut StateTransitionContext {
-                transition,
-                from,
-                to,
-                style,
-                measure,
-                route_index,
-                route_total,
-                occupied_labels: &mut occupied_labels,
-                obstacles: &state_obstacles,
-            });
-            svg.push_str(&t_svg);
-            transition_min_x = transition_min_x.min(ext.x);
-            transition_max_x = transition_max_x.max(ext.x + ext.w);
-            transition_max_y = transition_max_y.max(ext.y + ext.h);
-        }
-    }
+    let (transitions_svg, extents) = render_state_transitions(
+        &visible_transitions,
+        |id| positions.get(id),
+        &state_obstacles,
+        style,
+        measure,
+    );
+    svg.push_str(&transitions_svg);
+    let transition_min_x = extents.iter().map(|e| e.x).fold(f32::MAX, f32::min);
+    let transition_max_x = extents.iter().map(|e| e.x + e.w).fold(f32::MIN, f32::max);
+    let transition_max_y = extents.iter().map(|e| e.y + e.h).fold(f32::MIN, f32::max);
 
     // Draw states
     for state in &diagram.states {
@@ -961,12 +916,9 @@ fn render_state(
                 && !text.is_empty()
                 && let Some(pos) = positions.get(note_state.as_str())
             {
-                let note_width = 180.0_f32;
-                let note_height = 26.0_f32;
-                let nx = pos.x + pos.w + 28.0;
-                let ny = pos.y + 4.0;
-                total_width = total_width.max(nx + note_width + padding);
-                total_height = total_height.max(ny + note_height + padding);
+                let (nx, ny) = state_note_origin(pos);
+                total_width = total_width.max(nx + STATE_NOTE_MAX_WIDTH + padding);
+                total_height = total_height.max(ny + STATE_NOTE_HEIGHT + padding);
             }
         }
     }
@@ -1113,13 +1065,6 @@ fn render_composite_state_contents(
         y_cursor += child_h + STATE_CHILD_GAP;
     }
 
-    let mut pair_totals: HashMap<(String, String), usize> = HashMap::new();
-    for transition in &child_transitions {
-        *pair_totals
-            .entry(state_pair_key(&transition.from, &transition.to))
-            .or_insert(0) += 1;
-    }
-
     let mut child_obstacles: Vec<Rect> =
         child_positions.values().map(|p| p.expanded(3.0)).collect();
     // Include global positions but exclude the parent composite (we're routing inside it)
@@ -1130,37 +1075,107 @@ fn render_composite_state_contents(
             .map(|p| p.expanded(3.0)),
     );
 
-    let mut pair_seen: HashMap<(String, String), usize> = HashMap::new();
-    let mut occupied_labels: Vec<Rect> = Vec::new();
-    for transition in child_transitions {
-        let key = state_pair_key(&transition.from, &transition.to);
-        let route_index = pair_seen.get(&key).copied().unwrap_or(0);
-        pair_seen.insert(key.clone(), route_index + 1);
-        let route_total = pair_totals.get(&key).copied().unwrap_or(1);
+    // Transitions to states outside the composite resolve to their global positions.
+    let (transitions_svg, _) = render_state_transitions(
+        &child_transitions,
+        |id| child_positions.get(id).or_else(|| positions.get(id)),
+        &child_obstacles,
+        style,
+        measure,
+    );
+    svg.push_str(&transitions_svg);
+    svg
+}
 
-        let from = child_positions
-            .get(&transition.from)
-            .or_else(|| positions.get(&transition.from));
-        let to = child_positions
-            .get(&transition.to)
-            .or_else(|| positions.get(&transition.to));
-        if let (Some(from_pos), Some(to_pos)) = (from, to) {
-            let (t_svg, _ext) = render_state_transition(&mut StateTransitionContext {
-                transition,
-                from: from_pos,
-                to: to_pos,
-                style,
-                measure,
-                route_index,
-                route_total,
-                occupied_labels: &mut occupied_labels,
-                obstacles: &child_obstacles,
-            });
-            svg.push_str(&t_svg);
-        }
+/// Draws `transitions`, resolving state ids through `position_of` and
+/// spreading transitions between the same pair of states into separate
+/// lanes. Returns the SVG and the extent of each drawn transition.
+fn render_state_transitions<'r>(
+    transitions: &[&StateTransition],
+    position_of: impl Fn(&str) -> Option<&'r Rect>,
+    obstacles: &[Rect],
+    style: &DiagramStyle,
+    measure: &mut impl TextMeasure,
+) -> (String, Vec<Rect>) {
+    let mut pair_totals: HashMap<(String, String), usize> = HashMap::new();
+    for transition in transitions {
+        *pair_totals
+            .entry(state_pair_key(&transition.from, &transition.to))
+            .or_insert(0) += 1;
     }
 
-    svg
+    let mut svg = String::new();
+    let mut extents = Vec::new();
+    let mut pair_seen: HashMap<(String, String), usize> = HashMap::new();
+    let mut occupied_labels: Vec<Rect> = Vec::new();
+    for transition in transitions {
+        let key = state_pair_key(&transition.from, &transition.to);
+        let seen = pair_seen.entry(key.clone()).or_insert(0);
+        let route_index = *seen;
+        *seen += 1;
+        let route_total = pair_totals[&key];
+
+        let (Some(from), Some(to)) = (position_of(&transition.from), position_of(&transition.to))
+        else {
+            continue;
+        };
+        if transition.from == transition.to {
+            let (t_svg, extent) = render_state_self_transition(
+                transition,
+                from,
+                style,
+                measure,
+                &mut occupied_labels,
+            );
+            svg.push_str(&t_svg);
+            extents.push(extent);
+            continue;
+        }
+
+        let edge = StateEdge::new(
+            from,
+            to,
+            RouteSlot::new(transition, route_index, route_total),
+        );
+        let route = edge.route(&Blockers::new(obstacles, edge.from_center, edge.to_center));
+        svg.push_str(&emit_route(&route, style));
+        let mut extent_points = route.points.clone();
+        if let Some(label) = &transition.label {
+            let (pill, rect) = place_state_label(
+                label,
+                &edge,
+                route.label_anchor,
+                obstacles,
+                &mut occupied_labels,
+                style,
+                measure,
+            );
+            svg.push_str(&pill);
+            extent_points.extend([(rect.x, rect.y), (rect.right(), rect.bottom())]);
+        }
+        extents.push(transition_extent(&extent_points));
+    }
+    (svg, extents)
+}
+
+/// Bounds of `points`, stretched on the low side to include the origin.
+fn transition_extent(points: &[(f32, f32)]) -> Rect {
+    let (min_x, min_y, max_x, max_y) = point_bounds(points);
+    let (x, y) = (min_x.min(0.0), min_y.min(0.0));
+    Rect {
+        x,
+        y,
+        w: (max_x - x).max(0.0),
+        h: (max_y - y).max(0.0),
+    }
+}
+
+const STATE_NOTE_HEIGHT: f32 = 26.0;
+const STATE_NOTE_MAX_WIDTH: f32 = 180.0;
+
+/// Top-left corner of the note drawn beside the state at `state_pos`.
+fn state_note_origin(state_pos: &Rect) -> (f32, f32) {
+    (state_pos.x + state_pos.w + 28.0, state_pos.y + 4.0)
 }
 
 fn render_state_note(
@@ -1172,10 +1187,9 @@ fn render_state_note(
     let cleaned = sanitize_xml_text(text);
     let note_width = (measure.measure_width(&cleaned, style.font_size * 0.8, false, false, false)
         + 16.0)
-        .clamp(72.0, 180.0);
-    let note_height = 26.0;
-    let x = state_pos.x + state_pos.w + 28.0;
-    let y = state_pos.y + 4.0;
+        .clamp(72.0, STATE_NOTE_MAX_WIDTH);
+    let note_height = STATE_NOTE_HEIGHT;
+    let (x, y) = state_note_origin(state_pos);
 
     let y_mid = y + note_height / 2.0;
     let line_x1 = state_pos.x + state_pos.w;
@@ -1203,592 +1217,503 @@ fn render_state_note(
     )
 }
 
-struct StateTransitionContext<'a, T: TextMeasure> {
-    transition: &'a StateTransition,
-    from: &'a Rect,
-    to: &'a Rect,
-    style: &'a DiagramStyle,
-    measure: &'a mut T,
-    route_index: usize,
-    route_total: usize,
-    occupied_labels: &'a mut Vec<Rect>,
-    obstacles: &'a [Rect],
+/// Per-transition routing parameters derived from the state names and the
+/// transition's position among parallel transitions between the same pair.
+struct RouteSlot {
+    hash: u32,
+    /// Offset among parallel transitions, centered on 0.
+    lane: f32,
+    lane_offset: f32,
+    /// Name-derived spread in -2..=2 that keeps unrelated labels apart.
+    global_lane: f32,
+    /// Preferred side for lanes and labels.
+    side: f32,
 }
 
-fn render_state_transition<T: TextMeasure>(
-    ctx: &mut StateTransitionContext<'_, T>,
-) -> (String, Rect) {
-    let transition = ctx.transition;
-    let from = ctx.from;
-    let to = ctx.to;
-    let style = ctx.style;
-    let measure = &mut *ctx.measure;
-    let route_index = ctx.route_index;
-    let route_total = ctx.route_total;
-    let occupied_labels = &mut *ctx.occupied_labels;
-    let obstacles = ctx.obstacles;
-
-    if transition.from == transition.to {
-        return render_state_self_transition(transition, from, style, measure, occupied_labels);
-    }
-
-    let mut svg = String::new();
-    let mut ext_min_x = f32::MAX;
-    let mut ext_min_y = f32::MAX;
-    let mut ext_max_x = f32::MIN;
-    let mut ext_max_y = f32::MIN;
-
-    macro_rules! track_point {
-        ($x:expr, $y:expr) => {
-            ext_min_x = ext_min_x.min($x);
-            ext_min_y = ext_min_y.min($y);
-            ext_max_x = ext_max_x.max($x);
-            ext_max_y = ext_max_y.max($y);
+impl RouteSlot {
+    fn new(transition: &StateTransition, index: usize, total: usize) -> Self {
+        let hash = transition
+            .from
+            .bytes()
+            .chain(transition.to.bytes())
+            .fold(0_u32, |acc, value| {
+                acc.wrapping_mul(31).wrapping_add(value as u32)
+            });
+        let lane = if total > 1 {
+            index as f32 - (total as f32 - 1.0) / 2.0
+        } else {
+            0.0
         };
-    }
-
-    let (from_cx, from_cy) = from.center();
-    let (to_cx, to_cy) = to.center();
-    let center_angle = (to_cy - from_cy).atan2(to_cx - from_cx);
-
-    let (px1, py1) = if from.w == from.h && from.w < 30.0 {
-        (
-            from_cx + center_angle.cos() * (from.w / 2.0),
-            from_cy + center_angle.sin() * (from.w / 2.0),
-        )
-    } else {
-        rect_boundary_point(from, center_angle)
-    };
-
-    let (px2, py2) = if to.w == to.h && to.w < 30.0 {
-        (
-            to_cx + (center_angle + std::f32::consts::PI).cos() * (to.w / 2.0),
-            to_cy + (center_angle + std::f32::consts::PI).sin() * (to.w / 2.0),
-        )
-    } else {
-        rect_boundary_point(to, center_angle + std::f32::consts::PI)
-    };
-
-    let route_hash = transition
-        .from
-        .bytes()
-        .chain(transition.to.bytes())
-        .fold(0_u32, |acc, value| {
-            acc.wrapping_mul(31).wrapping_add(value as u32)
-        });
-    let lane = if route_total > 1 {
-        route_index as f32 - (route_total as f32 - 1.0) / 2.0
-    } else {
-        0.0
-    };
-    let lane_offset = lane * 30.0;
-    let global_lane = (route_hash % 5) as f32 - 2.0;
-    let global_offset = global_lane * 6.0;
-    let route_side = match transition.from.cmp(&transition.to) {
-        std::cmp::Ordering::Less => 1.0,
-        std::cmp::Ordering::Greater => -1.0,
-        std::cmp::Ordering::Equal => {
-            if route_hash % 2 == 0 {
+        Self {
+            hash,
+            lane,
+            lane_offset: lane * 30.0,
+            global_lane: (hash % 5) as f32 - 2.0,
+            // Self transitions are drawn as loops, so the names always differ here.
+            side: if transition.from < transition.to {
                 1.0
             } else {
                 -1.0
+            },
+        }
+    }
+}
+
+/// Where a line at `angle` from the center leaves `rect`; small square
+/// states are start/end circles.
+fn state_anchor(rect: &Rect, angle: f32) -> (f32, f32) {
+    if rect.w == rect.h && rect.w < 30.0 {
+        let (cx, cy) = rect.center();
+        (
+            cx + angle.cos() * (rect.w / 2.0),
+            cy + angle.sin() * (rect.w / 2.0),
+        )
+    } else {
+        rect_boundary_point(rect, angle)
+    }
+}
+
+/// Obstacles a transition must avoid: every state except its own endpoints,
+/// which are recognized by their centers.
+struct Blockers<'a> {
+    rects: Vec<&'a Rect>,
+}
+
+impl<'a> Blockers<'a> {
+    fn new(obstacles: &'a [Rect], from_center: (f32, f32), to_center: (f32, f32)) -> Self {
+        let centered_on = |r: &Rect, (cx, cy): (f32, f32)| {
+            let (rcx, rcy) = r.center();
+            (rcx - cx).abs() < 1.0 && (rcy - cy).abs() < 1.0
+        };
+        let rects = obstacles
+            .iter()
+            .filter(|r| !centered_on(r, from_center) && !centered_on(r, to_center))
+            .collect();
+        Self { rects }
+    }
+
+    fn crosses(&self, a: (f32, f32), b: (f32, f32)) -> bool {
+        self.rects
+            .iter()
+            .any(|r| line_intersects_rect(a.0, a.1, b.0, b.1, r))
+    }
+
+    /// Whether the axis-aligned polyline through `points` keeps a 6px margin
+    /// from every blocker.
+    fn orthogonal_clear(&self, points: &[(f32, f32)]) -> bool {
+        self.rects.iter().all(|r| {
+            let r = r.expanded(6.0);
+            points.windows(2).all(|segment| {
+                let ((x1, y1), (x2, y2)) = (segment[0], segment[1]);
+                if x1 == x2 {
+                    !vseg_hits_rect(x1, y1, y2, &r)
+                } else {
+                    !hseg_hits_rect(y1, x1, x2, &r)
+                }
+            })
+        })
+    }
+}
+
+/// Steps outward from `base(side)` for each of `sides` until `clear(side, lane)`
+/// holds. The second side wins only with strictly fewer steps. Returns the
+/// lane and its step count.
+fn first_clear_lane(
+    sides: [f32; 2],
+    base: impl Fn(f32) -> f32,
+    clear: impl Fn(f32, f32) -> bool,
+) -> Option<(f32, usize)> {
+    const STEP: f32 = 18.0;
+    const MAX_STEPS: usize = 30;
+    let mut best = None;
+    let mut limit = MAX_STEPS;
+    for side in sides {
+        let base = base(side);
+        let found = (0..limit)
+            .map(|i| (base + side * (i as f32) * STEP, i))
+            .find(|&(lane, _)| clear(side, lane));
+        if let Some((_, steps)) = found {
+            best = found;
+            limit = steps;
+        }
+    }
+    best
+}
+
+/// A routed transition. The arrowhead sits on the last point.
+struct StateRoute {
+    points: Vec<(f32, f32)>,
+    label_anchor: (f32, f32),
+    arrow_angle: f32,
+}
+
+/// Endpoint geometry shared by every routing strategy for one transition.
+struct StateEdge<'a> {
+    from: &'a Rect,
+    to: &'a Rect,
+    from_center: (f32, f32),
+    to_center: (f32, f32),
+    /// Where the center-to-center line leaves `from` and enters `to`.
+    start: (f32, f32),
+    end: (f32, f32),
+    slot: RouteSlot,
+    /// The states share a column and sit far enough apart vertically that
+    /// the transition takes a side lane.
+    verticalish: bool,
+}
+
+impl<'a> StateEdge<'a> {
+    fn new(from: &'a Rect, to: &'a Rect, slot: RouteSlot) -> Self {
+        let from_center = from.center();
+        let to_center = to.center();
+        let angle = (to_center.1 - from_center.1).atan2(to_center.0 - from_center.0);
+        let start = state_anchor(from, angle);
+        let end = state_anchor(to, angle + std::f32::consts::PI);
+        let verticalish = (from_center.0 - to_center.0).abs() < (from.w.min(to.w)) / 2.0
+            && (end.1 - start.1).abs() > 30.0;
+        Self {
+            from,
+            to,
+            from_center,
+            to_center,
+            start,
+            end,
+            slot,
+            verticalish,
+        }
+    }
+
+    fn route(&self, blockers: &Blockers) -> StateRoute {
+        if self.verticalish {
+            let max_half_width = (self.from.w / 2.0).max(self.to.w / 2.0);
+            let lane_x = self.side_lane(blockers).map_or(
+                self.from_center.0 + self.slot.side * (max_half_width + 30.0),
+                |(lane_x, _)| lane_x,
+            );
+            self.side_lane_route(lane_x)
+        } else if blockers.crosses(self.start, self.end) {
+            self.detour_route(blockers)
+        } else {
+            // Jitter the label anchor along the edge to reduce label-label collisions.
+            let ((x1, y1), (x2, y2)) = (self.start, self.end);
+            let jitter = ((self.slot.hash % 7) as f32 - 3.0) * 0.07;
+            let t = (0.5 + jitter).clamp(0.25, 0.75);
+            self.straight_route((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t))
+        }
+    }
+
+    /// Tries a Z route, then the closer of a U route and a side lane, and
+    /// finally draws the blocked straight line anyway.
+    fn detour_route(&self, blockers: &Blockers) -> StateRoute {
+        if let Some(route) = self.z_route(blockers) {
+            return route;
+        }
+        match (self.u_lane(blockers), self.side_lane(blockers)) {
+            (Some((lane_y, u_steps)), side)
+                if side.is_none_or(|(_, side_steps)| u_steps <= side_steps) =>
+            {
+                self.u_route(lane_y)
+            }
+            (_, Some((lane_x, _))) => self.side_lane_route(lane_x),
+            _ => {
+                let ((x1, y1), (x2, y2)) = (self.start, self.end);
+                self.straight_route(((x1 + x2) / 2.0, (y1 + y2) / 2.0))
             }
         }
-    };
-    let verticalish =
-        (from_cx - to_cx).abs() < (from.w.min(to.w)) / 2.0 && (py2 - py1).abs() > 30.0;
+    }
 
-    let label_anchor_x;
-    let label_anchor_y;
-    let arrow_angle;
-    let mut arrow_x = px2;
-    let mut arrow_y = py2;
+    fn straight_route(&self, label_anchor: (f32, f32)) -> StateRoute {
+        let ((x1, y1), (x2, y2)) = (self.start, self.end);
+        StateRoute {
+            points: vec![self.start, self.end],
+            label_anchor,
+            arrow_angle: (y1 - y2).atan2(x1 - x2),
+        }
+    }
 
-    if verticalish {
-        // Determine if from and to are adjacent (no boxes between them)
-        let gap = (to.y - from.bottom()).max(from.y - to.bottom());
-        let (top_y, bot_y) = if from_cy < to_cy {
-            (from.bottom(), to.y)
+    /// Leaves the facing sides vertically and crosses over at mid-height,
+    /// if that path is clear.
+    fn z_route(&self, blockers: &Blockers) -> Option<StateRoute> {
+        let (from_cx, from_cy) = self.from_center;
+        let (to_cx, to_cy) = self.to_center;
+        let going_right = to_cx > from_cx;
+        let from_x = if going_right {
+            self.from.right()
         } else {
-            (to.bottom(), from.y)
+            self.from.x
         };
-        let mid_x = (from_cx + to_cx) / 2.0;
-        let is_src_or_dst = |r: &Rect| -> bool {
-            let rcx = r.x + r.w / 2.0;
-            let rcy = r.y + r.h / 2.0;
-            ((rcx - from_cx).abs() < 1.0 && (rcy - from_cy).abs() < 1.0)
-                || ((rcx - to_cx).abs() < 1.0 && (rcy - to_cy).abs() < 1.0)
+        let to_x = if going_right {
+            self.to.x
+        } else {
+            self.to.right()
         };
-        let has_obstacle_between = gap > 0.0
-            && obstacles.iter().any(|r| {
-                if is_src_or_dst(r) {
-                    return false;
-                }
-                // Check if a straight vertical line from from→to would cross this obstacle
-                let line_x = mid_x;
-                line_x >= r.x && line_x <= r.x + r.w && r.y < bot_y && r.y + r.h > top_y
-            });
-        // Also check if the straight line crosses any obstacle using full intersection test
-        let straight_crosses = obstacles.iter().any(|r| {
-            if is_src_or_dst(r) {
-                return false;
-            }
-            line_intersects_rect(px1, py1, px2, py2, r)
-        });
-        let adjacent = gap > 0.0 && gap < 60.0 && !has_obstacle_between && !straight_crosses;
-
-        if adjacent {
-            // Adjacent states: draw a straight vertical line
-            let x = (from_cx + to_cx) / 2.0;
-            let y1 = if from_cy < to_cy {
-                from.bottom()
-            } else {
-                from.y
-            };
-            let y2 = if from_cy < to_cy { to.y } else { to.bottom() };
-            svg.push_str(&format!(
-                r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="0.75" />"#,
-                x, y1, x, y2, style.edge_stroke
-            ));
-            track_point!(x, y1);
-            track_point!(x, y2);
-            label_anchor_x = x;
-            label_anchor_y = (y1 + y2) / 2.0;
-            arrow_angle = if from_cy < to_cy {
-                -std::f32::consts::FRAC_PI_2 // arrowhead points up (into top of target)
+        let mid_y = (from_cy + to_cy) / 2.0;
+        let points = vec![
+            (from_x, from_cy),
+            (from_x, mid_y),
+            (to_x, mid_y),
+            (to_x, to_cy),
+        ];
+        if !blockers.orthogonal_clear(&points) {
+            return None;
+        }
+        Some(StateRoute {
+            points,
+            label_anchor: ((from_x + to_x) / 2.0, mid_y),
+            arrow_angle: if to_cy > mid_y {
+                -std::f32::consts::FRAC_PI_2
             } else {
                 std::f32::consts::FRAC_PI_2
-            };
-            arrow_x = x;
-            arrow_y = y2;
-        } else {
-            // Non-adjacent: use orthogonal routing (out → down → in)
-            let max_half_width = (from.w / 2.0).max(to.w / 2.0);
-            let exit_y = from_cy;
-            let enter_y = to_cy;
-            let is_endpoint = |r: &Rect| -> bool {
-                let rcx = r.x + r.w / 2.0;
-                let rcy = r.y + r.h / 2.0;
-                ((rcx - from_cx).abs() < 1.0 && (rcy - from_cy).abs() < 1.0)
-                    || ((rcx - to_cx).abs() < 1.0 && (rcy - to_cy).abs() < 1.0)
-            };
+            },
+        })
+    }
 
-            // Try both sides and pick the one that clears first (fewer steps)
-            let step = 18.0;
-            let max_steps = 30;
-
-            let mut best_lane_x = from_cx + route_side * (max_half_width + 30.0);
-            let mut best_step_count = max_steps;
-
-            for &try_side in &[route_side, -route_side] {
-                let base = from_cx + try_side * (max_half_width + 30.0 + lane.abs() * 14.0);
-                let fex = if base >= from_cx {
-                    from.x + from.w
-                } else {
-                    from.x
-                };
-                let tex = if base >= to_cx { to.x + to.w } else { to.x };
-                for i in 0..max_steps {
-                    let candidate = base + try_side * (i as f32) * step;
-                    let clear = obstacles.iter().all(|r| {
-                        if is_endpoint(r) {
-                            return true;
-                        }
-                        let rr = r.expanded(6.0);
-                        !hseg_hits_rect(exit_y, fex, candidate, &rr)
-                            && !vseg_hits_rect(candidate, exit_y, enter_y, &rr)
-                            && !hseg_hits_rect(enter_y, candidate, tex, &rr)
-                    });
-                    if clear && i < best_step_count {
-                        best_lane_x = candidate;
-                        best_step_count = i;
-                        break;
-                    }
-                }
+    /// First clear horizontal lane below or above both states, preferring the
+    /// direction of travel.
+    fn u_lane(&self, blockers: &Blockers) -> Option<(f32, usize)> {
+        let (from, to) = (self.from, self.to);
+        let (from_cx, to_cx) = (self.from_center.0, self.to_center.0);
+        let lane_pad = self.slot.lane.abs() * 14.0;
+        let base = |side: f32| {
+            if side > 0.0 {
+                from.bottom().max(to.bottom()) + 30.0 + lane_pad
+            } else {
+                from.y.min(to.y) - 30.0 - lane_pad
             }
+        };
+        let preferred: f32 = if self.to_center.1 > self.from_center.1 {
+            1.0
+        } else {
+            -1.0
+        };
+        first_clear_lane([preferred, -preferred], base, |side, lane_y| {
+            let (from_y, to_y) = if side > 0.0 {
+                (from.bottom(), to.bottom())
+            } else {
+                (from.y, to.y)
+            };
+            blockers.orthogonal_clear(&[
+                (from_cx, from_y),
+                (from_cx, lane_y),
+                (to_cx, lane_y),
+                (to_cx, to_y),
+            ])
+        })
+    }
 
-            let lane_x = best_lane_x;
-            let from_exit_x = if lane_x >= from_cx {
-                from.x + from.w
+    /// Leaves both states vertically and joins them along `lane_y`.
+    fn u_route(&self, lane_y: f32) -> StateRoute {
+        let (from_cx, from_cy) = self.from_center;
+        let (to_cx, to_cy) = self.to_center;
+        let from_exit_y = if lane_y > from_cy {
+            self.from.bottom()
+        } else {
+            self.from.y
+        };
+        let to_enter_y = if lane_y > to_cy {
+            self.to.bottom()
+        } else {
+            self.to.y
+        };
+        StateRoute {
+            points: vec![
+                (from_cx, from_exit_y),
+                (from_cx, lane_y),
+                (to_cx, lane_y),
+                (to_cx, to_enter_y),
+            ],
+            label_anchor: ((from_cx + to_cx) / 2.0, lane_y),
+            arrow_angle: if to_enter_y > lane_y {
+                -std::f32::consts::FRAC_PI_2
+            } else {
+                std::f32::consts::FRAC_PI_2
+            },
+        }
+    }
+
+    /// First clear vertical lane beside both states, preferring the slot's side.
+    fn side_lane(&self, blockers: &Blockers) -> Option<(f32, usize)> {
+        let (from, to) = (self.from, self.to);
+        let (from_cx, exit_y) = self.from_center;
+        let (to_cx, enter_y) = self.to_center;
+        let max_half_width = (from.w / 2.0).max(to.w / 2.0);
+        let base =
+            |side: f32| from_cx + side * (max_half_width + 30.0 + self.slot.lane.abs() * 14.0);
+        first_clear_lane([self.slot.side, -self.slot.side], base, |side, lane_x| {
+            let base_x = base(side);
+            let from_x = if base_x >= from_cx {
+                from.right()
             } else {
                 from.x
             };
-            let to_enter_x = if lane_x >= to_cx { to.x + to.w } else { to.x };
-
-            svg.push_str(&format!(
-                r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75" />"#,
-                from_exit_x, exit_y, lane_x, exit_y, lane_x, enter_y, to_enter_x, enter_y,
-                style.edge_stroke
-            ));
-            track_point!(from_exit_x, exit_y);
-            track_point!(lane_x, exit_y);
-            track_point!(lane_x, enter_y);
-            track_point!(to_enter_x, enter_y);
-            label_anchor_x = lane_x;
-            label_anchor_y = (exit_y + enter_y) / 2.0;
-            arrow_angle = if to_enter_x > lane_x {
-                0.0 // pointing right
-            } else {
-                std::f32::consts::PI // pointing left
-            };
-            arrow_x = to_enter_x;
-            arrow_y = enter_y;
-        }
-    } else {
-        // Check if a straight line would cross any obstacles
-        let is_from_or_to = |r: &Rect| -> bool {
-            let rcx = r.x + r.w / 2.0;
-            let rcy = r.y + r.h / 2.0;
-            ((rcx - from_cx).abs() < 1.0 && (rcy - from_cy).abs() < 1.0)
-                || ((rcx - to_cx).abs() < 1.0 && (rcy - to_cy).abs() < 1.0)
-        };
-        let straight_blocked = obstacles.iter().any(|r| {
-            if is_from_or_to(r) {
-                return false;
-            }
-            line_intersects_rect(px1, py1, px2, py2, r)
-        });
-
-        if straight_blocked {
-            // Obstacle-aware orthogonal routing for non-verticalish blocked paths.
-            // We try multiple strategies and pick the first clear one:
-            //   1. Simple Z-route (exit side → horizontal mid → enter side)
-            //   2. U-route via vertical center exit (exit top/bottom → horizontal lane → enter top/bottom)
-            //   3. Side-exit L-route (exit side → vertical lane → enter side) - like verticalish routing
-            let is_endpoint = |r: &Rect| -> bool {
-                let rcx = r.x + r.w / 2.0;
-                let rcy = r.y + r.h / 2.0;
-                ((rcx - from_cx).abs() < 1.0 && (rcy - from_cy).abs() < 1.0)
-                    || ((rcx - to_cx).abs() < 1.0 && (rcy - to_cy).abs() < 1.0)
-            };
-
-            let step = 18.0;
-            let max_steps = 30;
-
-            // Strategy 1: Simple Z-route (exit from side, horizontal midline, enter from side)
-            let going_right = to_cx > from_cx;
-            let simple_from_exit_x = if going_right { from.x + from.w } else { from.x };
-            let simple_to_enter_x = if going_right { to.x } else { to.x + to.w };
-            let mid_y = (from_cy + to_cy) / 2.0;
-            let simple_clear = obstacles.iter().all(|r| {
-                if is_endpoint(r) {
-                    return true;
-                }
-                let rr = r.expanded(6.0);
-                !vseg_hits_rect(simple_from_exit_x, from_cy, mid_y, &rr)
-                    && !hseg_hits_rect(mid_y, simple_from_exit_x, simple_to_enter_x, &rr)
-                    && !vseg_hits_rect(simple_to_enter_x, mid_y, to_cy, &rr)
-            });
-
-            if simple_clear {
-                // Use simpler Z-route since it's clear
-                svg.push_str(&format!(
-                    r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75" />"#,
-                    simple_from_exit_x, from_cy, simple_from_exit_x, mid_y, simple_to_enter_x, mid_y, simple_to_enter_x, to_cy,
-                    style.edge_stroke
-                ));
-                track_point!(simple_from_exit_x, from_cy);
-                track_point!(simple_from_exit_x, mid_y);
-                track_point!(simple_to_enter_x, mid_y);
-                track_point!(simple_to_enter_x, to_cy);
-                label_anchor_x = (simple_from_exit_x + simple_to_enter_x) / 2.0;
-                label_anchor_y = mid_y;
-                arrow_angle = if to_cy > mid_y {
-                    -std::f32::consts::FRAC_PI_2
-                } else {
-                    std::f32::consts::FRAC_PI_2
-                };
-                arrow_x = simple_to_enter_x;
-                arrow_y = to_cy;
-            } else {
-                // Strategy 2: U-route via vertical center exit
-                let going_down = to_cy > from_cy;
-                let pref_side: f32 = if going_down { 1.0 } else { -1.0 };
-                let mut best_u_lane_y = f32::NAN;
-                let mut best_u_steps = max_steps;
-
-                for &try_side in &[pref_side, -pref_side] {
-                    let base = if try_side > 0.0 {
-                        from.bottom().max(to.bottom()) + 30.0 + lane.abs() * 14.0
-                    } else {
-                        from.y.min(to.y) - 30.0 - lane.abs() * 14.0
-                    };
-                    let fey = if try_side > 0.0 {
-                        from.bottom()
-                    } else {
-                        from.y
-                    };
-                    let tey = if try_side > 0.0 { to.bottom() } else { to.y };
-                    for i in 0..max_steps {
-                        let candidate = base + try_side * (i as f32) * step;
-                        let clear = obstacles.iter().all(|r| {
-                            if is_endpoint(r) {
-                                return true;
-                            }
-                            let rr = r.expanded(6.0);
-                            !vseg_hits_rect(from_cx, fey, candidate, &rr)
-                                && !hseg_hits_rect(candidate, from_cx, to_cx, &rr)
-                                && !vseg_hits_rect(to_cx, candidate, tey, &rr)
-                        });
-                        if clear && i < best_u_steps {
-                            best_u_lane_y = candidate;
-                            best_u_steps = i;
-                            break;
-                        }
-                    }
-                }
-
-                // Strategy 3: Side-exit L-route (exit from side, vertical lane, enter from side)
-                // Same approach as the verticalish non-adjacent routing.
-                let max_half_width = (from.w / 2.0).max(to.w / 2.0);
-                let exit_y = from_cy;
-                let enter_y = to_cy;
-                let mut best_side_lane_x = f32::NAN;
-                let mut best_side_steps = max_steps;
-
-                for &try_side in &[route_side, -route_side] {
-                    let base_x = from_cx + try_side * (max_half_width + 30.0 + lane.abs() * 14.0);
-                    let fex = if base_x >= from_cx {
-                        from.x + from.w
-                    } else {
-                        from.x
-                    };
-                    let tex = if base_x >= to_cx { to.x + to.w } else { to.x };
-                    for i in 0..max_steps {
-                        let candidate = base_x + try_side * (i as f32) * step;
-                        let clear = obstacles.iter().all(|r| {
-                            if is_endpoint(r) {
-                                return true;
-                            }
-                            let rr = r.expanded(6.0);
-                            !hseg_hits_rect(exit_y, fex, candidate, &rr)
-                                && !vseg_hits_rect(candidate, exit_y, enter_y, &rr)
-                                && !hseg_hits_rect(enter_y, candidate, tex, &rr)
-                        });
-                        if clear && i < best_side_steps {
-                            best_side_lane_x = candidate;
-                            best_side_steps = i;
-                            break;
-                        }
-                    }
-                }
-
-                // Pick the best strategy: prefer fewer steps (closer route)
-                let use_u_route = !best_u_lane_y.is_nan()
-                    && (best_side_lane_x.is_nan() || best_u_steps <= best_side_steps);
-
-                if use_u_route {
-                    let lane_y = best_u_lane_y;
-                    let from_exit_y = if lane_y > from_cy {
-                        from.bottom()
-                    } else {
-                        from.y
-                    };
-                    let to_enter_y = if lane_y > to_cy { to.bottom() } else { to.y };
-
-                    svg.push_str(&format!(
-                        r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75" />"#,
-                        from_cx, from_exit_y, from_cx, lane_y, to_cx, lane_y, to_cx, to_enter_y,
-                        style.edge_stroke
-                    ));
-                    track_point!(from_cx, from_exit_y);
-                    track_point!(from_cx, lane_y);
-                    track_point!(to_cx, lane_y);
-                    track_point!(to_cx, to_enter_y);
-                    label_anchor_x = (from_cx + to_cx) / 2.0;
-                    label_anchor_y = lane_y;
-                    arrow_angle = if to_enter_y > lane_y {
-                        -std::f32::consts::FRAC_PI_2
-                    } else {
-                        std::f32::consts::FRAC_PI_2
-                    };
-                    arrow_x = to_cx;
-                    arrow_y = to_enter_y;
-                } else if !best_side_lane_x.is_nan() {
-                    let lane_x = best_side_lane_x;
-                    let from_exit_x = if lane_x >= from_cx {
-                        from.x + from.w
-                    } else {
-                        from.x
-                    };
-                    let to_enter_x = if lane_x >= to_cx { to.x + to.w } else { to.x };
-
-                    svg.push_str(&format!(
-                        r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75" />"#,
-                        from_exit_x, exit_y, lane_x, exit_y, lane_x, enter_y, to_enter_x, enter_y,
-                        style.edge_stroke
-                    ));
-                    track_point!(from_exit_x, exit_y);
-                    track_point!(lane_x, exit_y);
-                    track_point!(lane_x, enter_y);
-                    track_point!(to_enter_x, enter_y);
-                    label_anchor_x = lane_x;
-                    label_anchor_y = (exit_y + enter_y) / 2.0;
-                    arrow_angle = if to_enter_x > lane_x {
-                        0.0
-                    } else {
-                        std::f32::consts::PI
-                    };
-                    arrow_x = to_enter_x;
-                    arrow_y = enter_y;
-                } else {
-                    // Fallback: draw the straight line anyway
-                    svg.push_str(&format!(
-                        r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="0.75" />"#,
-                        px1, py1, px2, py2, style.edge_stroke
-                    ));
-                    track_point!(px1, py1);
-                    track_point!(px2, py2);
-                    arrow_angle = (py1 - py2).atan2(px1 - px2);
-                    label_anchor_x = (px1 + px2) / 2.0;
-                    label_anchor_y = (py1 + py2) / 2.0;
-                }
-            }
-        } else {
-            svg.push_str(&format!(
-                r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="0.75" />"#,
-                px1, py1, px2, py2, style.edge_stroke
-            ));
-            track_point!(px1, py1);
-            track_point!(px2, py2);
-            arrow_angle = (py1 - py2).atan2(px1 - px2);
-
-            // Jitter label anchor along the edge to reduce label-label collisions.
-            let dx = px2 - px1;
-            let dy = py2 - py1;
-            let jitter = ((route_hash % 7) as f32 - 3.0) * 0.07;
-            let t = (0.5 + jitter).clamp(0.25, 0.75);
-            label_anchor_x = px1 + dx * t;
-            label_anchor_y = py1 + dy * t;
-        }
+            let to_x = if base_x >= to_cx { to.right() } else { to.x };
+            blockers.orthogonal_clear(&[
+                (from_x, exit_y),
+                (lane_x, exit_y),
+                (lane_x, enter_y),
+                (to_x, enter_y),
+            ])
+        })
     }
 
+    /// Leaves both states sideways and joins them along `lane_x`.
+    fn side_lane_route(&self, lane_x: f32) -> StateRoute {
+        let (from_cx, exit_y) = self.from_center;
+        let (to_cx, enter_y) = self.to_center;
+        let from_exit_x = if lane_x >= from_cx {
+            self.from.right()
+        } else {
+            self.from.x
+        };
+        let to_enter_x = if lane_x >= to_cx {
+            self.to.right()
+        } else {
+            self.to.x
+        };
+        StateRoute {
+            points: vec![
+                (from_exit_x, exit_y),
+                (lane_x, exit_y),
+                (lane_x, enter_y),
+                (to_enter_x, enter_y),
+            ],
+            label_anchor: (lane_x, (exit_y + enter_y) / 2.0),
+            arrow_angle: if to_enter_x > lane_x {
+                0.0
+            } else {
+                std::f32::consts::PI
+            },
+        }
+    }
+}
+
+/// SVG for `route`: a line or polyline plus the arrowhead on its last point.
+fn emit_route(route: &StateRoute, style: &DiagramStyle) -> String {
+    let mut svg = if let [(x1, y1), (x2, y2)] = route.points[..] {
+        format!(
+            r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="0.75" />"#,
+            x1, y1, x2, y2, style.edge_stroke
+        )
+    } else {
+        let points: Vec<String> = route
+            .points
+            .iter()
+            .map(|(x, y)| format!("{x:.2},{y:.2}"))
+            .collect();
+        format!(
+            r#"<polyline points="{}" fill="none" stroke="{}" stroke-width="0.75" />"#,
+            points.join(" "),
+            style.edge_stroke
+        )
+    };
+    let (x, y) = route.points[route.points.len() - 1];
     // `arrow_angle` points back along the edge, away from the target.
     svg.push_str(&arrowhead(
         ArrowHead::Filled,
-        arrow_x,
-        arrow_y,
-        arrow_angle + std::f32::consts::PI,
+        x,
+        y,
+        route.arrow_angle + std::f32::consts::PI,
         style,
     ));
+    svg
+}
 
-    // Label
-    if let Some(ref label) = transition.label {
-        let label_font = style.font_size * 0.85;
-        let (label_width, label_height) = pill_size(measure, label, label_font);
-        let dx = px2 - px1;
-        let dy = py2 - py1;
-        let len = (dx * dx + dy * dy).sqrt().max(1.0);
-        let tx = dx / len;
-        let ty = dy / len;
-        let perp_x = -ty;
-        let perp_y = tx;
-        let tangent_offset = lane_offset + global_offset;
+/// Places `label` near `anchor`, trying spots beside the center-to-center
+/// line and scoring overlap with states and earlier labels plus distance moved.
+fn place_state_label(
+    label: &str,
+    edge: &StateEdge,
+    anchor: (f32, f32),
+    obstacles: &[Rect],
+    occupied_labels: &mut Vec<Rect>,
+    style: &DiagramStyle,
+    measure: &mut impl TextMeasure,
+) -> (String, Rect) {
+    let label_font = style.font_size * 0.85;
+    let (label_width, label_height) = pill_size(measure, label, label_font);
+    let slot = &edge.slot;
+    let ((px1, py1), (px2, py2)) = (edge.start, edge.end);
+    let dx = px2 - px1;
+    let dy = py2 - py1;
+    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    let tx = dx / len;
+    let ty = dy / len;
+    let perp_x = -ty;
+    let perp_y = tx;
+    let tangent_offset = slot.lane_offset + slot.global_lane * 6.0;
+    let (anchor_x, anchor_y) = anchor;
 
-        let rect_for = |lx: f32, ly: f32| {
-            Rect::new(
-                lx - label_width / 2.0,
-                ly - label_height / 2.0,
-                label_width,
-                label_height,
-            )
-        };
-
-        let score = |r: &Rect| -> f32 {
-            let mut s = 0.0;
-            if r.x < 0.0 || r.y < 0.0 {
-                s += 1000.0;
-            }
-            for o in obstacles {
-                if r.overlaps(o) {
-                    s += 140.0;
-                }
-            }
-            for o in occupied_labels.iter() {
-                if r.overlaps(o) {
-                    s += 220.0;
-                }
-            }
-            s
-        };
-
-        // Candidate search: try different anchor t and perpendicular distances on both sides.
-        let t_candidates: [f32; 5] = [0.38, 0.46, 0.5, 0.54, 0.62];
-        let dist_candidates: [f32; 6] = [24.0, 34.0, 44.0, 54.0, 66.0, 78.0];
-        let side_candidates: [f32; 2] = [route_side, -route_side];
-
-        // Always include the previous heuristic as a candidate.
-        let movement_weight = 2.0;
-        let base_dist = 28.0 + lane.abs() * 10.0 + global_lane.abs() * 4.0;
-        let base_x = label_anchor_x + perp_x * base_dist * route_side + tx * tangent_offset;
-        let base_y = label_anchor_y + perp_y * base_dist * route_side + ty * tangent_offset;
-        let base_rect = rect_for(base_x, base_y);
-        let base_score = score(&base_rect);
-        let mut best_x = base_x;
-        let mut best_y = base_y;
-        let mut best_move =
-            ((base_x - label_anchor_x).powi(2) + (base_y - label_anchor_y).powi(2)).sqrt();
-        let mut best_cost = base_score + best_move * movement_weight;
-
-        for &t in &t_candidates {
-            let ax = px1 + dx * t;
-            let ay = py1 + dy * t;
-            for &side in &side_candidates {
-                for &dist in &dist_candidates {
-                    let lx = ax + perp_x * dist * side + tx * tangent_offset;
-                    let ly = ay + perp_y * dist * side + ty * tangent_offset;
-                    let r = rect_for(lx, ly);
-                    let sc = score(&r);
-                    let mv = ((lx - label_anchor_x).powi(2) + (ly - label_anchor_y).powi(2)).sqrt();
-                    let cost = sc + mv * movement_weight;
-                    if cost < best_cost
-                        || ((cost - best_cost).abs() < f32::EPSILON && mv < best_move)
-                    {
-                        best_cost = cost;
-                        best_move = mv;
-                        best_x = lx;
-                        best_y = ly;
-                    }
-                }
+    let score = |lx: f32, ly: f32| -> f32 {
+        let r = Rect::new(
+            lx - label_width / 2.0,
+            ly - label_height / 2.0,
+            label_width,
+            label_height,
+        );
+        let mut s = 0.0;
+        if r.x < 0.0 || r.y < 0.0 {
+            s += 1000.0;
+        }
+        for o in obstacles {
+            if r.overlaps(o) {
+                s += 140.0;
             }
         }
-
-        // For vertical-ish routes (polyline), also try shifting sideways.
-        if verticalish {
-            for &side in &side_candidates {
-                for &dist in &dist_candidates {
-                    let lx = label_anchor_x + side * dist;
-                    let ly = label_anchor_y + lane_offset * 0.5;
-                    let r = rect_for(lx, ly);
-                    let sc = score(&r);
-                    let mv = ((lx - label_anchor_x).powi(2) + (ly - label_anchor_y).powi(2)).sqrt();
-                    let cost = sc + mv * movement_weight;
-                    if cost < best_cost
-                        || ((cost - best_cost).abs() < f32::EPSILON && mv < best_move)
-                    {
-                        best_cost = cost;
-                        best_move = mv;
-                        best_x = lx;
-                        best_y = ly;
-                    }
-                }
+        for o in occupied_labels.iter() {
+            if r.overlaps(o) {
+                s += 220.0;
             }
         }
+        s
+    };
+    let movement_weight = 2.0;
+    let cost_and_move = |lx: f32, ly: f32| {
+        let mv = ((lx - anchor_x).powi(2) + (ly - anchor_y).powi(2)).sqrt();
+        (score(lx, ly) + mv * movement_weight, mv)
+    };
 
-        let (pill, rect) = label_pill(measure, style, label, label_font, (best_x, best_y));
-        svg.push_str(&pill);
-        occupied_labels.push(rect);
-        track_point!(rect.x, rect.y);
-        track_point!(rect.right(), rect.bottom());
+    let base_dist = 28.0 + slot.lane.abs() * 10.0 + slot.global_lane.abs() * 4.0;
+    let mut best = (
+        anchor_x + perp_x * base_dist * slot.side + tx * tangent_offset,
+        anchor_y + perp_y * base_dist * slot.side + ty * tangent_offset,
+    );
+    let (mut best_cost, mut best_move) = cost_and_move(best.0, best.1);
+
+    let sides = [slot.side, -slot.side];
+    let dists = [24.0, 34.0, 44.0, 54.0, 66.0, 78.0];
+    let mut candidates = Vec::new();
+    for t in [0.38, 0.46, 0.5, 0.54, 0.62] {
+        let ax = px1 + dx * t;
+        let ay = py1 + dy * t;
+        for side in sides {
+            for dist in dists {
+                candidates.push((
+                    ax + perp_x * dist * side + tx * tangent_offset,
+                    ay + perp_y * dist * side + ty * tangent_offset,
+                ));
+            }
+        }
+    }
+    // Side-lane routes run vertically, so also try shifting straight sideways.
+    if edge.verticalish {
+        for side in sides {
+            for dist in dists {
+                candidates.push((anchor_x + side * dist, anchor_y + slot.lane_offset * 0.5));
+            }
+        }
+    }
+    for (lx, ly) in candidates {
+        let (cost, mv) = cost_and_move(lx, ly);
+        if cost < best_cost || ((cost - best_cost).abs() < f32::EPSILON && mv < best_move) {
+            best_cost = cost;
+            best_move = mv;
+            best = (lx, ly);
+        }
     }
 
-    let extent = Rect {
-        x: ext_min_x.min(0.0),
-        y: ext_min_y.min(0.0),
-        w: (ext_max_x - ext_min_x.min(0.0)).max(0.0),
-        h: (ext_max_y - ext_min_y.min(0.0)).max(0.0),
-    };
-    (svg, extent)
+    let (pill, rect) = label_pill(measure, style, label, label_font, best);
+    occupied_labels.push(rect);
+    (pill, rect)
 }
 
 fn render_state_self_transition(
@@ -1844,6 +1769,12 @@ fn render_state_self_transition(
 }
 
 fn bounding_rect(points: &[(f32, f32)]) -> Rect {
+    let (min_x, min_y, max_x, max_y) = point_bounds(points);
+    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+/// `(min_x, min_y, max_x, max_y)` over `points`.
+fn point_bounds(points: &[(f32, f32)]) -> (f32, f32, f32, f32) {
     let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
     let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
     for &(x, y) in points {
@@ -1852,7 +1783,7 @@ fn bounding_rect(points: &[(f32, f32)]) -> Rect {
         max_x = max_x.max(x);
         max_y = max_y.max(y);
     }
-    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
+    (min_x, min_y, max_x, max_y)
 }
 
 fn state_pair_key(from: &str, to: &str) -> (String, String) {
