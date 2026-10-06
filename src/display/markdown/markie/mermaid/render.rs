@@ -2612,6 +2612,23 @@ Note right of Child: child note"#,
     }
 
     #[test]
+    fn unreachable_components_sit_side_by_side_from_the_top() {
+        let image = rasterize(&render_svg(
+            "flowchart TD\n    R --> S\n    C1 --> C2\n    C2 --> C1\n    E1 --> E2\n    E2 --> E1",
+        ));
+        let bands = node_bands(&image);
+        assert_eq!(bands.len(), 2, "expected two rows of nodes, got {bands:?}");
+        for (_, top, _, _) in bands {
+            // Above the node labels, every node in the row shows as one run.
+            let row: Vec<bool> = (0..image.width())
+                .map(|x| is_node_fill(image.get_pixel(x, top + 2)))
+                .collect();
+            let runs = row.windows(2).filter(|w| !w[0] && w[1]).count();
+            assert_eq!(runs, 3, "row at {top} should hold three separate nodes");
+        }
+    }
+
+    #[test]
     fn subgraph_box_keeps_equal_padding_when_clamped_at_top() {
         let image = rasterize(&render_svg(
             "flowchart TD\n    subgraph Group\n        A[Alpha] --> B[Beta]\n    end",

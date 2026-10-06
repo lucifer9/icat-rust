@@ -826,7 +826,8 @@ fn adjacency<'a>(
 }
 
 /// BFS from the sources (or the first node when every node has a parent);
-/// each node still unranked afterwards starts another BFS on a new rank.
+/// each node still unranked afterwards starts another BFS at rank 0, so parts
+/// unreachable from earlier BFS runs sit side by side from the top, as in Mermaid.
 fn assign_ranks<'a>(
     nodes: &'a [String],
     incoming: &Adjacency<'a>,
@@ -845,9 +846,6 @@ fn assign_ranks<'a>(
         ranks.insert(root, 0);
     }
 
-    // Later components count up from the first BFS's deepest rank, so they
-    // can share ranks with components placed before them.
-    let mut next_rank: Option<usize> = None;
     let mut unranked = nodes.iter().map(String::as_str);
     loop {
         while let Some(id) = queue.pop_front() {
@@ -862,9 +860,7 @@ fn assign_ranks<'a>(
         let Some(start) = unranked.find(|id| !ranks.contains_key(id)) else {
             return ranks;
         };
-        let rank = next_rank.get_or_insert_with(|| ranks.values().copied().max().unwrap_or(0));
-        *rank += 1;
-        ranks.insert(start, *rank);
+        ranks.insert(start, 0);
         queue.push_back(start);
     }
 }
