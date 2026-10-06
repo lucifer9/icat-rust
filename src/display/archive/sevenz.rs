@@ -1,11 +1,10 @@
-use std::{fs::File, io::Read};
+use std::fs::File;
+use std::io::{self, Read};
 
 use sevenz_rust2::{
     Archive as SevenZipArchive, BlockDecoder as SevenZipBlockDecoder, Error as SevenZipError,
     Password,
 };
-
-use crate::imgutil;
 
 use super::{MAX_ARCHIVE_SCAN_BYTES, choose_image_index, has_image_extension};
 
@@ -23,7 +22,7 @@ pub(super) fn read_seven_zip_image_bytes(
         .collect();
     let selection = choose_image_index(image_entries.len(), index, path)?;
     let (target_file_index, target_size) = image_entries[selection.index];
-    if target_size > imgutil::MAX_INPUT_BYTES as u64 {
+    if target_size > MAX_ARCHIVE_SCAN_BYTES as u64 {
         return Err(String::from("archive entry exceeds size limit").into());
     }
     let target_file = &archive.files[target_file_index];
@@ -39,9 +38,6 @@ pub(super) fn read_seven_zip_image_bytes(
     let mut data = None;
     SevenZipBlockDecoder::new(1, block_index, &archive, &password, &mut file).for_each_entries(
         &mut |entry, entry_reader| {
-            if data.is_some() {
-                return Ok(false);
-            }
             if entry.is_directory() {
                 return Ok(true);
             }
@@ -63,24 +59,19 @@ fn read_entry_limited(
     total_read: &mut usize,
     keep_data: bool,
 ) -> Result<Option<Vec<u8>>, SevenZipError> {
-    let mut data = keep_data.then(Vec::new);
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        *total_read = total_read
-            .checked_add(n)
-            .ok_or_else(|| SevenZipError::Other("archive scan size overflow".into()))?;
-        if *total_read > MAX_ARCHIVE_SCAN_BYTES {
-            return Err(SevenZipError::Other(
-                "archive scan exceeds size limit".into(),
-            ));
-        }
-        if let Some(data) = &mut data {
-            data.extend_from_slice(&buf[..n]);
-        }
+    // Reading one byte past the remaining budget detects an over-limit entry.
+    let mut limited = reader.take((MAX_ARCHIVE_SCAN_BYTES - *total_read) as u64 + 1);
+    let (read, data) = if keep_data {
+        let mut data = Vec::new();
+        (limited.read_to_end(&mut data)?, Some(data))
+    } else {
+        (io::copy(&mut limited, &mut io::sink())? as usize, None)
+    };
+    *total_read += read;
+    if *total_read > MAX_ARCHIVE_SCAN_BYTES {
+        return Err(SevenZipError::Other(
+            "archive scan exceeds size limit".into(),
+        ));
     }
     Ok(data)
 }

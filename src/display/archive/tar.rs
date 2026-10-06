@@ -2,7 +2,7 @@ use std::io::Read;
 
 use crate::imgutil;
 
-use super::{MAX_ARCHIVE_SCAN_BYTES, has_image_extension};
+use super::{MAX_ARCHIVE_SCAN_BYTES, has_image_extension, no_images_error, out_of_range_warning};
 
 pub(super) fn read_tar_gz_image_bytes(
     path: &str,
@@ -39,10 +39,10 @@ fn read_tar_single_pass<R: Read>(
         }
         image_count += 1;
         let size = entry.size();
-        if size > imgutil::MAX_INPUT_BYTES as u64 {
+        if size > MAX_ARCHIVE_SCAN_BYTES as u64 {
             return Err(String::from("archive entry exceeds size limit").into());
         }
-        let data = imgutil::read_limited((&mut entry).take(MAX_ARCHIVE_SCAN_BYTES as u64))?;
+        let data = imgutil::read_limited(&mut entry)?;
         if let Some(index) = index {
             if image_count == index {
                 return Ok((data, None));
@@ -54,18 +54,9 @@ fn read_tar_single_pass<R: Read>(
     }
 
     if let Some(index) = index {
-        let data = last.ok_or_else(|| format!("no images found in archive {path}"))?;
-        let warning = if index > image_count {
-            Some(format!(
-                "warning: index {index} out of range for archive {path}, showing last item {image_count}"
-            ))
-        } else {
-            None
-        };
+        let data = last.ok_or_else(|| no_images_error(path))?;
+        let warning = (index > image_count).then(|| out_of_range_warning(index, image_count, path));
         return Ok((data, warning));
     }
-    Ok((
-        chosen.ok_or_else(|| format!("no images found in archive {path}"))?,
-        None,
-    ))
+    Ok((chosen.ok_or_else(|| no_images_error(path))?, None))
 }

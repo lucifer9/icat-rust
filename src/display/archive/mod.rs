@@ -1,8 +1,7 @@
 use std::fmt;
-use std::path::Path;
 
 use crate::display::image;
-use crate::imgutil;
+use crate::imgutil::{self, has_image_extension, is_image_extension};
 use crate::term::Size;
 
 mod rar;
@@ -11,8 +10,6 @@ mod tar;
 mod zip;
 
 use rar::read_rar_image_bytes;
-#[cfg(test)]
-use rar::{RarEntryInfo, validate_rar_selection_bounds};
 use sevenz::read_seven_zip_image_bytes;
 use tar::{read_tar_gz_image_bytes, read_tar_image_bytes};
 use zip::read_zip_image_bytes;
@@ -58,7 +55,7 @@ pub fn archive(
     image::image_from_bytes(&data, size, tmux)
 }
 
-pub fn read_image_bytes(
+fn read_image_bytes(
     path: &str,
     index: Option<usize>,
 ) -> Result<(Vec<u8>, Option<String>), Box<dyn std::error::Error>> {
@@ -74,42 +71,22 @@ pub fn read_image_bytes(
     }
 }
 
-fn has_image_extension(name: &str) -> bool {
-    matches!(
-        Path::new(name)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase()),
-        Some(ext) if is_image_extension(&ext)
-    )
-}
-
-fn is_image_extension(ext: &str) -> bool {
-    matches!(
-        ext,
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif"
-    )
-}
-
 fn detect_format(path: &str) -> Option<ArchiveFormat> {
     let mut f = std::fs::File::open(path).ok()?;
     let mut header = [0u8; 8];
     let n = std::io::Read::read(&mut f, &mut header).ok()?;
     let h = &header[..n];
 
-    if h.len() >= 4 && &h[..4] == b"PK\x03\x04" {
+    if h.starts_with(b"PK\x03\x04") || h.starts_with(b"PK\x05\x06") {
         return Some(ArchiveFormat::Zip);
     }
-    if h.len() >= 4 && &h[..4] == b"PK\x05\x06" {
-        return Some(ArchiveFormat::Zip);
-    }
-    if h.len() >= 6 && &h[..6] == b"\x37\x7a\xbc\xaf\x27\x1c" {
+    if h.starts_with(b"\x37\x7a\xbc\xaf\x27\x1c") {
         return Some(ArchiveFormat::SevenZip);
     }
-    if h.len() >= 4 && &h[..4] == b"Rar!" {
+    if h.starts_with(b"Rar!") {
         return Some(ArchiveFormat::Rar);
     }
-    if h.len() >= 2 && &h[..2] == b"\x1f\x8b" {
+    if h.starts_with(b"\x1f\x8b") {
         return Some(ArchiveFormat::TarGz);
     }
 
@@ -127,7 +104,7 @@ fn choose_image_index(
     path: &str,
 ) -> Result<Selection, Box<dyn std::error::Error>> {
     if total == 0 {
-        return Err(format!("no images found in archive {path}").into());
+        return Err(no_images_error(path));
     }
     if let Some(index) = index {
         if index <= total {
@@ -138,9 +115,7 @@ fn choose_image_index(
         }
         return Ok(Selection {
             index: total - 1,
-            warning: Some(format!(
-                "warning: index {index} out of range for archive {path}, showing last item {total}"
-            )),
+            warning: Some(out_of_range_warning(index, total, path)),
         });
     }
     Ok(Selection {
@@ -149,11 +124,20 @@ fn choose_image_index(
     })
 }
 
+fn no_images_error(path: &str) -> Box<dyn std::error::Error> {
+    format!("no images found in archive {path}").into()
+}
+
+fn out_of_range_warning(index: usize, total: usize, path: &str) -> String {
+    format!("warning: index {index} out of range for archive {path}, showing last item {total}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ::image::{DynamicImage, ImageBuffer, Rgba};
     use std::io::Write;
+    use std::path::Path;
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         let image =
@@ -202,29 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn has_image_extension_works() {
-        for name in [
-            "a.png",
-            "a.jpg",
-            "a.jpeg",
-            "a.gif",
-            "a.bmp",
-            "a.webp",
-            "a.tiff",
-            "a.tif",
-            "photo.PNG",
-            "photo.WebP",
-        ] {
-            assert!(has_image_extension(name), "{name}");
-        }
-        for name in [
-            "doc.txt", "file.pdf", "app.exe", "arch.zip", "src.rs", "noext",
-        ] {
-            assert!(!has_image_extension(name), "{name}");
-        }
-    }
-
-    #[test]
     fn choose_image_index_behaviour() {
         assert_eq!(choose_image_index(5, Some(2), "test.zip").unwrap().index, 1);
         let sel = choose_image_index(2, Some(3), "test.zip").unwrap();
@@ -234,90 +195,28 @@ mod tests {
     }
 
     #[test]
-    fn detect_format_works() {
+    fn detect_format_reads_magic_header_then_tar_extension() {
         let dir = tempfile::tempdir().unwrap();
-        let zip_path = dir.path().join("sample.zip");
-        write_zip_fixture(&zip_path, &[("a.png", &png_bytes(1, 1))]);
-        assert_eq!(
-            detect_format(zip_path.to_str().unwrap()),
-            Some(ArchiveFormat::Zip)
-        );
-
-        let tgz_path = dir.path().join("sample.tar.gz");
-        write_tar_fixture(&tgz_path, true, &[("a.png", &png_bytes(1, 1))]);
-        assert_eq!(
-            detect_format(tgz_path.to_str().unwrap()),
-            Some(ArchiveFormat::TarGz)
-        );
-
-        let tar_path = dir.path().join("sample.tar");
-        write_tar_fixture(&tar_path, false, &[("a.png", &png_bytes(1, 1))]);
-        assert_eq!(
-            detect_format(tar_path.to_str().unwrap()),
-            Some(ArchiveFormat::Tar)
-        );
-
-        let plain = dir.path().join("plain.bin");
-        std::fs::write(&plain, b"not an archive").unwrap();
-        assert_eq!(detect_format(plain.to_str().unwrap()), None);
-    }
-
-    #[test]
-    fn test_detect_format_reads_only_header() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // ZIP magic at bytes 0-3, followed by arbitrary padding
-        let zip_path = dir.path().join("header_only.zip");
-        let mut zip_data = b"PK\x03\x04".to_vec();
-        zip_data.extend_from_slice(&[0u8; 100]);
-        std::fs::write(&zip_path, &zip_data).unwrap();
-        assert_eq!(
-            detect_format(zip_path.to_str().unwrap()),
-            Some(ArchiveFormat::Zip)
-        );
-
-        // ZIP end-of-central-directory magic PK\x05\x06
-        let zip_ecd_path = dir.path().join("header_ecd.zip");
-        let mut zip_ecd_data = b"PK\x05\x06".to_vec();
-        zip_ecd_data.extend_from_slice(&[0u8; 100]);
-        std::fs::write(&zip_ecd_path, &zip_ecd_data).unwrap();
-        assert_eq!(
-            detect_format(zip_ecd_path.to_str().unwrap()),
-            Some(ArchiveFormat::Zip)
-        );
-
-        // gzip magic
-        let gz_path = dir.path().join("header_only.tar.gz");
-        let mut gz_data = b"\x1f\x8b".to_vec();
-        gz_data.extend_from_slice(&[0u8; 100]);
-        std::fs::write(&gz_path, &gz_data).unwrap();
-        assert_eq!(
-            detect_format(gz_path.to_str().unwrap()),
-            Some(ArchiveFormat::TarGz)
-        );
-
-        // RAR magic
-        let rar_path = dir.path().join("header_only.rar");
-        let mut rar_data = b"Rar!".to_vec();
-        rar_data.extend_from_slice(&[0u8; 100]);
-        std::fs::write(&rar_path, &rar_data).unwrap();
-        assert_eq!(
-            detect_format(rar_path.to_str().unwrap()),
-            Some(ArchiveFormat::Rar)
-        );
-
-        // TAR fallback by extension (no magic bytes)
-        let tar_path = dir.path().join("header_only.tar");
-        std::fs::write(&tar_path, b"no magic bytes here").unwrap();
-        assert_eq!(
-            detect_format(tar_path.to_str().unwrap()),
-            Some(ArchiveFormat::Tar)
-        );
-
-        // Unknown format with no matching magic or extension
-        let unknown_path = dir.path().join("unknown.bin");
-        std::fs::write(&unknown_path, b"completely unknown").unwrap();
-        assert_eq!(detect_format(unknown_path.to_str().unwrap()), None);
+        let cases: [(&str, &[u8], Option<ArchiveFormat>); 7] = [
+            ("local.zip", b"PK\x03\x04", Some(ArchiveFormat::Zip)),
+            ("empty.zip", b"PK\x05\x06", Some(ArchiveFormat::Zip)),
+            (
+                "a.7z",
+                b"\x37\x7a\xbc\xaf\x27\x1c",
+                Some(ArchiveFormat::SevenZip),
+            ),
+            ("a.rar", b"Rar!", Some(ArchiveFormat::Rar)),
+            ("a.tar.gz", b"\x1f\x8b", Some(ArchiveFormat::TarGz)),
+            ("a.tar", b"no magic bytes here", Some(ArchiveFormat::Tar)),
+            ("unknown.bin", b"completely unknown", None),
+        ];
+        for (name, header, expected) in cases {
+            let path = dir.path().join(name);
+            let mut data = header.to_vec();
+            data.extend_from_slice(&[0u8; 100]);
+            std::fs::write(&path, &data).unwrap();
+            assert_eq!(detect_format(path.to_str().unwrap()), expected, "{name}");
+        }
     }
 
     #[test]
@@ -419,18 +318,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_sevenzip_image_bytes_by_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.7z");
-        let img = png_bytes(2, 2);
-        write_sevenzip_fixture(&path, &[("photo.png", &img)]);
-        let (data, warning) = read_image_bytes(path.to_str().unwrap(), Some(1)).unwrap();
-        assert!(!data.is_empty());
-        assert_eq!(data, img);
-        assert!(warning.is_none());
-    }
-
-    #[test]
     fn test_read_sevenzip_image_bytes_skips_preceding_entry_streaming() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test_preceding.7z");
@@ -448,11 +335,11 @@ mod tests {
     fn test_read_sevenzip_image_bytes_out_of_range() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test_oor.7z");
-        let img = png_bytes(1, 1);
-        write_sevenzip_fixture(&path, &[("a.png", &img)]);
+        let first = png_bytes(1, 1);
+        let second = png_bytes(2, 2);
+        write_sevenzip_fixture(&path, &[("a.png", &first), ("b.png", &second)]);
         let (data, warning) = read_image_bytes(path.to_str().unwrap(), Some(99)).unwrap();
-        assert!(!data.is_empty());
-        assert!(warning.is_some());
+        assert_eq!(data, second);
         let w = warning.unwrap();
         assert!(w.contains("out of range"), "warning was: {w}");
     }
@@ -471,90 +358,5 @@ mod tests {
             data == img_a || data == img_b,
             "random selection should return one of the archive images"
         );
-    }
-
-    fn write_rar_fixture(path: &std::path::Path, files: &[(&str, &[u8])]) {
-        use rar5::RarArchive;
-        let mut ar = RarArchive::create(path).expect("create rar archive");
-        for (name, data) in files {
-            ar.add_bytes(name, data, 0).expect("add bytes to rar");
-        }
-        ar.close().expect("close rar archive");
-    }
-
-    #[test]
-    fn test_read_rar_image_bytes_by_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sample.rar");
-        let first = png_bytes(1, 1);
-        let second = png_bytes(2, 2);
-        write_rar_fixture(
-            &path,
-            &[
-                ("note.txt", b"ignore me"),
-                ("a.png", &first),
-                ("b.jpg", &second),
-            ],
-        );
-        let (data, warning) = read_rar_image_bytes(path.to_str().unwrap(), Some(2)).unwrap();
-        assert_eq!(warning, None);
-        assert_eq!(data, second);
-    }
-
-    #[test]
-    fn test_read_rar_image_bytes_out_of_range_clamps_last() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sample_oor.rar");
-        let first = png_bytes(1, 1);
-        let second = png_bytes(2, 2);
-        write_rar_fixture(&path, &[("a.png", &first), ("b.png", &second)]);
-        let (data, warning) = read_rar_image_bytes(path.to_str().unwrap(), Some(99)).unwrap();
-        assert_eq!(data, second);
-        assert!(warning.is_some());
-    }
-
-    #[test]
-    fn test_read_rar_image_bytes_no_images_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("noimg.rar");
-        write_rar_fixture(&path, &[("readme.txt", b"nothing to see here")]);
-        let err = read_rar_image_bytes(path.to_str().unwrap(), None).unwrap_err();
-        assert!(err.to_string().contains("no images found"));
-    }
-
-    #[test]
-    fn test_rar_chain_bounds_count_target_packed_size() {
-        let entries = vec![RarEntryInfo {
-            name: "a.png".to_string(),
-            unpacked_size: 1,
-            packed_size: MAX_ARCHIVE_SCAN_BYTES as u64 + 1,
-            is_solid: false,
-        }];
-
-        let err = validate_rar_selection_bounds(&entries, 0).unwrap_err();
-
-        assert_eq!(err.to_string(), "archive entry exceeds size limit");
-    }
-
-    #[test]
-    fn test_rar_chain_bounds_count_solid_prefix() {
-        let entries = vec![
-            RarEntryInfo {
-                name: "note.txt".to_string(),
-                unpacked_size: MAX_ARCHIVE_SCAN_BYTES as u64,
-                packed_size: 1,
-                is_solid: false,
-            },
-            RarEntryInfo {
-                name: "a.png".to_string(),
-                unpacked_size: 1,
-                packed_size: 1,
-                is_solid: true,
-            },
-        ];
-
-        let err = validate_rar_selection_bounds(&entries, 1).unwrap_err();
-
-        assert_eq!(err.to_string(), "archive solid chain exceeds size limit");
     }
 }

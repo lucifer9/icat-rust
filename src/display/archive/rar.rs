@@ -15,11 +15,11 @@ const RAR4_ATTR_UNIX_DIR: u32 = 0o040000;
 const RAR4_OS_UNIX: u8 = 3;
 
 #[derive(Debug, Clone)]
-pub(super) struct RarEntryInfo {
-    pub(super) name: String,
-    pub(super) unpacked_size: u64,
-    pub(super) packed_size: u64,
-    pub(super) is_solid: bool,
+struct RarEntryInfo {
+    name: String,
+    unpacked_size: u64,
+    packed_size: u64,
+    is_solid: bool,
 }
 
 pub(super) fn read_rar_image_bytes(
@@ -31,9 +31,8 @@ pub(super) fn read_rar_image_bytes(
     let entries: Vec<RarEntryInfo> = arc
         .list()
         .iter()
-        .enumerate()
-        .filter(|(_, e)| !e.is_dir())
-        .map(|(_, e)| RarEntryInfo {
+        .filter(|e| !e.is_dir())
+        .map(|e| RarEntryInfo {
             name: e.name().to_string(),
             unpacked_size: e.size(),
             packed_size: e.compressed_size(),
@@ -47,10 +46,6 @@ pub(super) fn read_rar_image_bytes(
         .filter(|(index, e)| rar_entry_has_image_extension(e, *index, &legacy_extensions))
         .map(|(entry_index, _)| entry_index)
         .collect();
-
-    if image_entry_indexes.is_empty() {
-        return Err(format!("no images found in archive {path}").into());
-    }
 
     let sel = choose_image_index(image_entry_indexes.len(), index, path)?;
     let entry_index = image_entry_indexes[sel.index];
@@ -74,33 +69,25 @@ fn rar_entry_has_image_extension(
             .is_some_and(is_image_extension)
 }
 
-pub(super) fn validate_rar_selection_bounds(
+fn validate_rar_selection_bounds(
     entries: &[RarEntryInfo],
     selected_index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let selected = entries
-        .get(selected_index)
-        .ok_or_else(|| String::from("archive entry index out of range"))?;
+    let selected = &entries[selected_index];
     if selected.unpacked_size > MAX_ARCHIVE_SCAN_BYTES as u64
         || selected.packed_size > MAX_ARCHIVE_SCAN_BYTES as u64
     {
         return Err("archive entry exceeds size limit".into());
     }
 
+    // Solid entries can only be extracted by decoding every entry since the
+    // chain start, so the whole prefix counts against the limit.
     let chain_start = rar_solid_chain_start(entries, selected_index);
-    if chain_start == selected_index {
-        return Ok(());
-    }
-
     let mut packed_total = 0u64;
     let mut unpacked_total = 0u64;
     for entry in &entries[chain_start..=selected_index] {
-        packed_total = packed_total
-            .checked_add(entry.packed_size)
-            .ok_or_else(|| String::from("archive solid chain size overflow"))?;
-        unpacked_total = unpacked_total
-            .checked_add(entry.unpacked_size)
-            .ok_or_else(|| String::from("archive solid chain size overflow"))?;
+        packed_total = packed_total.saturating_add(entry.packed_size);
+        unpacked_total = unpacked_total.saturating_add(entry.unpacked_size);
         if packed_total > MAX_ARCHIVE_SCAN_BYTES as u64
             || unpacked_total > MAX_ARCHIVE_SCAN_BYTES as u64
         {
@@ -147,10 +134,11 @@ fn rar4_legacy_extensions(path: &str) -> io::Result<Vec<Option<String>>> {
             break;
         }
 
-        let add_size = if flags & RAR4_HD_ADD_SIZE != 0
+        // File and service headers keep their data size inside the header body.
+        let has_add_size = flags & RAR4_HD_ADD_SIZE != 0
             && header_type != RAR4_HEAD_FILE
-            && header_type != RAR4_HEAD_NEWSUB
-        {
+            && header_type != RAR4_HEAD_NEWSUB;
+        let add_size = if has_add_size {
             let mut size = [0u8; 4];
             file.read_exact(&mut size)?;
             u32::from_le_bytes(size) as u64
@@ -158,7 +146,7 @@ fn rar4_legacy_extensions(path: &str) -> io::Result<Vec<Option<String>>> {
             0
         };
 
-        let consumed_after_common = if add_size > 0 { 4 } else { 0 };
+        let consumed_after_common = if has_add_size { 4 } else { 0 };
         let ext_len = header_size.saturating_sub(7 + consumed_after_common);
         let mut ext = vec![0u8; ext_len];
         file.read_exact(&mut ext)?;
@@ -199,8 +187,8 @@ fn parse_rar4_legacy_entry(ext: &[u8], flags: u16) -> Option<Rar4LegacyEntry> {
     let packed_low = read_u32_le(ext, &mut pos)? as u64;
     let unpacked_low = read_u32_le(ext, &mut pos)? as u64;
     let host_os = *ext.get(pos)?;
-    pos += 1;
-    pos = pos.checked_add(10)?;
+    // Skip the host OS byte read above, then file CRC, time, unpack version, and method.
+    pos += 1 + 10;
     let name_size = read_u16_le(ext, &mut pos)? as usize;
     let file_attr = read_u32_le(ext, &mut pos)?;
 
@@ -211,7 +199,7 @@ fn parse_rar4_legacy_entry(ext: &[u8], flags: u16) -> Option<Rar4LegacyEntry> {
         unpacked_size |= (read_u32_le(ext, &mut pos)? as u64) << 32;
     }
 
-    let name = ext.get(pos..pos.checked_add(name_size)?)?;
+    let name = ext.get(pos..pos + name_size)?;
     let is_dir = (host_os == RAR4_OS_UNIX && file_attr & (RAR4_ATTR_UNIX_DIR << 16) != 0)
         || file_attr & RAR4_ATTR_DIRECTORY != 0
         || (unpacked_size == 0
@@ -227,25 +215,27 @@ fn parse_rar4_legacy_entry(ext: &[u8], flags: u16) -> Option<Rar4LegacyEntry> {
 }
 
 fn rar4_ascii_extension(name: &[u8]) -> Option<String> {
-    let base_name = name.split(|byte| *byte == 0).next().unwrap_or(name);
+    let base_name = name.split(|byte| *byte == 0).next()?;
     let dot = base_name.iter().rposition(|byte| *byte == b'.')?;
     let ext = &base_name[dot + 1..];
     if ext.is_empty() || !ext.iter().all(|byte| byte.is_ascii_alphanumeric()) {
         return None;
     }
-    std::str::from_utf8(ext)
-        .ok()
-        .map(|ext| ext.to_ascii_lowercase())
+    Some(
+        ext.iter()
+            .map(|byte| char::from(byte.to_ascii_lowercase()))
+            .collect(),
+    )
 }
 
 fn read_u16_le(data: &[u8], pos: &mut usize) -> Option<u16> {
-    let bytes: [u8; 2] = data.get(*pos..pos.checked_add(2)?)?.try_into().ok()?;
+    let bytes: [u8; 2] = data.get(*pos..*pos + 2)?.try_into().ok()?;
     *pos += 2;
     Some(u16::from_le_bytes(bytes))
 }
 
 fn read_u32_le(data: &[u8], pos: &mut usize) -> Option<u32> {
-    let bytes: [u8; 4] = data.get(*pos..pos.checked_add(4)?)?.try_into().ok()?;
+    let bytes: [u8; 4] = data.get(*pos..*pos + 4)?.try_into().ok()?;
     *pos += 4;
     Some(u32::from_le_bytes(bytes))
 }
@@ -282,6 +272,40 @@ mod tests {
         assert!(!entry.is_dir);
     }
 
+    fn rar4_header(header_type: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut header = vec![0, 0, header_type];
+        header.extend_from_slice(&flags.to_le_bytes());
+        header.extend_from_slice(&((7 + body.len()) as u16).to_le_bytes());
+        header.extend_from_slice(body);
+        header
+    }
+
+    #[test]
+    fn rar4_legacy_extensions_skips_zero_add_size_field() {
+        let name = b"image.JPG";
+        let mut file_ext = Vec::new();
+        file_ext.extend_from_slice(&0u32.to_le_bytes()); // packed size
+        file_ext.extend_from_slice(&1u32.to_le_bytes()); // unpacked size
+        file_ext.push(0); // host OS
+        file_ext.extend_from_slice(&[0; 10]); // CRC, time, version, method
+        file_ext.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        file_ext.extend_from_slice(&0u32.to_le_bytes()); // attributes
+        file_ext.extend_from_slice(name);
+
+        let mut data = RAR4_SIGNATURE.to_vec();
+        // A non-file header whose ADD_SIZE field is present but zero.
+        data.extend(rar4_header(0x73, RAR4_HD_ADD_SIZE, &0u32.to_le_bytes()));
+        data.extend(rar4_header(RAR4_HEAD_FILE, 0, &file_ext));
+        data.extend(rar4_header(RAR4_HEAD_ENDARC, 0, &[]));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.rar");
+        std::fs::write(&path, data).unwrap();
+
+        let extensions = rar4_legacy_extensions(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(extensions, vec![Some(String::from("jpg"))]);
+    }
+
     #[test]
     fn rar_entry_extension_uses_legacy_rar4_fallback() {
         let entry = RarEntryInfo {
@@ -297,5 +321,88 @@ mod tests {
             0,
             &[Some(String::from("jpg"))]
         ));
+    }
+
+    fn write_rar_fixture(path: &std::path::Path, files: &[(&str, &[u8])]) {
+        let mut ar = RarArchive::create(path).expect("create rar archive");
+        for (name, data) in files {
+            ar.add_bytes(name, data, 0).expect("add bytes to rar");
+        }
+        ar.close().expect("close rar archive");
+    }
+
+    #[test]
+    fn test_read_rar_image_bytes_by_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.rar");
+        write_rar_fixture(
+            &path,
+            &[
+                ("note.txt", b"ignore me"),
+                ("a.png", b"first image"),
+                ("b.jpg", b"second image"),
+            ],
+        );
+        let (data, warning) = read_rar_image_bytes(path.to_str().unwrap(), Some(2)).unwrap();
+        assert_eq!(warning, None);
+        assert_eq!(data, b"second image");
+    }
+
+    #[test]
+    fn test_read_rar_image_bytes_out_of_range_clamps_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample_oor.rar");
+        write_rar_fixture(
+            &path,
+            &[("a.png", b"first image"), ("b.png", b"second image")],
+        );
+        let (data, warning) = read_rar_image_bytes(path.to_str().unwrap(), Some(99)).unwrap();
+        assert_eq!(data, b"second image");
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn test_read_rar_image_bytes_no_images_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("noimg.rar");
+        write_rar_fixture(&path, &[("readme.txt", b"nothing to see here")]);
+        let err = read_rar_image_bytes(path.to_str().unwrap(), None).unwrap_err();
+        assert!(err.to_string().contains("no images found"));
+    }
+
+    #[test]
+    fn test_rar_chain_bounds_count_target_packed_size() {
+        let entries = vec![RarEntryInfo {
+            name: "a.png".to_string(),
+            unpacked_size: 1,
+            packed_size: MAX_ARCHIVE_SCAN_BYTES as u64 + 1,
+            is_solid: false,
+        }];
+
+        let err = validate_rar_selection_bounds(&entries, 0).unwrap_err();
+
+        assert_eq!(err.to_string(), "archive entry exceeds size limit");
+    }
+
+    #[test]
+    fn test_rar_chain_bounds_count_solid_prefix() {
+        let entries = vec![
+            RarEntryInfo {
+                name: "note.txt".to_string(),
+                unpacked_size: MAX_ARCHIVE_SCAN_BYTES as u64,
+                packed_size: 1,
+                is_solid: false,
+            },
+            RarEntryInfo {
+                name: "a.png".to_string(),
+                unpacked_size: 1,
+                packed_size: 1,
+                is_solid: true,
+            },
+        ];
+
+        let err = validate_rar_selection_bounds(&entries, 1).unwrap_err();
+
+        assert_eq!(err.to_string(), "archive solid chain exceeds size limit");
     }
 }
