@@ -4,6 +4,7 @@ mod math;
 mod mermaid;
 
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -13,7 +14,8 @@ use cosmic_text::{
 };
 use image::{DynamicImage, ImageBuffer, Rgba, imageops};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-use tiny_skia::{BlendMode, Paint as SkPaint, Pixmap, Rect as SkRect, Transform};
+use syntect::highlighting::{FontStyle, Style as SyntaxStyle};
+use tiny_skia::{Paint as SkPaint, Pixmap, Rect as SkRect, Transform};
 
 use crate::display::MarkdownOptions;
 use crate::imgutil;
@@ -24,6 +26,7 @@ const DEFAULT_MARKDOWN_MARGIN: u32 = 48;
 pub const DEFAULT_MARKDOWN_FONT_PT: f64 = 24.0;
 pub const MIN_MARKDOWN_WIDTH: u32 = 480;
 const MARKDOWN_CHUNK_HEIGHT: u32 = 8192;
+const CODE_PADDING: u32 = 10;
 
 // Cached syntax highlighting sets (loaded once, reused across calls)
 static SYNTAX_SET: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
@@ -38,18 +41,6 @@ struct FontState {
 
 static FONT_STATE: OnceLock<Mutex<FontState>> = OnceLock::new();
 
-pub fn markdown(path: &str, size: Size, tmux: bool) -> Result<(), Box<dyn std::error::Error>> {
-    markdown_with_options(
-        path,
-        size,
-        tmux,
-        MarkdownOptions {
-            page: None,
-            font_size_pt: 0.0,
-        },
-    )
-}
-
 pub fn markdown_with_options(
     path: &str,
     size: Size,
@@ -61,22 +52,6 @@ pub fn markdown_with_options(
         format!("failed to read Markdown {label}: {err}")
     })?;
     markdown_from_bytes_impl(&raw, markdown_base_dir(path), opts, size, tmux)
-}
-
-pub fn markdown_from_bytes(
-    data: &[u8],
-    size: Size,
-    tmux: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    markdown_from_bytes_with_options(
-        data,
-        size,
-        tmux,
-        MarkdownOptions {
-            page: None,
-            font_size_pt: 0.0,
-        },
-    )
 }
 
 pub fn markdown_from_bytes_with_options(
@@ -97,76 +72,25 @@ fn markdown_from_bytes_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let page_height = markdown_page_height(size);
     let width = markdown_render_width(size.pixel_width);
-    let font_size = markdown_font_size(opts.font_size_pt);
     let blocks = parse_markdown_blocks(data);
 
-    let state = FONT_STATE.get_or_init(|| {
-        let res = fonts::resolve_fonts();
-        Mutex::new(FontState {
-            font_system: res.font_system,
-            swash: SwashCache::new(),
-            warning: res.warning,
-        })
-    });
+    // Layout runs once over the whole document to learn its height; pages are
+    // then drawn on demand into page-sized pixmaps.
+    let mut layout = with_fonts(|font_system, _| {
+        layout_document(&blocks, &base_dir, font_system, width, opts.font_size_pt)
+    })?;
 
-    // Layout pass: shape all text and place blocks (needs font_system).
-    // This must process the full document to know total height, but allocates
-    // no pixel buffer — only the logical block tree.
-    let (mut rendered_blocks, total_height) = {
-        let mut guard = state.lock().unwrap();
-        if let Some(w) = guard.warning.take() {
-            eprintln!("{w}");
-        }
-        let FontState { font_system, .. } = &mut *guard;
-        layout_blocks_inner(&blocks, &base_dir, font_system, width, font_size)?
-    };
-
-    let total_pages = markdown_total_pages(total_height, page_height);
-    let start_page = opts.page.unwrap_or(1).clamp(1, total_pages.max(1));
-    let interactive =
-        opts.page.is_none() && total_pages > 1 && term::is_terminal(&std::io::stdout());
-
-    if !interactive {
-        let y_start = (start_page - 1) as u32 * page_height;
-        let draw_h = total_height.saturating_sub(y_start).min(page_height);
-        let image = {
-            let mut guard = state.lock().unwrap();
-            let FontState {
-                font_system, swash, ..
-            } = &mut *guard;
-            draw_blocks_page(
-                &mut rendered_blocks,
-                font_system,
-                swash,
-                width,
-                y_start,
-                draw_h,
-            )?
-        };
-        return send_rendered_markdown(&image, size, tmux);
-    }
-
-    // Interactive paging: layout is done once; draw only the requested page
-    // each time (small per-page Pixmap, released after send).
-    let mut current = start_page;
+    let total_pages = markdown_total_pages(layout.height, page_height);
+    let interactive = opts.page.is_none() && total_pages > 1 && std::io::stdout().is_terminal();
+    let mut current = opts.page.unwrap_or(1).clamp(1, total_pages);
     loop {
-        let image = {
-            let mut guard = state.lock().unwrap();
-            let FontState {
-                font_system, swash, ..
-            } = &mut *guard;
-            let y_start = (current - 1) as u32 * page_height;
-            let draw_h = total_height.saturating_sub(y_start).min(page_height);
-            draw_blocks_page(
-                &mut rendered_blocks,
-                font_system,
-                swash,
-                width,
-                y_start,
-                draw_h,
-            )?
-        };
+        let image = with_fonts(|font_system, swash| {
+            render_page(&mut layout, font_system, swash, current, page_height)
+        })?;
         send_rendered_markdown(&image, size, tmux)?;
+        if !interactive {
+            return Ok(());
+        }
 
         let prompt = if current < total_pages {
             format!(
@@ -177,75 +101,18 @@ fn markdown_from_bytes_impl(
         };
         let input = match term::read_interactive_line(&prompt) {
             Ok(s) => s,
-            Err(_) => break,
+            Err(_) => return Ok(()),
         };
         match markdown_pager_action(current, total_pages, &input) {
             PagerAction::ShowPage(next) => current = next,
-            PagerAction::Quit => break,
+            PagerAction::Quit => return Ok(()),
         }
     }
-    Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PagerAction {
-    ShowPage(usize),
-    Quit,
-}
-
-fn markdown_pager_action(current: usize, total_pages: usize, input: &str) -> PagerAction {
-    let total_pages = total_pages.max(1);
-    let current = current.clamp(1, total_pages);
-    let trimmed = input.trim();
-    if trimmed.is_empty() || trimmed == " " {
-        if current < total_pages {
-            return PagerAction::ShowPage(current + 1);
-        }
-        return PagerAction::Quit;
-    }
-    if trimmed.eq_ignore_ascii_case("q") {
-        return PagerAction::Quit;
-    }
-    if let Ok(n) = trimmed.parse::<usize>() {
-        return PagerAction::ShowPage(n.clamp(1, total_pages));
-    }
-    PagerAction::ShowPage(current)
-}
-
-pub fn render_markdown(
-    data: &[u8],
-    base_dir: &Path,
-    max_pixel_width: u32,
-) -> Result<DynamicImage, Box<dyn std::error::Error>> {
-    render_markdown_with_font_size(data, base_dir, max_pixel_width, 0.0)
-}
-
-pub fn render_markdown_with_font_size(
-    data: &[u8],
-    base_dir: &Path,
-    max_pixel_width: u32,
-    font_size_pt: f64,
-) -> Result<DynamicImage, Box<dyn std::error::Error>> {
-    let blocks = parse_markdown_blocks(data);
-    render_blocks(
-        &blocks,
-        base_dir,
-        markdown_render_width(max_pixel_width),
-        markdown_font_size(font_size_pt),
-    )
-}
-
-pub fn render_markdown_page_detailed(
-    data: &[u8],
-    base_dir: &Path,
-    max_pixel_width: u32,
-    page_index: usize,
-    page_height: u32,
-    font_size_pt: f64,
-) -> Result<DynamicImage, Box<dyn std::error::Error>> {
-    let blocks = parse_markdown_blocks(data);
-    let width = markdown_render_width(max_pixel_width);
-    let font_size = markdown_font_size(font_size_pt);
+// Runs `f` with the shared font system and glyph cache, printing the font
+// warning once on first use.
+fn with_fonts<R>(f: impl FnOnce(&mut FontSystem, &mut SwashCache) -> R) -> R {
     let state = FONT_STATE.get_or_init(|| {
         let res = fonts::resolve_fonts();
         Mutex::new(FontState {
@@ -261,83 +128,50 @@ pub fn render_markdown_page_detailed(
     let FontState {
         font_system, swash, ..
     } = &mut *guard;
-    let (mut rendered_blocks, total_height) =
-        layout_blocks_inner(&blocks, base_dir, font_system, width, font_size)?;
-    let y_start = (page_index as u32)
-        .saturating_mul(page_height)
-        .min(total_height.saturating_sub(1));
-    let draw_height = total_height.saturating_sub(y_start).min(page_height).max(1);
-    draw_blocks_page(
-        &mut rendered_blocks,
-        font_system,
-        swash,
-        width,
-        y_start,
-        draw_height,
-    )
-}
-
-pub fn measure_markdown_pages(
-    data: &[u8],
-    base_dir: &Path,
-    max_pixel_width: u32,
-    page_height: u32,
-    font_size_pt: f64,
-) -> Result<MarkdownPagePlan, Box<dyn std::error::Error>> {
-    let blocks = parse_markdown_blocks(data);
-    let width = markdown_render_width(max_pixel_width);
-    let font_size = markdown_font_size(font_size_pt);
-    let state = FONT_STATE.get_or_init(|| {
-        let res = fonts::resolve_fonts();
-        Mutex::new(FontState {
-            font_system: res.font_system,
-            swash: SwashCache::new(),
-            warning: res.warning,
-        })
-    });
-    let mut guard = state.lock().unwrap();
-    if let Some(w) = guard.warning.take() {
-        eprintln!("{w}");
-    }
-    let FontState { font_system, .. } = &mut *guard;
-    let (_, total_height) = layout_blocks_inner(&blocks, base_dir, font_system, width, font_size)?;
-    Ok(MarkdownPagePlan {
-        total_height,
-        page_height,
-        total_pages: markdown_total_pages(total_height, page_height),
-    })
+    f(font_system, swash)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MarkdownPagePlan {
-    pub total_height: u32,
-    pub page_height: u32,
-    pub total_pages: usize,
+enum PagerAction {
+    ShowPage(usize),
+    Quit,
+}
+
+fn markdown_pager_action(current: usize, total_pages: usize, input: &str) -> PagerAction {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        if current < total_pages {
+            return PagerAction::ShowPage(current + 1);
+        }
+        return PagerAction::Quit;
+    }
+    if trimmed.eq_ignore_ascii_case("q") {
+        return PagerAction::Quit;
+    }
+    if let Ok(n) = trimmed.parse::<usize>() {
+        return PagerAction::ShowPage(n.clamp(1, total_pages));
+    }
+    PagerAction::ShowPage(current)
 }
 
 // ── AST types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) enum InlineToken {
-    Text {
-        text: String,
-        bold: bool,
-        italic: bool,
-        mono: bool,
-        color: Option<u32>, // packed 0xRRGGBB
-        underline: bool,
-    },
-    Image {
-        path: PathBuf,
-        center: bool,
-    },
-    Math {
-        text: String,
-        display: bool,
-    },
+enum InlineToken {
+    Text { text: String, style: InlineStyle },
+    Image { path: PathBuf },
+    Math { text: String, display: bool },
     SoftBreak,
     HardBreak,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct InlineStyle {
+    bold: bool,
+    italic: bool,
+    mono: bool,
+    color: Option<u32>, // packed 0xRRGGBB
+    underline: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -358,41 +192,12 @@ enum Block {
         lang: String,
         text: String,
     },
-    Math {
-        text: String,
-        display: bool,
-    },
+    Math(String),
     Rule,
     Table {
         header: Vec<Vec<InlineToken>>,
         rows: Vec<Vec<Vec<InlineToken>>>,
     },
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct InlineState {
-    bold: bool,
-    italic: bool,
-}
-
-impl InlineState {
-    fn regular() -> Self {
-        Self {
-            bold: false,
-            italic: false,
-        }
-    }
-
-    fn with_bold(self) -> Self {
-        Self { bold: true, ..self }
-    }
-
-    fn with_italic(self) -> Self {
-        Self {
-            italic: true,
-            ..self
-        }
-    }
 }
 
 // ── Parser ───────────────────────────────────────────────────────────────────
@@ -403,6 +208,13 @@ fn parse_markdown_blocks(data: &[u8]) -> Vec<Block> {
     let events: Vec<Event<'_>> = parser.collect();
     let mut idx = 0;
     parse_block_list(&events, &mut idx)
+}
+
+// Consumes the closing event of a container when the cursor is on it.
+fn skip_end(events: &[Event<'_>], idx: &mut usize, end: TagEnd) {
+    if matches!(events.get(*idx), Some(Event::End(e)) if *e == end) {
+        *idx += 1;
+    }
 }
 
 fn parse_block_list(events: &[Event<'_>], idx: &mut usize) -> Vec<Block> {
@@ -423,42 +235,36 @@ fn parse_block_list(events: &[Event<'_>], idx: &mut usize) -> Vec<Block> {
 
 fn parse_one_block(events: &[Event<'_>], idx: &mut usize) -> Option<Block> {
     match &events[*idx] {
-        Event::Start(Tag::Heading { level, .. }) => {
-            let level = heading_level_from_tag(*level);
+        Event::Start(tag @ Tag::Heading { level, .. }) => {
             *idx += 1;
-            let tokens = collect_inline_tokens(events, idx, InlineState::regular());
-            if matches!(events.get(*idx), Some(Event::End(TagEnd::Heading(_)))) {
-                *idx += 1;
-            }
-            Some(Block::Heading { level, tokens })
+            let tokens = collect_inline_tokens(events, idx, InlineStyle::default());
+            skip_end(events, idx, tag.to_end());
+            Some(Block::Heading {
+                level: *level as u32,
+                tokens,
+            })
         }
         Event::Start(Tag::Paragraph) => {
             *idx += 1;
-            let tokens = collect_inline_tokens(events, idx, InlineState::regular());
-            if matches!(events.get(*idx), Some(Event::End(TagEnd::Paragraph))) {
-                *idx += 1;
-            }
+            let tokens = collect_inline_tokens(events, idx, InlineStyle::default());
+            skip_end(events, idx, TagEnd::Paragraph);
             if tokens.is_empty() {
                 None
             } else {
                 Some(Block::Paragraph(tokens))
             }
         }
-        Event::Start(Tag::BlockQuote(_)) => {
+        Event::Start(tag @ Tag::BlockQuote(_)) => {
             *idx += 1;
             let children = parse_block_list(events, idx);
-            if matches!(events.get(*idx), Some(Event::End(TagEnd::BlockQuote(_)))) {
-                *idx += 1;
-            }
+            skip_end(events, idx, tag.to_end());
             Some(Block::BlockQuote(children))
         }
-        Event::Start(Tag::List(start)) => {
+        Event::Start(tag @ Tag::List(start)) => {
             let ordered = start.is_some();
             *idx += 1;
             let (items, tight) = collect_list_items(events, idx);
-            if matches!(events.get(*idx), Some(Event::End(TagEnd::List(_)))) {
-                *idx += 1;
-            }
+            skip_end(events, idx, tag.to_end());
             Some(Block::List {
                 ordered,
                 tight,
@@ -494,29 +300,19 @@ fn parse_one_block(events: &[Event<'_>], idx: &mut usize) -> Option<Block> {
         }
         Event::DisplayMath(text) => {
             *idx += 1;
-            Some(Block::Math {
-                text: text.to_string(),
-                display: true,
-            })
+            Some(Block::Math(text.to_string()))
         }
         Event::Start(Tag::Table(_)) => {
             *idx += 1;
             let (header, rows) = collect_table(events, idx);
-            if matches!(events.get(*idx), Some(Event::End(TagEnd::Table))) {
-                *idx += 1;
-            }
+            skip_end(events, idx, TagEnd::Table);
             Some(Block::Table { header, rows })
         }
         Event::Start(Tag::FootnoteDefinition(label)) => {
             let label = label.to_string();
             *idx += 1;
             let children = parse_block_list(events, idx);
-            if matches!(
-                events.get(*idx),
-                Some(Event::End(TagEnd::FootnoteDefinition))
-            ) {
-                *idx += 1;
-            }
+            skip_end(events, idx, TagEnd::FootnoteDefinition);
             let text = flatten_blocks_to_text(&children).trim().to_string();
             if text.is_empty() {
                 None
@@ -529,9 +325,7 @@ fn parse_one_block(events: &[Event<'_>], idx: &mut usize) -> Option<Block> {
         Event::Start(Tag::DefinitionList) => {
             *idx += 1;
             let items = collect_definition_list(events, idx);
-            if matches!(events.get(*idx), Some(Event::End(TagEnd::DefinitionList))) {
-                *idx += 1;
-            }
+            skip_end(events, idx, TagEnd::DefinitionList);
             if items.is_empty() {
                 None
             } else {
@@ -567,7 +361,7 @@ fn parse_one_block(events: &[Event<'_>], idx: &mut usize) -> Option<Block> {
 fn collect_inline_tokens(
     events: &[Event<'_>],
     idx: &mut usize,
-    state: InlineState,
+    style: InlineStyle,
 ) -> Vec<InlineToken> {
     let mut tokens = Vec::new();
     while *idx < events.len() {
@@ -576,11 +370,7 @@ fn collect_inline_tokens(
             Event::Text(text) => {
                 tokens.push(InlineToken::Text {
                     text: text.to_string(),
-                    bold: state.bold,
-                    italic: state.italic,
-                    mono: false,
-                    color: None,
-                    underline: false,
+                    style,
                 });
                 *idx += 1;
             }
@@ -588,11 +378,10 @@ fn collect_inline_tokens(
                 // Inline code span: monospace
                 tokens.push(InlineToken::Text {
                     text: text.to_string(),
-                    bold: false,
-                    italic: false,
-                    mono: true,
-                    color: None,
-                    underline: false,
+                    style: InlineStyle {
+                        mono: true,
+                        ..InlineStyle::default()
+                    },
                 });
                 *idx += 1;
             }
@@ -621,35 +410,40 @@ fn collect_inline_tokens(
             Event::Start(Tag::Emphasis) => {
                 *idx += 1;
                 // Emphasis level-1: entering italic escalates bold→bold+italic
-                let inner = collect_inline_tokens(events, idx, state.with_italic());
-                if matches!(events.get(*idx), Some(Event::End(TagEnd::Emphasis))) {
-                    *idx += 1;
-                }
+                let inner = collect_inline_tokens(
+                    events,
+                    idx,
+                    InlineStyle {
+                        italic: true,
+                        ..style
+                    },
+                );
+                skip_end(events, idx, TagEnd::Emphasis);
                 tokens.extend(inner);
             }
             Event::Start(Tag::Strong) => {
                 *idx += 1;
                 // Emphasis level-2: entering bold escalates italic→bold+italic
-                let inner = collect_inline_tokens(events, idx, state.with_bold());
-                if matches!(events.get(*idx), Some(Event::End(TagEnd::Strong))) {
-                    *idx += 1;
-                }
+                let inner = collect_inline_tokens(
+                    events,
+                    idx,
+                    InlineStyle {
+                        bold: true,
+                        ..style
+                    },
+                );
+                skip_end(events, idx, TagEnd::Strong);
                 tokens.extend(inner);
             }
             Event::Start(Tag::Link { .. }) => {
                 *idx += 1;
-                let mut link_tokens = collect_inline_tokens(events, idx, state);
-                if matches!(events.get(*idx), Some(Event::End(TagEnd::Link))) {
-                    *idx += 1;
-                }
+                let mut link_tokens = collect_inline_tokens(events, idx, style);
+                skip_end(events, idx, TagEnd::Link);
                 // Link color 0x064FBD + underline on all text spans
                 for t in link_tokens.iter_mut() {
-                    if let InlineToken::Text {
-                        color, underline, ..
-                    } = t
-                    {
-                        *color = Some(0x064FBD);
-                        *underline = true;
+                    if let InlineToken::Text { style, .. } = t {
+                        style.color = Some(0x064FBD);
+                        style.underline = true;
                     }
                 }
                 tokens.extend(link_tokens);
@@ -665,15 +459,13 @@ fn collect_inline_tokens(
                     }
                     *idx += 1;
                 }
-                tokens.push(InlineToken::Image { path, center: true });
+                tokens.push(InlineToken::Image { path });
             }
             Event::Start(Tag::List(_)) => break,
             Event::Start(Tag::Strikethrough) => {
                 *idx += 1;
-                let inner = collect_inline_tokens(events, idx, state);
-                if matches!(events.get(*idx), Some(Event::End(TagEnd::Strikethrough))) {
-                    *idx += 1;
-                }
+                let inner = collect_inline_tokens(events, idx, style);
+                skip_end(events, idx, TagEnd::Strikethrough);
                 tokens.extend(inner);
             }
             _ => {
@@ -687,11 +479,7 @@ fn collect_inline_tokens(
 fn plain_text_token(text: &str) -> InlineToken {
     InlineToken::Text {
         text: text.to_string(),
-        bold: false,
-        italic: false,
-        mono: false,
-        color: None,
-        underline: false,
+        style: InlineStyle::default(),
     }
 }
 
@@ -716,18 +504,14 @@ fn collect_list_items(events: &[Event<'_>], idx: &mut usize) -> (Vec<Vec<InlineT
                             if !item_tokens.is_empty() {
                                 item_tokens.push(InlineToken::HardBreak);
                             }
-                            let toks = collect_inline_tokens(events, idx, InlineState::regular());
+                            let toks = collect_inline_tokens(events, idx, InlineStyle::default());
                             item_tokens.extend(toks);
-                            if matches!(events.get(*idx), Some(Event::End(TagEnd::Paragraph))) {
-                                *idx += 1;
-                            }
+                            skip_end(events, idx, TagEnd::Paragraph);
                         }
-                        Event::Start(Tag::List(_)) => {
+                        Event::Start(tag @ Tag::List(_)) => {
                             *idx += 1;
                             let (nested_items, _) = collect_list_items(events, idx);
-                            if matches!(events.get(*idx), Some(Event::End(TagEnd::List(_)))) {
-                                *idx += 1;
-                            }
+                            skip_end(events, idx, tag.to_end());
                             for nested in nested_items {
                                 if !item_tokens.is_empty() {
                                     item_tokens.push(InlineToken::HardBreak);
@@ -738,7 +522,7 @@ fn collect_list_items(events: &[Event<'_>], idx: &mut usize) -> (Vec<Vec<InlineT
                         }
                         _ => {
                             let before = *idx;
-                            let toks = collect_inline_tokens(events, idx, InlineState::regular());
+                            let toks = collect_inline_tokens(events, idx, InlineStyle::default());
                             item_tokens.extend(toks);
                             // collect_inline_tokens stops before unmatched End events
                             // (e.g. a blockquote nested in the item); skip them so the
@@ -769,23 +553,13 @@ fn collect_definition_list(events: &[Event<'_>], idx: &mut usize) -> Vec<Vec<Inl
             Event::Start(Tag::DefinitionListTitle) => {
                 *idx += 1;
                 current_title =
-                    flatten_tokens(&collect_inline_tokens(events, idx, InlineState::regular()));
-                if matches!(
-                    events.get(*idx),
-                    Some(Event::End(TagEnd::DefinitionListTitle))
-                ) {
-                    *idx += 1;
-                }
+                    flatten_tokens(&collect_inline_tokens(events, idx, InlineStyle::default()));
+                skip_end(events, idx, TagEnd::DefinitionListTitle);
             }
             Event::Start(Tag::DefinitionListDefinition) => {
                 *idx += 1;
                 let blocks = parse_block_list(events, idx);
-                if matches!(
-                    events.get(*idx),
-                    Some(Event::End(TagEnd::DefinitionListDefinition))
-                ) {
-                    *idx += 1;
-                }
+                skip_end(events, idx, TagEnd::DefinitionListDefinition);
                 let definition = flatten_blocks_to_text(&blocks).trim().to_string();
                 if !current_title.trim().is_empty() || !definition.is_empty() {
                     items.push(vec![plain_text_token(&format!(
@@ -823,10 +597,8 @@ fn collect_table(
             // Header cells appear directly inside TableHead (no TableRow wrapper)
             Event::Start(Tag::TableCell) if in_head => {
                 *idx += 1;
-                let cell = collect_inline_tokens(events, idx, InlineState::regular());
-                if matches!(events.get(*idx), Some(Event::End(TagEnd::TableCell))) {
-                    *idx += 1;
-                }
+                let cell = collect_inline_tokens(events, idx, InlineStyle::default());
+                skip_end(events, idx, TagEnd::TableCell);
                 header.push(cell);
             }
             // Body rows
@@ -841,10 +613,8 @@ fn collect_table(
                         }
                         Event::Start(Tag::TableCell) => {
                             *idx += 1;
-                            let cell = collect_inline_tokens(events, idx, InlineState::regular());
-                            if matches!(events.get(*idx), Some(Event::End(TagEnd::TableCell))) {
-                                *idx += 1;
-                            }
+                            let cell = collect_inline_tokens(events, idx, InlineStyle::default());
+                            skip_end(events, idx, TagEnd::TableCell);
                             row.push(cell);
                         }
                         _ => {
@@ -866,7 +636,7 @@ fn collect_table(
 
 // ── AST utilities ─────────────────────────────────────────────────────────────
 
-pub(crate) fn flatten_tokens(tokens: &[InlineToken]) -> String {
+fn flatten_tokens(tokens: &[InlineToken]) -> String {
     let mut s = String::new();
     for t in tokens {
         match t {
@@ -894,7 +664,7 @@ fn flatten_blocks_to_text(blocks: &[Block]) -> String {
                 s.push_str(text);
                 s.push('\n');
             }
-            Block::Math { text, .. } => {
+            Block::Math(text) => {
                 s.push_str(text);
                 s.push('\n');
             }
@@ -904,63 +674,31 @@ fn flatten_blocks_to_text(blocks: &[Block]) -> String {
     s
 }
 
-fn heading_level_from_tag(level: pulldown_cmark::HeadingLevel) -> u32 {
-    match level {
-        pulldown_cmark::HeadingLevel::H1 => 1,
-        pulldown_cmark::HeadingLevel::H2 => 2,
-        pulldown_cmark::HeadingLevel::H3 => 3,
-        pulldown_cmark::HeadingLevel::H4 => 4,
-        pulldown_cmark::HeadingLevel::H5 => 5,
-        pulldown_cmark::HeadingLevel::H6 => 6,
-    }
-}
-
 // ── Renderer ──────────────────────────────────────────────────────────────────
 
-fn render_blocks(
-    blocks: &[Block],
-    base_dir: &Path,
+// The laid-out document: blocks positioned in document coordinates on a canvas
+// `width` pixels wide and `height` pixels tall.
+struct MarkdownLayout {
+    blocks: Vec<RenderBlock>,
     width: u32,
-    font_size: f64,
-) -> Result<DynamicImage, Box<dyn std::error::Error>> {
-    let state = FONT_STATE.get_or_init(|| {
-        let res = fonts::resolve_fonts();
-        Mutex::new(FontState {
-            font_system: res.font_system,
-            swash: SwashCache::new(),
-            warning: res.warning,
-        })
-    });
-    let mut guard = state.lock().unwrap();
-    if let Some(w) = guard.warning.take() {
-        eprintln!("{w}");
-    }
-    let FontState {
-        font_system, swash, ..
-    } = &mut *guard;
-    let (mut rendered_blocks, total_height) =
-        layout_blocks_inner(blocks, base_dir, font_system, width, font_size)?;
-    draw_blocks_page(
-        &mut rendered_blocks,
-        font_system,
-        swash,
-        width,
-        0,
-        total_height,
-    )
+    height: u32,
 }
 
-fn layout_blocks_inner(
+fn layout_document(
     blocks: &[Block],
     base_dir: &Path,
     font_system: &mut FontSystem,
     width: u32,
     font_size: f64,
-) -> Result<(Vec<RenderBlock>, u32), Box<dyn std::error::Error>> {
+) -> Result<MarkdownLayout, Box<dyn std::error::Error>> {
     let mut image_cache = HashMap::new();
     let mut y = DEFAULT_MARKDOWN_MARGIN;
     let mut rendered_blocks: Vec<RenderBlock> = Vec::new();
-    let content_width = width.saturating_sub(DEFAULT_MARKDOWN_MARGIN * 2).max(1);
+    let content_width = width.saturating_sub(DEFAULT_MARKDOWN_MARGIN * 2);
+    let bold = InlineStyle {
+        bold: true,
+        ..InlineStyle::default()
+    };
 
     for block in blocks {
         match block {
@@ -973,7 +711,7 @@ fn layout_blocks_inner(
                     _ => font_size * 1.15,
                 } as f32;
                 let text = flatten_tokens(tokens);
-                let layout = layout_text(font_system, &text, content_width, size, FontKind::Bold)?;
+                let layout = layout_text(font_system, &text, content_width, size, bold);
                 y += (font_size * 0.75) as u32;
                 rendered_blocks.push(RenderBlock::Text {
                     layout,
@@ -983,34 +721,24 @@ fn layout_blocks_inner(
                 y += rendered_blocks.last().unwrap().height() + (font_size * 0.5) as u32;
             }
             Block::Paragraph(tokens) => {
-                // Solo image paragraph: render inline image centered
                 let non_empty: Vec<_> = tokens
                     .iter()
                     .filter(|t| !matches!(t, InlineToken::SoftBreak | InlineToken::HardBreak))
                     .collect();
-                let is_solo_image =
-                    non_empty.len() == 1 && matches!(non_empty[0], InlineToken::Image { .. });
-                let is_solo_math =
-                    non_empty.len() == 1 && matches!(non_empty[0], InlineToken::Math { .. });
-
-                if is_solo_image {
-                    if let InlineToken::Image { path, center } = &non_empty[0] {
+                match non_empty.as_slice() {
+                    // Solo image paragraph: render the image centered
+                    [InlineToken::Image { path }] => {
                         let resolved = resolve_image_path(base_dir, path);
                         if let Some(img) = load_inline_image(&resolved, &mut image_cache)? {
                             let img = scale_markdown_image_to_width(&img, content_width);
-                            let x = if *center {
-                                DEFAULT_MARKDOWN_MARGIN
-                                    + content_width.saturating_sub(img.width()) / 2
-                            } else {
-                                DEFAULT_MARKDOWN_MARGIN
-                            };
+                            let x = DEFAULT_MARKDOWN_MARGIN
+                                + content_width.saturating_sub(img.width()) / 2;
                             rendered_blocks.push(RenderBlock::Image { image: img, x, y });
                             y +=
                                 rendered_blocks.last().unwrap().height() + (font_size * 0.6) as u32;
                         }
                     }
-                } else if is_solo_math {
-                    if let InlineToken::Math { text, display } = &non_empty[0] {
+                    [InlineToken::Math { text, display }] => {
                         let rendered =
                             math::render_math(text, font_system, font_size as f32, *display)
                                 .map_err(|err| format!("failed to render math: {err}"))?;
@@ -1020,20 +748,20 @@ fn layout_blocks_inner(
                         rendered_blocks.push(RenderBlock::Image { image, x, y });
                         y += rendered_blocks.last().unwrap().height() + (font_size * 0.6) as u32;
                     }
-                } else if !flatten_tokens(tokens).trim().is_empty()
-                    || tokens
-                        .iter()
-                        .any(|t| matches!(t, InlineToken::Image { .. }))
-                {
-                    let layout = layout_inline_tokens(
-                        font_system,
-                        tokens,
-                        content_width,
-                        font_size as f32,
-                        base_dir,
-                        &mut image_cache,
-                    )?;
-                    if layout.height > 0 {
+                    _ if !flatten_tokens(tokens).trim().is_empty()
+                        || tokens
+                            .iter()
+                            .any(|t| matches!(t, InlineToken::Image { .. })) =>
+                    {
+                        let layout = layout_inline_tokens(
+                            font_system,
+                            tokens,
+                            content_width,
+                            font_size as f32,
+                            false,
+                            base_dir,
+                            &mut image_cache,
+                        )?;
                         rendered_blocks.push(RenderBlock::Inline {
                             layout,
                             x: DEFAULT_MARKDOWN_MARGIN,
@@ -1041,6 +769,7 @@ fn layout_blocks_inner(
                         });
                         y += rendered_blocks.last().unwrap().height() + (font_size * 0.9) as u32;
                     }
+                    _ => {}
                 }
             }
             Block::List {
@@ -1059,13 +788,14 @@ fn layout_blocks_inner(
                         &prefix,
                         32,
                         font_size as f32,
-                        FontKind::Regular,
-                    )?;
+                        InlineStyle::default(),
+                    );
                     let content = layout_inline_tokens(
                         font_system,
                         item,
                         content_width.saturating_sub(40),
                         font_size as f32,
+                        false,
                         base_dir,
                         &mut image_cache,
                     )?;
@@ -1100,8 +830,8 @@ fn layout_blocks_inner(
                         trimmed,
                         content_width.saturating_sub(48),
                         font_size as f32,
-                        FontKind::Regular,
-                    )?;
+                        InlineStyle::default(),
+                    );
                     let h = layout.height;
                     // 4px vertical bar on the left
                     rendered_blocks.push(RenderBlock::Rect {
@@ -1123,29 +853,43 @@ fn layout_blocks_inner(
             }
             Block::Code { lang, text } => {
                 if lang.trim().eq_ignore_ascii_case("mermaid") {
-                    let image =
-                        mermaid::render_mermaid(text, font_system, content_width, font_size as f32)
-                            .map_err(|err| format!("failed to render Mermaid: {err}"))?;
-                    let x =
-                        DEFAULT_MARKDOWN_MARGIN + content_width.saturating_sub(image.width()) / 2;
-                    rendered_blocks.push(RenderBlock::Image { image, x, y });
-                    y += rendered_blocks.last().unwrap().height() + (font_size * 0.6) as u32;
-                    continue;
+                    match mermaid::render_mermaid(
+                        text,
+                        font_system,
+                        content_width,
+                        font_size as f32,
+                    ) {
+                        Ok(image) => {
+                            let x = DEFAULT_MARKDOWN_MARGIN
+                                + content_width.saturating_sub(image.width()) / 2;
+                            rendered_blocks.push(RenderBlock::Image { image, x, y });
+                            y +=
+                                rendered_blocks.last().unwrap().height() + (font_size * 0.6) as u32;
+                            continue;
+                        }
+                        // Show the diagram source as a code block instead of
+                        // dropping the rest of the document.
+                        Err(err) => eprintln!(
+                            "Warning: failed to render Mermaid diagram: {}",
+                            crate::cli::sanitize_control_chars(&err)
+                        ),
+                    }
                 }
                 let code_size = (font_size * 0.95) as f32;
-                let code_inner = content_width.saturating_sub(20);
-                let spans_data = highlight_code_spans(lang, text);
+                let code_inner = content_width.saturating_sub(CODE_PADDING * 2);
+                let spans = highlight_code_spans(lang, text);
 
                 let mut buffer = Buffer::new(font_system, Metrics::new(code_size, code_size * 1.4));
                 buffer.set_size(Some(code_inner as f32), None);
                 {
-                    let rich: Vec<(&str, Attrs)> = spans_data
+                    let rich: Vec<(&str, Attrs)> = spans
                         .iter()
-                        .flat_map(|(s, r, g, b, bold)| {
+                        .flat_map(|(style, s)| {
+                            let fg = style.foreground;
                             let mut a = Attrs::new()
                                 .family(Family::Monospace)
-                                .color(Color::rgb(*r, *g, *b));
-                            if *bold {
+                                .color(Color::rgb(fg.r, fg.g, fg.b));
+                            if style.font_style.contains(FontStyle::BOLD) {
                                 a = a.weight(Weight::BOLD);
                             }
                             route_monospace_cjk(s, &a)
@@ -1161,12 +905,11 @@ fn layout_blocks_inner(
                     x: DEFAULT_MARKDOWN_MARGIN,
                     y,
                     width: content_width,
-                    padding: 10,
                 });
                 y += rendered_blocks.last().unwrap().height() + 6;
             }
-            Block::Math { text, display } => {
-                let rendered = math::render_math(text, font_system, font_size as f32, *display)
+            Block::Math(text) => {
+                let rendered = math::render_math(text, font_system, font_size as f32, true)
                     .map_err(|err| format!("failed to render math: {err}"))?;
                 let image = scale_markdown_image_to_width(&rendered.image, content_width);
                 let x = DEFAULT_MARKDOWN_MARGIN + content_width.saturating_sub(image.width()) / 2;
@@ -1208,7 +951,7 @@ fn layout_blocks_inner(
                     let mut cell_layouts = Vec::new();
                     let mut max_h = 0_u32;
                     for cell_toks in row_tokens.iter().take(n_cols) {
-                        let layout = layout_inline_tokens_with_defaults(
+                        let layout = layout_inline_tokens(
                             font_system,
                             cell_toks,
                             cell_inner,
@@ -1227,6 +970,7 @@ fn layout_blocks_inner(
                             &[],
                             cell_inner,
                             font_size as f32,
+                            false,
                             base_dir,
                             &mut image_cache,
                         )?);
@@ -1296,34 +1040,30 @@ fn layout_blocks_inner(
         }
     }
 
-    let total_height = (y + DEFAULT_MARKDOWN_MARGIN).max(DEFAULT_MARKDOWN_MARGIN + 50);
-    Ok((rendered_blocks, total_height))
+    let height = (y + DEFAULT_MARKDOWN_MARGIN).max(DEFAULT_MARKDOWN_MARGIN + 50);
+    Ok(MarkdownLayout {
+        blocks: rendered_blocks,
+        width,
+        height,
+    })
 }
 
-// Allocate a Pixmap of exactly `draw_height` rows starting at `y_start` in
-// document coordinates, draw only the blocks that overlap that slice, and
-// return the result as a DynamicImage.  For a full-document render pass
-// `y_start=0` and `draw_height=total_height`.
-fn draw_blocks_page(
-    rendered_blocks: &mut [RenderBlock],
+// Draw the 1-based `page` of `layout` into a pixmap of at most `page_height`
+// rows; only blocks overlapping that slice of the document are drawn.
+fn render_page(
+    layout: &mut MarkdownLayout,
     font_system: &mut FontSystem,
     swash: &mut SwashCache,
-    width: u32,
-    y_start: u32,
-    draw_height: u32,
+    page: usize,
+    page_height: u32,
 ) -> Result<DynamicImage, Box<dyn std::error::Error>> {
-    let draw_height = draw_height.max(1);
+    let y_start = (page - 1) as u32 * page_height;
+    let draw_height = layout.height.saturating_sub(y_start).min(page_height);
+    let width = layout.width;
     let mut pixmap = Pixmap::new(width, draw_height).ok_or("failed to allocate pixmap")?;
-    sk_fill_rect(
-        &mut pixmap,
-        0,
-        0,
-        width,
-        draw_height,
-        Rgba([255, 255, 255, 255]),
-    );
+    pixmap.fill(tiny_skia::Color::WHITE);
     let y_end = y_start.saturating_add(draw_height);
-    for block in rendered_blocks.iter_mut() {
+    for block in layout.blocks.iter_mut() {
         let bt = block.y_top();
         let bb = bt.saturating_add(block.height());
         if bb <= y_start || bt >= y_end {
@@ -1348,18 +1088,13 @@ fn draw_blocks_page(
 
 // ── Syntax highlighting ───────────────────────────────────────────────────────
 
-fn highlight_code_spans(lang: &str, text: &str) -> Vec<(String, u8, u8, u8, bool)> {
+fn highlight_code_spans(lang: &str, text: &str) -> Vec<(SyntaxStyle, String)> {
     use syntect::easy::HighlightLines;
-    use syntect::highlighting::FontStyle;
     use syntect::util::LinesWithEndings;
 
-    let ss = SYNTAX_SET.get_or_init(syntect::parsing::SyntaxSet::load_defaults_nonewlines);
+    let ss = SYNTAX_SET.get_or_init(syntect::parsing::SyntaxSet::load_defaults_newlines);
     let ts = THEME_SET.get_or_init(syntect::highlighting::ThemeSet::load_defaults);
-    let theme = ts
-        .themes
-        .get("InspiredGitHub")
-        .or_else(|| ts.themes.values().next())
-        .unwrap();
+    let theme = &ts.themes["InspiredGitHub"];
     let syntax = ss
         .find_syntax_by_token(lang)
         .unwrap_or_else(|| ss.find_syntax_plain_text());
@@ -1368,36 +1103,26 @@ fn highlight_code_spans(lang: &str, text: &str) -> Vec<(String, u8, u8, u8, bool
     for line in LinesWithEndings::from(text) {
         match hl.highlight_line(line, ss) {
             Ok(ranges) => {
-                for (style, s) in &ranges {
-                    result.push((
-                        s.to_string(),
-                        style.foreground.r,
-                        style.foreground.g,
-                        style.foreground.b,
-                        style.font_style.contains(FontStyle::BOLD),
-                    ));
-                }
+                result.extend(ranges.into_iter().map(|(style, s)| (style, s.to_string())));
             }
             Err(_) => {
-                result.push((line.to_string(), 50, 50, 50, false));
+                let plain = SyntaxStyle {
+                    foreground: syntect::highlighting::Color {
+                        r: 50,
+                        g: 50,
+                        b: 50,
+                        a: 255,
+                    },
+                    ..SyntaxStyle::default()
+                };
+                result.push((plain, line.to_string()));
             }
         }
-    }
-    if result.is_empty() {
-        result.push((String::new(), 0, 0, 0, false));
     }
     result
 }
 
 // ── Render primitives ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-enum FontKind {
-    Regular,
-    Bold,
-    Mono,
-}
 
 #[derive(Debug)]
 struct TextLayout {
@@ -1433,23 +1158,13 @@ fn layout_text(
     text: &str,
     width: u32,
     size: f32,
-    kind: FontKind,
-) -> Result<TextLayout, Box<dyn std::error::Error>> {
-    layout_text_with_attrs(font_system, text, width, size, attrs_for_kind(kind, None))
-}
-
-fn layout_text_with_attrs(
-    font_system: &mut FontSystem,
-    text: &str,
-    width: u32,
-    size: f32,
-    attrs: Attrs,
-) -> Result<TextLayout, Box<dyn std::error::Error>> {
+    style: InlineStyle,
+) -> TextLayout {
     let mut buffer = Buffer::new(font_system, Metrics::new(size, size * 1.4));
     buffer.set_size(Some(width as f32), None);
-    set_buffer_text(&mut buffer, text, &attrs);
+    set_buffer_text(&mut buffer, text, &inline_attrs(style));
     buffer.shape_until_scroll(font_system, false);
-    Ok(text_layout_from_buffer(buffer, Color::rgb(0, 0, 0)))
+    text_layout_from_buffer(buffer, Color::rgb(0, 0, 0))
 }
 
 fn set_buffer_text(buffer: &mut Buffer, text: &str, attrs: &Attrs) {
@@ -1483,31 +1198,6 @@ fn route_monospace_cjk<'t, 'a>(text: &'t str, attrs: &Attrs<'a>) -> Vec<(&'t str
 
 fn has_monospace_cjk(text: &str, attrs: &Attrs) -> bool {
     attrs.family == Family::Monospace && text.chars().any(fonts::is_cjk_char)
-}
-
-fn attrs_for_kind(kind: FontKind, color: Option<u32>) -> Attrs<'static> {
-    let mut attrs = match kind {
-        FontKind::Regular => Attrs::new().family(Family::SansSerif),
-        FontKind::Bold => Attrs::new().family(Family::SansSerif).weight(Weight::BOLD),
-        FontKind::Mono => Attrs::new().family(Family::Monospace),
-    };
-    if let Some(color) = color {
-        attrs = attrs.color(Color::rgb(
-            ((color >> 16) & 0xff) as u8,
-            ((color >> 8) & 0xff) as u8,
-            (color & 0xff) as u8,
-        ));
-    }
-    attrs
-}
-
-#[derive(Debug, Clone, Copy)]
-struct InlineStyle {
-    bold: bool,
-    italic: bool,
-    mono: bool,
-    color: Option<u32>,
-    underline: bool,
 }
 
 fn inline_attrs(style: InlineStyle) -> Attrs<'static> {
@@ -1572,25 +1262,6 @@ fn layout_inline_tokens(
     tokens: &[InlineToken],
     width: u32,
     font_size: f32,
-    base_dir: &Path,
-    image_cache: &mut HashMap<PathBuf, DynamicImage>,
-) -> Result<InlineLayout, Box<dyn std::error::Error>> {
-    layout_inline_tokens_with_defaults(
-        font_system,
-        tokens,
-        width,
-        font_size,
-        false,
-        base_dir,
-        image_cache,
-    )
-}
-
-fn layout_inline_tokens_with_defaults(
-    font_system: &mut FontSystem,
-    tokens: &[InlineToken],
-    width: u32,
-    font_size: f32,
     default_bold: bool,
     base_dir: &Path,
     image_cache: &mut HashMap<PathBuf, DynamicImage>,
@@ -1600,22 +1271,12 @@ fn layout_inline_tokens_with_defaults(
 
     for token in tokens {
         match token {
-            InlineToken::Text {
-                text,
-                bold,
-                italic,
-                mono,
-                color,
-                underline,
-            } => {
+            InlineToken::Text { text, style } => {
                 let style = InlineStyle {
-                    bold: *bold || default_bold,
-                    italic: *italic,
-                    mono: *mono,
-                    color: *color,
-                    underline: *underline,
+                    bold: style.bold || default_bold,
+                    ..*style
                 };
-                push_inline_words(font_system, &mut lines, text, width, font_size, style)?;
+                push_inline_words(font_system, &mut lines, text, width, font_size, style);
             }
             InlineToken::Math { text, display } => {
                 let rendered = math::render_math(text, font_system, font_size, *display)
@@ -1627,7 +1288,7 @@ fn layout_inline_tokens_with_defaults(
                 lines.last_mut().unwrap().width += space_width;
             }
             InlineToken::HardBreak => lines.push(InlineLine::default()),
-            InlineToken::Image { path, .. } => {
+            InlineToken::Image { path } => {
                 let resolved = resolve_image_path(base_dir, path);
                 if let Some(image) = load_inline_image(&resolved, image_cache)? {
                     let baseline = image.height();
@@ -1707,10 +1368,10 @@ fn push_inline_words(
     max_width: u32,
     font_size: f32,
     style: InlineStyle,
-) -> Result<(), Box<dyn std::error::Error>> {
+) {
     let segments = split_inline_segments(text, style.mono);
     if segments.is_empty() {
-        return Ok(());
+        return;
     }
 
     let widths = measure_segment_widths(font_system, &segments, font_size, style);
@@ -1737,13 +1398,7 @@ fn push_inline_words(
         } else {
             u32::MAX / 2
         };
-        let layout = layout_text_with_attrs(
-            font_system,
-            &segment,
-            layout_width,
-            font_size,
-            inline_attrs(style),
-        )?;
+        let layout = layout_text(font_system, &segment, layout_width, font_size, style);
         let line = lines.last_mut().unwrap();
         let x = line.width;
         line.width = line.width.saturating_add(layout.width);
@@ -1756,7 +1411,6 @@ fn push_inline_words(
             baseline,
         });
     }
-    Ok(())
 }
 
 fn split_inline_segments(text: &str, preserve_whitespace: bool) -> Vec<String> {
@@ -1846,7 +1500,14 @@ fn cached_space_width(font_system: &mut FontSystem, font_size: f32) -> u32 {
     if let Some(width) = cache.lock().unwrap().get(&key) {
         return *width;
     }
-    let width = measure_inline_text_width(font_system, " ", font_size, FontKind::Regular);
+    let width = layout_text(
+        font_system,
+        " ",
+        u32::MAX / 2,
+        font_size,
+        InlineStyle::default(),
+    )
+    .width;
     cache.lock().unwrap().insert(key, width);
     width
 }
@@ -1879,17 +1540,6 @@ fn push_inline_image(
         .push(InlineLineItem::Image { image, x, baseline });
 }
 
-fn measure_inline_text_width(
-    font_system: &mut FontSystem,
-    text: &str,
-    size: f32,
-    kind: FontKind,
-) -> u32 {
-    layout_text(font_system, text, u32::MAX / 2, size, kind)
-        .map(|layout| layout.width)
-        .unwrap_or(0)
-}
-
 #[derive(Debug)]
 enum RenderBlock {
     Text {
@@ -1907,7 +1557,6 @@ enum RenderBlock {
         x: u32,
         y: u32,
         width: u32,
-        padding: u32,
     },
     Image {
         image: DynamicImage,
@@ -1933,9 +1582,7 @@ impl RenderBlock {
         match self {
             Self::Text { layout, .. } => layout.height,
             Self::Inline { layout, .. } => layout.height,
-            Self::Code {
-                layout, padding, ..
-            } => layout.height + padding * 2 + 6,
+            Self::Code { layout, .. } => layout.height + CODE_PADDING * 2 + 6,
             Self::Image { image, .. } => image.height(),
             Self::Rule { .. } => 2,
             Self::Rect { height, .. } => *height,
@@ -2001,18 +1648,17 @@ impl RenderBlock {
                 x,
                 y,
                 width,
-                padding,
             } => {
                 let y_adj = *y as i32 - y_offset;
-                sk_fill_rect_signed(
+                fill_rect(
                     pixmap,
                     *x as i32,
                     y_adj,
                     *width,
-                    layout.height + *padding * 2 + 6,
-                    Rgba([245, 245, 245, 255]),
+                    layout.height + CODE_PADDING * 2 + 6,
+                    [245, 245, 245, 255],
                 );
-                let text_top = *padding as i32;
+                let text_top = CODE_PADDING as i32;
                 let text_visible_top = visible_top as i32 - text_top;
                 let text_visible_bottom = visible_bottom as i32 - text_top;
                 if text_visible_bottom > 0 && text_visible_top < layout.height as i32 {
@@ -2024,7 +1670,7 @@ impl RenderBlock {
                     draw_text_layout(
                         &mut ctx,
                         layout,
-                        (*x + *padding) as i32,
+                        (*x + CODE_PADDING) as i32,
                         y_adj + text_top,
                         text_visible_top.max(0) as u32,
                         text_visible_bottom.min(layout.height as i32).max(0) as u32,
@@ -2042,13 +1688,13 @@ impl RenderBlock {
                 );
             }
             Self::Rule { x, y, width } => {
-                sk_fill_rect_signed(
+                fill_rect(
                     pixmap,
                     *x as i32,
                     *y as i32 - y_offset,
                     *width,
                     2,
-                    Rgba([220, 220, 220, 255]),
+                    [220, 220, 220, 255],
                 );
             }
             Self::Rect {
@@ -2058,13 +1704,13 @@ impl RenderBlock {
                 height,
                 color,
             } => {
-                sk_fill_rect_signed(
+                fill_rect(
                     pixmap,
                     *x as i32,
                     *y as i32 - y_offset,
                     *width,
                     *height,
-                    *color,
+                    color.0,
                 );
             }
         }
@@ -2229,7 +1875,14 @@ struct TextPixmapRenderer<'a> {
 
 impl Renderer for TextPixmapRenderer<'_> {
     fn rectangle(&mut self, x: i32, y: i32, width: u32, height: u32, color: Color) {
-        fill_cosmic_rect(self.pixmap, self.x + x, self.y + y, width, height, color);
+        fill_rect(
+            self.pixmap,
+            self.x + x,
+            self.y + y,
+            width,
+            height,
+            color.as_rgba(),
+        );
     }
 
     fn glyph(&mut self, physical_glyph: PhysicalGlyph, color: Color) {
@@ -2241,94 +1894,33 @@ impl Renderer for TextPixmapRenderer<'_> {
             physical_glyph.cache_key,
             color,
             |gx, gy, pixel_color| {
-                fill_cosmic_rect(pixmap, base_x + gx, base_y + gy, 1, 1, pixel_color);
+                fill_rect(
+                    pixmap,
+                    base_x + gx,
+                    base_y + gy,
+                    1,
+                    1,
+                    pixel_color.as_rgba(),
+                );
             },
         );
     }
 }
 
-fn fill_cosmic_rect(pixmap: &mut Pixmap, x: i32, y: i32, width: u32, height: u32, color: Color) {
-    let a = color.a();
-    if a == 0 || width == 0 || height == 0 {
+// tiny-skia clips the rectangle to the pixmap, so callers may pass blocks that
+// straddle or lie outside the current page slice.
+fn fill_rect(pixmap: &mut Pixmap, x: i32, y: i32, width: u32, height: u32, rgba: [u8; 4]) {
+    let [r, g, b, a] = rgba;
+    // Glyph rasterization reports fully transparent pixels too; skip them cheaply.
+    if a == 0 {
         return;
     }
-    let pw = pixmap.width() as i64;
-    let ph = pixmap.height() as i64;
-    let x0 = i64::from(x).max(0).min(pw);
-    let y0 = i64::from(y).max(0).min(ph);
-    let x1 = i64::from(x).saturating_add(i64::from(width)).max(0).min(pw);
-    let y1 = i64::from(y)
-        .saturating_add(i64::from(height))
-        .max(0)
-        .min(ph);
-    let draw_w = x1 - x0;
-    let draw_h = y1 - y0;
-    if draw_w <= 0 || draw_h <= 0 {
+    let Some(rect) = SkRect::from_xywh(x as f32, y as f32, width as f32, height as f32) else {
         return;
-    }
-    if let Some(rect) = SkRect::from_xywh(x0 as f32, y0 as f32, draw_w as f32, draw_h as f32) {
-        let mut paint = SkPaint {
-            blend_mode: BlendMode::SourceOver,
-            ..SkPaint::default()
-        };
-        paint.set_color_rgba8(color.r(), color.g(), color.b(), a);
-        pixmap.fill_rect(rect, &paint, Transform::identity(), None);
-    }
-}
-
-fn sk_fill_rect(pixmap: &mut Pixmap, x: u32, y: u32, width: u32, height: u32, color: Rgba<u8>) {
-    if width == 0 || height == 0 {
-        return;
-    }
-    let x = x.min(pixmap.width()) as f32;
-    let y = y.min(pixmap.height()) as f32;
-    let w = (width as f32).min(pixmap.width() as f32 - x);
-    let h = (height as f32).min(pixmap.height() as f32 - y);
-    if w <= 0.0 || h <= 0.0 {
-        return;
-    }
-    if let Some(rect) = SkRect::from_xywh(x, y, w, h) {
-        let mut paint = SkPaint {
-            blend_mode: BlendMode::SourceOver,
-            ..SkPaint::default()
-        };
-        paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
-        pixmap.fill_rect(rect, &paint, Transform::identity(), None);
-    }
-}
-
-// Like sk_fill_rect but accepts signed coordinates, handling negative y when a
-// block is partially above the current page slice.
-fn sk_fill_rect_signed(
-    pixmap: &mut Pixmap,
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-    color: Rgba<u8>,
-) {
-    if width == 0 || height == 0 {
-        return;
-    }
-    let pw = pixmap.width() as i32;
-    let ph = pixmap.height() as i32;
-    let x0 = x.max(0).min(pw) as f32;
-    let y0 = y.max(0).min(ph) as f32;
-    let x1 = (x + width as i32).min(pw).max(0) as f32;
-    let y1 = (y + height as i32).min(ph).max(0) as f32;
-    let w = x1 - x0;
-    let h = y1 - y0;
-    if w <= 0.0 || h <= 0.0 {
-        return;
-    }
-    if let Some(rect) = SkRect::from_xywh(x0, y0, w, h) {
-        let mut paint = SkPaint {
-            blend_mode: BlendMode::SourceOver,
-            ..SkPaint::default()
-        };
-        paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
-        pixmap.fill_rect(rect, &paint, Transform::identity(), None);
-    }
+    };
+    let mut paint = SkPaint::default();
+    paint.set_color_rgba8(r, g, b, a);
+    pixmap.fill_rect(rect, &paint, Transform::identity(), None);
 }
 
 // Overlay only the visible source rows for images that straddle page boundaries.
@@ -2431,7 +2023,7 @@ fn load_inline_image(
     if !path.exists() {
         return Ok(None);
     }
-    let data = imgutil::read_source(path.to_str().unwrap_or_default())?;
+    let data = imgutil::read_file(path)?;
     let image = imgutil::decode_with_limits(&data)?;
     cache.insert(path.to_path_buf(), image.clone());
     Ok(Some(image))
@@ -2443,22 +2035,20 @@ fn send_rendered_markdown(
     tmux: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for rect in markdown_chunk_rects(image.width(), image.height()) {
-        let chunk = image.crop_imm(rect.0, rect.1, rect.2, rect.3);
+        let mut chunk = image.crop_imm(rect.0, rect.1, rect.2, rect.3);
+        let (width, height) =
+            imgutil::fit_within(chunk.width(), chunk.height(), size.pixel_width, u32::MAX);
+        if (width, height) != (chunk.width(), chunk.height()) {
+            chunk = imgutil::scale(&chunk, width, height);
+        }
         let png = imgutil::encode_png(&chunk)?;
-        let prepared = crate::display::image::prepare_image(&png, size.pixel_width)?;
-        crate::kitty::send_static_image(
-            &prepared.png_data,
-            prepared.width,
-            prepared.height,
-            size,
-            tmux,
-        )?;
+        crate::kitty::send_static_image(&png, width, height, size, tmux)?;
     }
     Ok(())
 }
 
 fn scale_markdown_image_to_width(image: &DynamicImage, max_width: u32) -> DynamicImage {
-    if image.width() <= max_width || max_width == 0 {
+    if image.width() <= max_width {
         image.clone()
     } else {
         image.resize(max_width, u32::MAX, imageops::FilterType::Triangle)
@@ -2481,14 +2071,6 @@ pub fn markdown_base_dir(path: &str) -> PathBuf {
         .unwrap_or_default()
 }
 
-pub fn markdown_font_size(value: f64) -> f64 {
-    if value <= 0.0 {
-        DEFAULT_MARKDOWN_FONT_PT
-    } else {
-        value
-    }
-}
-
 pub fn markdown_page_height(size: Size) -> u32 {
     size.image_area_height()
 }
@@ -2501,17 +2083,8 @@ pub fn markdown_total_pages(total_height: u32, page_height: u32) -> usize {
     }
 }
 
-pub fn markdown_should_paginate(bounds: (u32, u32), size: Size) -> bool {
-    bounds.1 > markdown_page_height(size)
-}
-
 pub fn markdown_chunk_max_height(width: u32) -> u32 {
-    if width == 0 {
-        return 1;
-    }
-    let by_pixels = (imgutil::MAX_PIXELS / width as u64) as u32;
-    let by_bytes = (imgutil::MAX_RGBA_BYTES / 4 / width as u64) as u32;
-    by_pixels.min(by_bytes).clamp(1, MARKDOWN_CHUNK_HEIGHT)
+    ((imgutil::MAX_PIXELS / width as u64) as u32).clamp(1, MARKDOWN_CHUNK_HEIGHT)
 }
 
 pub fn markdown_chunk_rects(width: u32, height: u32) -> Vec<(u32, u32, u32, u32)> {
@@ -2536,6 +2109,47 @@ mod tests {
     use super::*;
     use image::{GenericImage, GenericImageView, ImageEncoder};
     use std::collections::BTreeSet;
+
+    // Lays out `data` at the default font size and draws the whole document as
+    // a single page.
+    fn render_markdown(
+        data: &[u8],
+        base_dir: &Path,
+        max_pixel_width: u32,
+    ) -> Result<DynamicImage, Box<dyn std::error::Error>> {
+        render_markdown_page(
+            data,
+            base_dir,
+            max_pixel_width,
+            DEFAULT_MARKDOWN_FONT_PT,
+            1,
+            None,
+        )
+    }
+
+    // Lays out `data` and draws one page through the production pager slicing;
+    // `page_height: None` draws the whole document as one page.
+    fn render_markdown_page(
+        data: &[u8],
+        base_dir: &Path,
+        max_pixel_width: u32,
+        font_size: f64,
+        page: usize,
+        page_height: Option<u32>,
+    ) -> Result<DynamicImage, Box<dyn std::error::Error>> {
+        let blocks = parse_markdown_blocks(data);
+        with_fonts(|font_system, swash| {
+            let mut layout = layout_document(
+                &blocks,
+                base_dir,
+                font_system,
+                markdown_render_width(max_pixel_width),
+                font_size,
+            )?;
+            let page_height = page_height.unwrap_or(layout.height);
+            render_page(&mut layout, font_system, swash, page, page_height)
+        })
+    }
 
     fn non_white_bounds(image: &DynamicImage) -> (u32, u32, u32, u32) {
         let rgba = image.to_rgba8();
@@ -2575,14 +2189,6 @@ mod tests {
     }
 
     #[test]
-    fn markdown_render_width_cases() {
-        assert_eq!(markdown_render_width(0), DEFAULT_MARKDOWN_WIDTH);
-        assert_eq!(markdown_render_width(320), MIN_MARKDOWN_WIDTH);
-        assert_eq!(markdown_render_width(800), 800);
-        assert_eq!(markdown_render_width(1600), DEFAULT_MARKDOWN_WIDTH);
-    }
-
-    #[test]
     fn render_markdown_produces_image() {
         let image = render_markdown(
             b"# Hello\n\n- one\n- two\n\n```go\nfmt.Println(\"hi\")\n```\n",
@@ -2592,9 +2198,6 @@ mod tests {
         .unwrap();
         assert_rendered_content(&image);
         assert_eq!(image.width(), 800);
-        assert!(image.height() > 0);
-        let encoded = imgutil::encode_png(&image).unwrap();
-        assert!(imgutil::is_png(&encoded));
     }
 
     #[test]
@@ -2614,11 +2217,13 @@ mod tests {
     fn render_markdown_with_font_size_affects_layout() {
         let data = b"# Title\n\nParagraph text that wraps enough to make font size visible in layout.\n\n- one\n- two\n";
         let default = render_markdown(data, Path::new(""), 800).unwrap();
-        let large = render_markdown_with_font_size(
+        let large = render_markdown_page(
             data,
             Path::new(""),
             800,
             DEFAULT_MARKDOWN_FONT_PT * 1.5,
+            1,
+            None,
         )
         .unwrap();
         assert!(large.height() > default.height());
@@ -2648,50 +2253,6 @@ $$
         assert_rendered_content(&image);
         assert_eq!(image.width(), 800);
         assert!(image.height() > 180);
-    }
-
-    #[test]
-    fn render_markdown_with_sequence_mermaid_uses_diagram_layout() {
-        let md = b"```mermaid\nsequenceDiagram\n    participant User\n    participant System\n    participant Database\n\n    User->>System: Login Request\n    System->>Database: Query User\n    Database-->>System: User Data\n    System-->>User: Login Success\n```\n";
-        let image = render_markdown(md, Path::new(""), 800).unwrap();
-
-        assert_rendered_content(&image);
-        assert_eq!(image.width(), 800);
-        assert!(
-            image.height() > 280,
-            "sequence Mermaid should render as a diagram, not compact text fallback"
-        );
-    }
-
-    #[test]
-    fn render_markdown_with_markie_mermaid_demo_types() {
-        let diagrams: &[(&str, &[u8], u32)] = &[
-            (
-                "class",
-                b"```mermaid\nclassDiagram\n    class Animal {\n        +String name\n        +makeSound()\n    }\n    class Dog {\n        +bark()\n    }\n    Animal <|-- Dog\n```\n",
-                240,
-            ),
-            (
-                "state",
-                b"```mermaid\nstateDiagram\n    [*] --> Idle\n    Idle --> Loading: Load Data\n    Loading --> Success: Complete\n    Success --> [*]\n```\n",
-                220,
-            ),
-            (
-                "er",
-                b"```mermaid\nerDiagram\n    CUSTOMER ||--o{ ORDER : places\n    ORDER ||--|{ LINE_ITEM : contains\n    CUSTOMER {\n        int id\n        string name\n    }\n```\n",
-                220,
-            ),
-        ];
-
-        for (name, md, min_height) in diagrams {
-            let image = render_markdown(md, Path::new(""), 800).unwrap();
-            assert_rendered_content(&image);
-            assert_eq!(image.width(), 800, "{name} diagram width");
-            assert!(
-                image.height() > *min_height,
-                "{name} Mermaid should render as a diagram, not compact text fallback"
-            );
-        }
     }
 
     #[test]
@@ -2758,7 +2319,7 @@ $$
     }
 
     #[test]
-    fn render_markdown_page_detailed_matches_non_first_code_slice() {
+    fn render_page_matches_non_first_code_slice() {
         let lines = (0..80)
             .map(|i| format!("let value_{i} = {i};\n"))
             .collect::<String>();
@@ -2767,13 +2328,13 @@ $$
         let full = render_markdown(markdown.as_bytes(), Path::new(""), 800).unwrap();
         assert!(full.height() > page_height * 2);
 
-        let page = render_markdown_page_detailed(
+        let page = render_markdown_page(
             markdown.as_bytes(),
             Path::new(""),
             800,
-            1,
-            page_height,
-            0.0,
+            DEFAULT_MARKDOWN_FONT_PT,
+            2,
+            Some(page_height),
         )
         .unwrap();
         let expected = full.crop_imm(0, page_height, full.width(), page_height);
@@ -2783,7 +2344,7 @@ $$
     }
 
     #[test]
-    fn render_markdown_page_detailed_matches_non_first_image_slice() {
+    fn render_page_matches_non_first_image_slice() {
         let dir = tempfile::tempdir().unwrap();
         let image_path = dir.path().join("tall.png");
         let mut image = DynamicImage::new_rgba8(64, 360);
@@ -2806,8 +2367,15 @@ $$
         let full = render_markdown(markdown, dir.path(), 800).unwrap();
         assert!(full.height() > page_height * 2);
 
-        let page =
-            render_markdown_page_detailed(markdown, dir.path(), 800, 1, page_height, 0.0).unwrap();
+        let page = render_markdown_page(
+            markdown,
+            dir.path(),
+            800,
+            DEFAULT_MARKDOWN_FONT_PT,
+            2,
+            Some(page_height),
+        )
+        .unwrap();
         let expected = full.crop_imm(0, page_height, full.width(), page_height);
 
         assert_eq!(page.dimensions(), expected.dimensions());
@@ -2826,21 +2394,6 @@ $$
             rects.last().unwrap().1 + rects.last().unwrap().3,
             markdown_chunk_max_height(1024) * 2 + 17
         );
-    }
-
-    #[test]
-    fn markdown_pagination_helpers() {
-        let size = Size {
-            pixel_width: 800,
-            pixel_height: 600,
-            cols: 100,
-            rows: 30,
-        };
-        let height = markdown_page_height(size);
-        assert!(height < 600 && height > 0);
-        assert_eq!(markdown_total_pages(height * 2 + 1, height), 3);
-        assert!(markdown_should_paginate((800, height + 1), size));
-        assert!(!markdown_should_paginate((800, height), size));
     }
 
     #[test]
@@ -2867,18 +2420,6 @@ $$
     }
 
     #[test]
-    fn markdown_base_dir_cases() {
-        assert_eq!(markdown_base_dir(""), PathBuf::new());
-        assert_eq!(markdown_base_dir("docs/README.md"), PathBuf::from("docs"));
-    }
-
-    #[test]
-    fn markdown_font_size_default_and_override() {
-        assert_eq!(markdown_font_size(0.0), DEFAULT_MARKDOWN_FONT_PT);
-        assert_eq!(markdown_font_size(20.5), 20.5);
-    }
-
-    #[test]
     fn render_markdown_solo_image_uses_base_dir() {
         let dir = tempfile::tempdir().unwrap();
         let image_path = dir.path().join("inline.png");
@@ -2892,6 +2433,32 @@ $$
                 .pixels()
                 .any(|pixel| pixel[0] > 200 && pixel[1] < 60 && pixel[2] < 60),
             "the relative solo image should be rendered"
+        );
+    }
+
+    // macOS file systems reject non-UTF-8 names, so this only runs on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_markdown_reads_image_under_non_utf8_base_dir() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_dir = dir.path().join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+        std::fs::create_dir(&base_dir).unwrap();
+        let mut image = DynamicImage::new_rgba8(32, 24);
+        image.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        std::fs::write(
+            base_dir.join("inline.png"),
+            imgutil::encode_png(&image).unwrap(),
+        )
+        .unwrap();
+        let rendered = render_markdown(b"![alt](inline.png)\n", &base_dir, 800).unwrap();
+        assert!(
+            rendered
+                .to_rgba8()
+                .pixels()
+                .any(|pixel| pixel[0] > 200 && pixel[1] < 60 && pixel[2] < 60),
+            "the image under a non-UTF-8 directory should be rendered"
         );
     }
 
@@ -3026,57 +2593,6 @@ $$
     }
 
     #[test]
-    fn parse_markdown_document_produces_ast() {
-        let md = b"# Hello\n\nA paragraph with **bold** and *italic* text.\n\n> Quoted block\n\n| Col1 | Col2 |\n|------|------|\n| a    | b    |\n";
-        let blocks = parse_markdown_blocks(md);
-
-        // Block 0: Heading level 1
-        assert!(
-            matches!(&blocks[0], Block::Heading { level: 1, .. }),
-            "expected Heading(1), got {:?}",
-            blocks[0]
-        );
-        if let Block::Heading { tokens, .. } = &blocks[0] {
-            assert_eq!(flatten_tokens(tokens).trim(), "Hello");
-        }
-
-        // Block 1: Paragraph with bold and italic spans
-        assert!(
-            matches!(&blocks[1], Block::Paragraph(_)),
-            "expected Paragraph"
-        );
-        if let Block::Paragraph(tokens) = &blocks[1] {
-            let has_bold = tokens
-                .iter()
-                .any(|t| matches!(t, InlineToken::Text { bold: true, .. }));
-            let has_italic = tokens
-                .iter()
-                .any(|t| matches!(t, InlineToken::Text { italic: true, .. }));
-            assert!(has_bold, "paragraph should contain a bold span");
-            assert!(has_italic, "paragraph should contain an italic span");
-        }
-
-        // Block 2: BlockQuote
-        assert!(
-            matches!(&blocks[2], Block::BlockQuote(_)),
-            "expected BlockQuote, got {:?}",
-            blocks[2]
-        );
-
-        // Block 3: Table with 2-column header and 1 data row
-        assert!(
-            matches!(&blocks[3], Block::Table { .. }),
-            "expected Table, got {:?}",
-            blocks[3]
-        );
-        if let Block::Table { header, rows } = &blocks[3] {
-            assert_eq!(header.len(), 2, "table should have 2 header columns");
-            assert_eq!(rows.len(), 1, "table should have 1 data row");
-            assert_eq!(rows[0].len(), 2, "data row should have 2 cells");
-        }
-    }
-
-    #[test]
     fn parse_markdown_continues_after_definition_list() {
         let md = b"Term\n: Definition\n\n## Next section\n\nContent after definition list.\n";
         let blocks = parse_markdown_blocks(md);
@@ -3176,16 +2692,19 @@ $$
     }
 
     #[test]
-    fn inline_tokens_emphasis_escalation() {
-        // Bold inside italic → bold+italic for nested text
-        let md = b"*outer **inner** end*\n";
-        let blocks = parse_markdown_blocks(md);
-        if let Block::Paragraph(tokens) = &blocks[0] {
-            let inner = tokens.iter().find(|t| {
-                matches!(t, InlineToken::Text { text, bold: true, italic: true, .. } if text == "inner")
-            });
-            assert!(inner.is_some(), "nested bold-italic should have both flags");
-        }
+    fn bold_nested_in_italic_renders_bold_italic() {
+        let nested = render_markdown(b"*outer **inner** end*\n", Path::new(""), 800).unwrap();
+        let bold_only = render_markdown(b"*outer* **inner** *end*\n", Path::new(""), 800).unwrap();
+        let italic_only = render_markdown(b"*outer inner end*\n", Path::new(""), 800).unwrap();
+
+        assert!(
+            nested.to_rgba8() != bold_only.to_rgba8(),
+            "bold nested in italic should keep the italic style"
+        );
+        assert!(
+            nested.to_rgba8() != italic_only.to_rgba8(),
+            "bold nested in italic should keep the bold weight"
+        );
     }
 
     #[test]
@@ -3238,16 +2757,55 @@ $$
     fn rust_code_highlighting_loads_theme_and_multiple_styles() {
         let source = "fn main() { let value = 42; }\n";
         let spans = highlight_code_spans("rust", source);
-        let rendered_text: String = spans.iter().map(|(text, ..)| text.as_str()).collect();
+        let rendered_text: String = spans.iter().map(|(_, text)| text.as_str()).collect();
         let colors = spans
             .iter()
-            .map(|(_, r, g, b, _)| (*r, *g, *b))
+            .map(|(style, _)| (style.foreground.r, style.foreground.g, style.foreground.b))
             .collect::<std::collections::HashSet<_>>();
 
         assert_eq!(rendered_text, source);
         assert!(
             colors.len() > 1,
             "Rust highlighting should produce multiple foreground colors: {spans:?}"
+        );
+    }
+
+    #[test]
+    fn mermaid_render_error_falls_back_to_code_block() {
+        for diagram in [
+            "stateDiagram\n    state \"unterminated",
+            "pie title Pets\n    \"Dogs\" : 386",
+        ] {
+            assert_mermaid_falls_back_to_code_block(diagram);
+        }
+    }
+
+    fn assert_mermaid_falls_back_to_code_block(diagram: &str) {
+        let md = format!("```mermaid\n{diagram}\n```\n\nAfter diagram.\n");
+        let image = render_markdown(md.as_bytes(), Path::new(""), 800).unwrap();
+        let rgba = image.to_rgba8();
+        let code_rows: Vec<u32> = (0..rgba.height())
+            .filter(|&y| {
+                let p = rgba.get_pixel(DEFAULT_MARKDOWN_MARGIN + 2, y);
+                p[0] == 245 && p[1] == 245 && p[2] == 245
+            })
+            .collect();
+        let (code_top, code_bottom) = (code_rows[0], *code_rows.last().unwrap());
+        let ink_in = |top: u32, bottom: u32| {
+            (top..bottom).any(|y| {
+                (0..rgba.width()).any(|x| {
+                    let p = rgba.get_pixel(x, y);
+                    p[0] < 160 && p[1] < 160 && p[2] < 160
+                })
+            })
+        };
+        assert!(
+            ink_in(code_top, code_bottom),
+            "the Mermaid source should render as code text: {diagram}"
+        );
+        assert!(
+            ink_in(code_bottom + 1, rgba.height()),
+            "the paragraph after the failed diagram should render: {diagram}"
         );
     }
 
@@ -3297,8 +2855,9 @@ $$
 
         let mut font_system = fonts::resolve_fonts().font_system;
         let blocks = parse_markdown_blocks(markdown.as_bytes());
-        let (rendered, _) =
-            layout_blocks_inner(&blocks, Path::new(""), &mut font_system, 800, 24.0).unwrap();
+        let rendered = layout_document(&blocks, Path::new(""), &mut font_system, 800, 24.0)
+            .unwrap()
+            .blocks;
         let [mut prose, mut inline_code, mut code_block] = Default::default();
         for block in &rendered {
             match block {

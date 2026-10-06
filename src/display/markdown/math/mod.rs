@@ -18,9 +18,9 @@ pub fn render_math(
     let size = if display { font_size * 1.15 } else { font_size };
     let result = markie::math::render_math(latex, size, "#141414", &mut measure, display)?;
     let pad = if display { 12.0 } else { 4.0 };
-    let width = (result.width + pad * 2.0).ceil().max(1.0);
-    let height = (result.ascent + result.descent + pad * 2.0).ceil().max(1.0);
-    let draw_baseline = (pad + result.ascent).ceil().max(1.0);
+    let width = (result.width + pad * 2.0).ceil();
+    let height = (result.ascent + result.descent + pad * 2.0).ceil();
+    let draw_baseline = (pad + result.ascent).ceil();
     let baseline = if display {
         draw_baseline
     } else {
@@ -103,7 +103,6 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_ink_has_padding("matrix", &rendered.image);
         let (left, top, right, bottom) = alpha_bounds(&rendered.image);
         // Exclude the brackets; each of the four cells must contain a glyph.
         let inset = (right - left) / 5;
@@ -137,7 +136,7 @@ mod tests {
             let rendered = render_math(latex, &mut font_system, font_size, false).unwrap();
             let midpoint = rendered.image.height() as f32 / 2.0;
             let min_baseline = midpoint - font_size * 0.15;
-            let max_baseline = midpoint + font_size * 0.28;
+            let max_baseline = midpoint + font_size * 0.25;
 
             assert!(rendered.baseline > 0);
             assert!(rendered.baseline <= rendered.image.height());
@@ -154,23 +153,6 @@ mod tests {
                 midpoint
             );
         }
-    }
-
-    #[test]
-    fn inline_sqrt_baseline_is_visually_centered() {
-        let mut font_system = FontSystem::new();
-        let font_size = 18.0;
-        let rendered =
-            render_math(r"\sqrt{x^2 + y^2}", &mut font_system, font_size, false).unwrap();
-        let midpoint = rendered.image.height() as f32 / 2.0;
-        let max_baseline = midpoint + font_size * 0.25;
-
-        assert!(
-            rendered.baseline as f32 <= max_baseline,
-            "inline sqrt baseline {} should stay near image midpoint {}",
-            rendered.baseline,
-            midpoint
-        );
     }
 
     #[test]

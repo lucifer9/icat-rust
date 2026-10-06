@@ -16,14 +16,14 @@ pub fn render_mermaid(
     };
     let (fragment, width, height) = markie::mermaid::render_diagram(source, &style, &mut measure)?;
     let canvas_pad = 4.0;
-    let inner_max_width = (max_width as f32 - canvas_pad * 2.0).max(1.0);
+    let inner_max_width = max_width as f32 - canvas_pad * 2.0;
     let scale = if width > inner_max_width {
         (inner_max_width / width).max(0.2)
     } else {
         1.0
     };
-    let canvas_w = (width * scale + canvas_pad * 2.0).ceil().max(1.0);
-    let canvas_h = (height * scale + canvas_pad * 2.0).ceil().max(1.0);
+    let canvas_w = (width * scale + canvas_pad * 2.0).ceil();
+    let canvas_h = (height * scale + canvas_pad * 2.0).ceil();
     let body = format!(
         r#"<g transform="translate({canvas_pad:.2},{canvas_pad:.2}) scale({scale:.4})">{fragment}</g>"#
     );

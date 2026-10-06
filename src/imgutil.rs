@@ -8,7 +8,6 @@ use image::{DynamicImage, ImageFormat, ImageReader, imageops::FilterType};
 
 pub const MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_PIXELS: u64 = 100_000_000;
-pub const MAX_RGBA_BYTES: u64 = 512 * 1024 * 1024;
 
 pub const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 

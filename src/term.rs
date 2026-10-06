@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{IsTerminal, Read, Write};
+use std::io::{Read, Write};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -230,10 +230,6 @@ pub fn read_interactive_line(prompt: &str) -> Result<String, Box<dyn std::error:
         }
     }
     Ok(buf)
-}
-
-pub fn is_terminal<T: IsTerminal>(value: &T) -> bool {
-    value.is_terminal()
 }
 
 #[cfg(test)]
