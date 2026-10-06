@@ -678,23 +678,24 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
 
         Self::normalize_positions(&mut positions, &mut edge_waypoints, base_x, base_y);
 
+        // Reversed directions mirror within the bounding box, keeping its margin.
         let mut bbox = Self::calculate_bbox(&positions);
         if matches!(direction, FlowDirection::BottomUp) {
-            let bottom = bbox.bottom();
+            let sum = bbox.y + bbox.bottom();
             for pos in positions.values_mut() {
-                pos.y = bottom - (pos.y + pos.h);
+                pos.y = sum - (pos.y + pos.h);
             }
             for wp in edge_waypoints.values_mut().flatten() {
-                wp.1 = bottom - wp.1;
+                wp.1 = sum - wp.1;
             }
             bbox = Self::calculate_bbox(&positions);
         } else if matches!(direction, FlowDirection::RightLeft) {
-            let right = bbox.right();
+            let sum = bbox.x + bbox.right();
             for pos in positions.values_mut() {
-                pos.x = right - (pos.x + pos.w);
+                pos.x = sum - (pos.x + pos.w);
             }
             for wp in edge_waypoints.values_mut().flatten() {
-                wp.0 = right - wp.0;
+                wp.0 = sum - wp.0;
             }
             bbox = Self::calculate_bbox(&positions);
         }

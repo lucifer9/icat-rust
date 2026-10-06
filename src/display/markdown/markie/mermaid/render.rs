@@ -2599,6 +2599,19 @@ Note right of Child: child note"#,
     }
 
     #[test]
+    fn reversed_flowchart_directions_keep_the_leading_margin() {
+        let node_origin = |direction: &str| {
+            let image = rasterize(&render_svg(&format!(
+                "flowchart {direction}\n    A --> B\n    A --> C"
+            )));
+            let (left, top, _, _) = bounds(&image, is_node_fill);
+            (left, top)
+        };
+        assert_eq!(node_origin("BT"), node_origin("TD"), "BT vs TD");
+        assert_eq!(node_origin("RL"), node_origin("LR"), "RL vs LR");
+    }
+
+    #[test]
     fn subgraph_box_keeps_equal_padding_when_clamped_at_top() {
         let image = rasterize(&render_svg(
             "flowchart TD\n    subgraph Group\n        A[Alpha] --> B[Beta]\n    end",
