@@ -581,10 +581,18 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                 augmented_edges.push((from.clone(), to.clone()));
                 continue;
             }
+            // Parallel edges share one chain, matching their shared waypoints.
+            let key = (from.clone(), to.clone());
+            if dummy_chains.contains_key(&key) {
+                continue;
+            }
+            // Numbered ids cannot collide the way joined names can
+            // (`a_b --> c` and `a --> b_c`).
+            let chain_index = dummy_chains.len();
             let mut chain: Vec<String> = Vec::new();
             let mut prev = from.clone();
             for rank in (from_rank + 1)..to_rank {
-                let dummy_id = format!("__d_{}_{}_{}", from, to, rank);
+                let dummy_id = format!("__dummy_{chain_index}_{rank}");
                 all_ids.push(dummy_id.clone());
                 all_sizes.insert(dummy_id.clone(), (0.0, 0.0));
                 all_ranks.insert(dummy_id.clone(), rank);
@@ -593,7 +601,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                 prev = dummy_id;
             }
             augmented_edges.push((prev, to.clone()));
-            dummy_chains.insert((from.clone(), to.clone()), chain);
+            dummy_chains.insert(key, chain);
         }
 
         let order: HashMap<&str, usize> = all_ids

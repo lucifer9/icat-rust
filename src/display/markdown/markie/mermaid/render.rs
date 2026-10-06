@@ -2629,6 +2629,18 @@ Note right of Child: child note"#,
     }
 
     #[test]
+    fn parallel_long_edges_take_no_more_room_than_one() {
+        // E1 starts a second BFS at rank 0, so E1 --> C4 spans three ranks.
+        let layout = |extra: &str| {
+            let image = rasterize(&render_svg(&format!(
+                "flowchart TD\n    C1 --> C2\n    C2 --> C3\n    C3 --> C4\n    C4 --> C1\n    E1 --> E2\n    E2 --> E1\n    E1 --> C4\n{extra}"
+            )));
+            (image.dimensions(), bounds(&image, is_node_fill))
+        };
+        assert_eq!(layout("    E1 --> C4"), layout(""));
+    }
+
+    #[test]
     fn subgraph_box_keeps_equal_padding_when_clamped_at_top() {
         let image = rasterize(&render_svg(
             "flowchart TD\n    subgraph Group\n        A[Alpha] --> B[Beta]\n    end",
