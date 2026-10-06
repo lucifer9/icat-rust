@@ -114,7 +114,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
             );
         }
 
-        self.layout_layered_graph(&nodes, &edges, &node_sizes, flowchart.direction)
+        Self::layout_layered_graph(&nodes, &edges, &node_sizes, flowchart.direction)
     }
 
     fn calculate_flowchart_node_size(&mut self, label: &str, shape: &NodeShape) -> (f32, f32) {
@@ -344,7 +344,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         }
 
         let (positions, _, bbox) =
-            self.layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::TopDown);
+            Self::layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::TopDown);
         (positions, bbox)
     }
 
@@ -422,7 +422,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         }
 
         let (positions, _, bbox) =
-            self.layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::TopDown);
+            Self::layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::TopDown);
         (positions, bbox)
     }
 
@@ -489,7 +489,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         }
 
         let (positions, _, bbox) =
-            self.layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::LeftRight);
+            Self::layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::LeftRight);
         (positions, bbox)
     }
 
@@ -547,446 +547,143 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         (positions, bbox)
     }
 
+    /// Layered layout: BFS ranks, dummy nodes on edges spanning several ranks,
+    /// barycenter ordering, then median alignment. The core works in rank
+    /// coordinates (x along a rank, y from rank to rank) that `RankFrame`
+    /// transposes for left-right diagrams.
     fn layout_layered_graph(
-        &self,
         nodes: &[String],
         edges: &[(String, String)],
         node_sizes: &HashMap<String, (f32, f32)>,
         direction: FlowDirection,
     ) -> (HashMap<String, Rect>, EdgeWaypoints, Rect) {
-        let mut positions: HashMap<String, Rect> = HashMap::new();
+        let frame = RankFrame::for_direction(direction);
+        let (base_x, base_y) = (30.0, 30.0);
 
-        let order_index: HashMap<&str, usize> = nodes
+        let (incoming, outgoing) = adjacency(nodes, edges);
+        let ranks = assign_ranks(nodes, &incoming, &outgoing);
+
+        let mut all_ids: Vec<String> = nodes.to_vec();
+        let mut all_sizes = node_sizes.clone();
+        let mut all_ranks: HashMap<String, usize> =
+            ranks.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        let mut dummy_chains: HashMap<(String, String), Vec<String>> = HashMap::new();
+        let mut augmented_edges: Vec<(String, String)> = Vec::new();
+        for (from, to) in edges {
+            let (Some(&from_rank), Some(&to_rank)) =
+                (ranks.get(from.as_str()), ranks.get(to.as_str()))
+            else {
+                continue;
+            };
+            if to_rank <= from_rank + 1 {
+                augmented_edges.push((from.clone(), to.clone()));
+                continue;
+            }
+            let mut chain: Vec<String> = Vec::new();
+            let mut prev = from.clone();
+            for rank in (from_rank + 1)..to_rank {
+                let dummy_id = format!("__d_{}_{}_{}", from, to, rank);
+                all_ids.push(dummy_id.clone());
+                all_sizes.insert(dummy_id.clone(), (0.0, 0.0));
+                all_ranks.insert(dummy_id.clone(), rank);
+                chain.push(dummy_id.clone());
+                augmented_edges.push((prev, dummy_id.clone()));
+                prev = dummy_id;
+            }
+            augmented_edges.push((prev, to.clone()));
+            dummy_chains.insert((from.clone(), to.clone()), chain);
+        }
+
+        let order: HashMap<&str, usize> = all_ids
             .iter()
             .enumerate()
             .map(|(i, n)| (n.as_str(), i))
             .collect();
+        let (incoming, outgoing) = adjacency(&all_ids, &augmented_edges);
 
-        let mut incoming_init: HashMap<&str, Vec<&str>> = HashMap::new();
-        let mut outgoing_init: HashMap<&str, Vec<&str>> = HashMap::new();
-
-        for node in nodes {
-            incoming_init.entry(node.as_str()).or_default();
-            outgoing_init.entry(node.as_str()).or_default();
+        let max_rank = all_ranks.values().copied().max().unwrap_or(0);
+        let mut rank_nodes: Vec<Vec<&str>> = vec![Vec::new(); max_rank + 1];
+        for id in &all_ids {
+            rank_nodes[all_ranks[id]].push(id.as_str());
         }
-
-        for (from, to) in edges {
-            if !order_index.contains_key(from.as_str()) || !order_index.contains_key(to.as_str()) {
-                continue;
+        for rank in &mut rank_nodes {
+            rank.sort_by_key(|id| order[id]);
+        }
+        for _ in 0..6 {
+            for i in 1..rank_nodes.len() {
+                let (before, after) = rank_nodes.split_at_mut(i);
+                sort_by_barycenter(&mut after[0], &incoming, &before[i - 1], &order);
             }
-            outgoing_init
-                .entry(from.as_str())
-                .or_default()
-                .push(to.as_str());
-            incoming_init
-                .entry(to.as_str())
-                .or_default()
-                .push(from.as_str());
+            for i in (0..rank_nodes.len().saturating_sub(1)).rev() {
+                let (before, after) = rank_nodes.split_at_mut(i + 1);
+                sort_by_barycenter(&mut before[i], &outgoing, &after[0], &order);
+            }
         }
 
-        let mut ranks: HashMap<&str, usize> = HashMap::new();
-        let roots: Vec<&str> = nodes
+        // Initial rank coordinates: each rank is centered on the widest one.
+        let rank_widths: Vec<f32> = rank_nodes
             .iter()
-            .map(String::as_str)
-            .filter(|n| {
-                incoming_init
-                    .get(n)
-                    .is_none_or(|parents| parents.is_empty())
+            .map(|rank| {
+                rank.iter()
+                    .map(|id| frame.swap(all_sizes[*id]).0)
+                    .sum::<f32>()
+                    + frame.node_gap * rank.len().saturating_sub(1) as f32
             })
             .collect();
-
-        let mut queue: VecDeque<&str> = VecDeque::new();
-        if roots.is_empty() {
-            if let Some(first) = nodes.first() {
-                ranks.insert(first.as_str(), 0);
-                queue.push_back(first.as_str());
+        let max_rank_w = rank_widths.iter().copied().fold(0.0, f32::max);
+        let mut positions: HashMap<String, Rect> = HashMap::new();
+        let mut y = base_y;
+        for (rank, rank_w) in rank_nodes.iter().zip(&rank_widths) {
+            let mut x = base_x + (max_rank_w - rank_w).max(0.0) / 2.0;
+            let mut rank_h: f32 = 0.0;
+            for id in rank {
+                let (w, h) = frame.swap(all_sizes[*id]);
+                positions.insert(id.to_string(), Rect::new(x, y, w, h));
+                x += w + frame.node_gap;
+                rank_h = rank_h.max(h);
             }
-        } else {
-            for root in roots {
-                ranks.insert(root, 0);
-                queue.push_back(root);
+            y += rank_h + frame.rank_gap;
+        }
+
+        for _ in 0..4 {
+            for rank in rank_nodes.iter().skip(1) {
+                align_rank_to_median(rank, &incoming, &mut positions, frame.node_gap);
+            }
+            for rank in rank_nodes[..rank_nodes.len().saturating_sub(1)]
+                .iter()
+                .rev()
+            {
+                align_rank_to_median(rank, &outgoing, &mut positions, frame.node_gap);
             }
         }
 
-        while let Some(node) = queue.pop_front() {
-            let rank = ranks[node];
-            for &neighbor in &outgoing_init[node] {
-                if !ranks.contains_key(neighbor) {
-                    ranks.insert(neighbor, rank + 1);
-                    queue.push_back(neighbor);
-                }
-            }
-        }
-
-        let mut max_rank = ranks.values().copied().max().unwrap_or(0);
-        for node in nodes {
-            if !ranks.contains_key(node.as_str()) {
-                max_rank += 1;
-                ranks.insert(node.as_str(), max_rank);
-                queue.push_back(node.as_str());
-
-                while let Some(cur) = queue.pop_front() {
-                    let rank = ranks[cur];
-                    for &neighbor in &outgoing_init[cur] {
-                        if !ranks.contains_key(neighbor) {
-                            ranks.insert(neighbor, rank + 1);
-                            queue.push_back(neighbor);
-                        }
-                    }
-                }
-            }
-        }
-
-        // --- Phase 2: Insert dummy nodes for long edges ---
-        let mut all_node_ids: Vec<String> = nodes.to_vec();
-        let mut all_sizes: HashMap<String, (f32, f32)> = node_sizes.clone();
-        let mut ranks_owned: HashMap<String, usize> =
-            ranks.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-        let mut dummy_set: HashSet<String> = HashSet::new();
-        let mut edge_dummy_chains: HashMap<(String, String), Vec<String>> = HashMap::new();
-        let mut augmented_edges: Vec<(String, String)> = Vec::new();
-
-        for (from, to) in edges {
-            if !order_index.contains_key(from.as_str()) || !order_index.contains_key(to.as_str()) {
-                augmented_edges.push((from.clone(), to.clone()));
-                continue;
-            }
-            let from_rank = ranks[from.as_str()];
-            let to_rank = ranks[to.as_str()];
-
-            if to_rank > from_rank + 1 {
-                let mut chain: Vec<String> = Vec::new();
-                let mut prev = from.clone();
-                for rank in (from_rank + 1)..to_rank {
-                    let dummy_id = format!("__d_{}_{}_{}", from, to, rank);
-                    all_node_ids.push(dummy_id.clone());
-                    all_sizes.insert(dummy_id.clone(), (0.0, 0.0));
-                    ranks_owned.insert(dummy_id.clone(), rank);
-                    dummy_set.insert(dummy_id.clone());
-                    chain.push(dummy_id.clone());
-                    augmented_edges.push((prev, dummy_id.clone()));
-                    prev = dummy_id;
-                }
-                augmented_edges.push((prev, to.clone()));
-                edge_dummy_chains.insert((from.clone(), to.clone()), chain);
-            } else {
-                augmented_edges.push((from.clone(), to.clone()));
-            }
-        }
-
-        // Rebuild data structures with dummies
-        let max_rank = ranks_owned.values().copied().max().unwrap_or(0);
-        let aug_order: HashMap<&str, usize> = all_node_ids
+        let mut edge_waypoints: EdgeWaypoints = dummy_chains
             .iter()
-            .enumerate()
-            .map(|(i, n)| (n.as_str(), i))
+            .map(|(edge, chain)| {
+                let waypoints = chain
+                    .iter()
+                    .map(|id| frame.swap(positions[id].center()))
+                    .collect();
+                (edge.clone(), waypoints)
+            })
             .collect();
-
-        let mut incoming: HashMap<&str, Vec<&str>> = HashMap::new();
-        let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
-
-        for node in &all_node_ids {
-            incoming.entry(node.as_str()).or_default();
-            outgoing.entry(node.as_str()).or_default();
+        for id in dummy_chains.values().flatten() {
+            positions.remove(id);
+        }
+        for pos in positions.values_mut() {
+            *pos = frame.swap_rect(*pos);
         }
 
-        for (from, to) in &augmented_edges {
-            if aug_order.contains_key(from.as_str()) && aug_order.contains_key(to.as_str()) {
-                outgoing.entry(from.as_str()).or_default().push(to.as_str());
-                incoming.entry(to.as_str()).or_default().push(from.as_str());
-            }
-        }
-
-        let mut rank_nodes: Vec<Vec<&str>> = vec![Vec::new(); max_rank + 1];
-        for node in &all_node_ids {
-            rank_nodes[ranks_owned[node.as_str()]].push(node.as_str());
-        }
-
-        for rank in &mut rank_nodes {
-            rank.sort_by_key(|id| aug_order[id]);
-        }
-
-        for _ in 0..6 {
-            for rank_idx in 1..rank_nodes.len() {
-                let prev_rank_pos: HashMap<&str, usize> = rank_nodes[rank_idx - 1]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, id)| (*id, i))
-                    .collect();
-
-                rank_nodes[rank_idx].sort_by(|a, b| {
-                    let bc_a = incoming
-                        .get(a)
-                        .and_then(|parents| barycenter(parents, &prev_rank_pos));
-                    let bc_b = incoming
-                        .get(b)
-                        .and_then(|parents| barycenter(parents, &prev_rank_pos));
-
-                    match (bc_a, bc_b) {
-                        (Some(x), Some(y)) => x
-                            .partial_cmp(&y)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| aug_order[a].cmp(&aug_order[b])),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => aug_order[a].cmp(&aug_order[b]),
-                    }
-                });
-            }
-
-            for rank_idx in (0..rank_nodes.len().saturating_sub(1)).rev() {
-                let next_rank_pos: HashMap<&str, usize> = rank_nodes[rank_idx + 1]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, id)| (*id, i))
-                    .collect();
-
-                rank_nodes[rank_idx].sort_by(|a, b| {
-                    let bc_a = outgoing
-                        .get(a)
-                        .and_then(|children| barycenter(children, &next_rank_pos));
-                    let bc_b = outgoing
-                        .get(b)
-                        .and_then(|children| barycenter(children, &next_rank_pos));
-
-                    match (bc_a, bc_b) {
-                        (Some(x), Some(y)) => x
-                            .partial_cmp(&y)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| aug_order[a].cmp(&aug_order[b])),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => aug_order[a].cmp(&aug_order[b]),
-                    }
-                });
-            }
-        }
-
-        let vertical = matches!(direction, FlowDirection::TopDown | FlowDirection::BottomUp);
-        let base_x = 30.0;
-        let base_y = 30.0;
-
-        if vertical {
-            let rank_widths: Vec<f32> = rank_nodes
-                .iter()
-                .map(|rank| {
-                    if rank.is_empty() {
-                        0.0
-                    } else {
-                        rank.iter().map(|id| all_sizes[*id].0).sum::<f32>()
-                            + NODE_SPACING_X * rank.len().saturating_sub(1) as f32
-                    }
-                })
-                .collect();
-
-            let max_rank_w = rank_widths.iter().copied().fold(0.0, f32::max);
-            let mut y = base_y;
-
-            for (rank_idx, rank) in rank_nodes.iter().enumerate() {
-                let mut x = base_x + (max_rank_w - rank_widths[rank_idx]).max(0.0) / 2.0;
-                let mut rank_max_h: f32 = 0.0;
-
-                for node_id in rank {
-                    let (w, h) = all_sizes[*node_id];
-                    positions.insert((*node_id).to_string(), Rect::new(x, y, w, h));
-                    x += w + NODE_SPACING_X;
-                    rank_max_h = rank_max_h.max(h);
-                }
-
-                y += rank_max_h + NODE_SPACING_Y;
-            }
-
-            // Phase 3: Coordinate refinement
-            for _ in 0..4 {
-                // Forward pass
-                for rank in rank_nodes.iter().skip(1) {
-                    for node_id in rank {
-                        if let Some(neighbors) = incoming.get(node_id) {
-                            let mut centers: Vec<f32> = neighbors
-                                .iter()
-                                .filter_map(|n| positions.get(*n))
-                                .map(|p| p.x + p.w / 2.0)
-                                .collect();
-                            if !centers.is_empty() {
-                                centers.sort_by(|a, b| {
-                                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                let median = centers[centers.len() / 2];
-                                let w = all_sizes[*node_id].0;
-                                if let Some(pos) = positions.get_mut(*node_id) {
-                                    pos.x = median - w / 2.0;
-                                }
-                            }
-                        }
-                    }
-                    // Enforce minimum spacing
-                    let mut prev_right = f32::NEG_INFINITY;
-                    for node_id in rank {
-                        if let Some(pos) = positions.get_mut(*node_id) {
-                            pos.x = pos.x.max(prev_right + NODE_SPACING_X);
-                            prev_right = pos.x + pos.w;
-                        }
-                    }
-                }
-
-                // Backward pass
-                for rank_idx in (0..rank_nodes.len().saturating_sub(1)).rev() {
-                    for node_id in &rank_nodes[rank_idx] {
-                        if let Some(neighbors) = outgoing.get(node_id) {
-                            let mut centers: Vec<f32> = neighbors
-                                .iter()
-                                .filter_map(|n| positions.get(*n))
-                                .map(|p| p.x + p.w / 2.0)
-                                .collect();
-                            if !centers.is_empty() {
-                                centers.sort_by(|a, b| {
-                                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                let median = centers[centers.len() / 2];
-                                let w = all_sizes[*node_id].0;
-                                if let Some(pos) = positions.get_mut(*node_id) {
-                                    pos.x = median - w / 2.0;
-                                }
-                            }
-                        }
-                    }
-                    let mut prev_right = f32::NEG_INFINITY;
-                    for node_id in &rank_nodes[rank_idx] {
-                        if let Some(pos) = positions.get_mut(*node_id) {
-                            pos.x = pos.x.max(prev_right + NODE_SPACING_X);
-                            prev_right = pos.x + pos.w;
-                        }
-                    }
-                }
-            }
-        } else {
-            let rank_heights: Vec<f32> = rank_nodes
-                .iter()
-                .map(|rank| {
-                    if rank.is_empty() {
-                        0.0
-                    } else {
-                        rank.iter().map(|id| all_sizes[*id].1).sum::<f32>()
-                            + NODE_SPACING_Y * rank.len().saturating_sub(1) as f32
-                    }
-                })
-                .collect();
-
-            let max_rank_h = rank_heights.iter().copied().fold(0.0, f32::max);
-            let mut x = base_x;
-
-            for (rank_idx, rank) in rank_nodes.iter().enumerate() {
-                let mut y = base_y + (max_rank_h - rank_heights[rank_idx]).max(0.0) / 2.0;
-                let mut rank_max_w: f32 = 0.0;
-
-                for node_id in rank {
-                    let (w, h) = all_sizes[*node_id];
-                    positions.insert((*node_id).to_string(), Rect::new(x, y, w, h));
-                    y += h + NODE_SPACING_Y;
-                    rank_max_w = rank_max_w.max(w);
-                }
-
-                x += rank_max_w + NODE_SPACING_X;
-            }
-
-            // Phase 3: Coordinate refinement (horizontal)
-            for _ in 0..4 {
-                // Forward pass
-                for rank in rank_nodes.iter().skip(1) {
-                    for node_id in rank {
-                        if let Some(neighbors) = incoming.get(node_id) {
-                            let mut centers: Vec<f32> = neighbors
-                                .iter()
-                                .filter_map(|n| positions.get(*n))
-                                .map(|p| p.y + p.h / 2.0)
-                                .collect();
-                            if !centers.is_empty() {
-                                centers.sort_by(|a, b| {
-                                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                let median = centers[centers.len() / 2];
-                                let h = all_sizes[*node_id].1;
-                                if let Some(pos) = positions.get_mut(*node_id) {
-                                    pos.y = median - h / 2.0;
-                                }
-                            }
-                        }
-                    }
-                    // Enforce minimum spacing
-                    let mut prev_bottom = f32::NEG_INFINITY;
-                    for node_id in rank {
-                        if let Some(pos) = positions.get_mut(*node_id) {
-                            pos.y = pos.y.max(prev_bottom + NODE_SPACING_Y);
-                            prev_bottom = pos.y + pos.h;
-                        }
-                    }
-                }
-
-                // Backward pass
-                for rank_idx in (0..rank_nodes.len().saturating_sub(1)).rev() {
-                    for node_id in &rank_nodes[rank_idx] {
-                        if let Some(neighbors) = outgoing.get(node_id) {
-                            let mut centers: Vec<f32> = neighbors
-                                .iter()
-                                .filter_map(|n| positions.get(*n))
-                                .map(|p| p.y + p.h / 2.0)
-                                .collect();
-                            if !centers.is_empty() {
-                                centers.sort_by(|a, b| {
-                                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                let median = centers[centers.len() / 2];
-                                let h = all_sizes[*node_id].1;
-                                if let Some(pos) = positions.get_mut(*node_id) {
-                                    pos.y = median - h / 2.0;
-                                }
-                            }
-                        }
-                    }
-                    let mut prev_bottom = f32::NEG_INFINITY;
-                    for node_id in &rank_nodes[rank_idx] {
-                        if let Some(pos) = positions.get_mut(*node_id) {
-                            pos.y = pos.y.max(prev_bottom + NODE_SPACING_Y);
-                            prev_bottom = pos.y + pos.h;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Extract waypoints from dummy positions
-        let mut edge_waypoints: EdgeWaypoints = HashMap::new();
-        for ((from, to), chain) in &edge_dummy_chains {
-            let waypoints: Vec<(f32, f32)> = chain
-                .iter()
-                .filter_map(|dummy_id| positions.get(dummy_id))
-                .map(|pos| pos.center())
-                .collect();
-            if !waypoints.is_empty() {
-                edge_waypoints.insert((from.clone(), to.clone()), waypoints);
-            }
-        }
-
-        // Remove dummy positions
-        for dummy_id in &dummy_set {
-            positions.remove(dummy_id);
-        }
-
-        // Normalize positions so diagram starts near origin
         Self::normalize_positions(&mut positions, &mut edge_waypoints, base_x, base_y);
 
-        // Direction flip
         let mut bbox = Self::calculate_bbox(&positions);
-
         if matches!(direction, FlowDirection::BottomUp) {
             let bottom = bbox.bottom();
             for pos in positions.values_mut() {
                 pos.y = bottom - (pos.y + pos.h);
             }
-            for wps in edge_waypoints.values_mut() {
-                for wp in wps.iter_mut() {
-                    wp.1 = bottom - wp.1;
-                }
+            for wp in edge_waypoints.values_mut().flatten() {
+                wp.1 = bottom - wp.1;
             }
             bbox = Self::calculate_bbox(&positions);
         } else if matches!(direction, FlowDirection::RightLeft) {
@@ -994,10 +691,8 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
             for pos in positions.values_mut() {
                 pos.x = right - (pos.x + pos.w);
             }
-            for wps in edge_waypoints.values_mut() {
-                for wp in wps.iter_mut() {
-                    wp.0 = right - wp.0;
-                }
+            for wp in edge_waypoints.values_mut().flatten() {
+                wp.0 = right - wp.0;
             }
             bbox = Self::calculate_bbox(&positions);
         }
@@ -1065,5 +760,162 @@ fn barycenter(neighbors: &[&str], rank_pos: &HashMap<&str, usize>) -> Option<f32
         Some(total / count)
     } else {
         None
+    }
+}
+
+/// Maps physical axes to rank coordinates for `layout_layered_graph`.
+/// Left-right diagrams swap the axes; the gap constants keep their physical
+/// meaning, so the gap along a rank differs between the two orientations.
+#[derive(Clone, Copy)]
+struct RankFrame {
+    transpose: bool,
+    node_gap: f32,
+    rank_gap: f32,
+}
+
+impl RankFrame {
+    fn for_direction(direction: FlowDirection) -> Self {
+        match direction {
+            FlowDirection::TopDown | FlowDirection::BottomUp => Self {
+                transpose: false,
+                node_gap: NODE_SPACING_X,
+                rank_gap: NODE_SPACING_Y,
+            },
+            FlowDirection::LeftRight | FlowDirection::RightLeft => Self {
+                transpose: true,
+                node_gap: NODE_SPACING_Y,
+                rank_gap: NODE_SPACING_X,
+            },
+        }
+    }
+
+    fn swap(self, (a, b): (f32, f32)) -> (f32, f32) {
+        if self.transpose { (b, a) } else { (a, b) }
+    }
+
+    fn swap_rect(self, r: Rect) -> Rect {
+        if self.transpose {
+            Rect::new(r.y, r.x, r.h, r.w)
+        } else {
+            r
+        }
+    }
+}
+
+type Adjacency<'a> = HashMap<&'a str, Vec<&'a str>>;
+
+/// Returns `(incoming, outgoing)` neighbor lists in edge order, ignoring
+/// edges whose endpoints are not in `ids`.
+fn adjacency<'a>(
+    ids: &'a [String],
+    edges: &'a [(String, String)],
+) -> (Adjacency<'a>, Adjacency<'a>) {
+    let mut incoming: Adjacency = ids.iter().map(|id| (id.as_str(), Vec::new())).collect();
+    let mut outgoing = incoming.clone();
+    for (from, to) in edges {
+        let (from, to) = (from.as_str(), to.as_str());
+        if incoming.contains_key(from) && incoming.contains_key(to) {
+            outgoing.get_mut(from).unwrap().push(to);
+            incoming.get_mut(to).unwrap().push(from);
+        }
+    }
+    (incoming, outgoing)
+}
+
+/// BFS from the sources (or the first node when every node has a parent);
+/// each node still unranked afterwards starts another BFS on a new rank.
+fn assign_ranks<'a>(
+    nodes: &'a [String],
+    incoming: &Adjacency<'a>,
+    outgoing: &Adjacency<'a>,
+) -> HashMap<&'a str, usize> {
+    let mut ranks: HashMap<&str, usize> = HashMap::new();
+    let mut queue: VecDeque<&str> = nodes
+        .iter()
+        .map(String::as_str)
+        .filter(|id| incoming[id].is_empty())
+        .collect();
+    if queue.is_empty() {
+        queue.extend(nodes.first().map(String::as_str));
+    }
+    for &root in &queue {
+        ranks.insert(root, 0);
+    }
+
+    // Later components count up from the first BFS's deepest rank, so they
+    // can share ranks with components placed before them.
+    let mut next_rank: Option<usize> = None;
+    let mut unranked = nodes.iter().map(String::as_str);
+    loop {
+        while let Some(id) = queue.pop_front() {
+            let rank = ranks[id];
+            for &child in &outgoing[id] {
+                if !ranks.contains_key(child) {
+                    ranks.insert(child, rank + 1);
+                    queue.push_back(child);
+                }
+            }
+        }
+        let Some(start) = unranked.find(|id| !ranks.contains_key(id)) else {
+            return ranks;
+        };
+        let rank = next_rank.get_or_insert_with(|| ranks.values().copied().max().unwrap_or(0));
+        *rank += 1;
+        ranks.insert(start, *rank);
+        queue.push_back(start);
+    }
+}
+
+/// Orders `rank` by the mean position of each node's neighbors in
+/// `adjacent_rank`; nodes without such neighbors go last. Ties keep `order`.
+fn sort_by_barycenter<'a>(
+    rank: &mut [&'a str],
+    neighbors: &Adjacency<'a>,
+    adjacent_rank: &[&'a str],
+    order: &HashMap<&str, usize>,
+) {
+    let rank_pos: HashMap<&str, usize> = adjacent_rank
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (*id, i))
+        .collect();
+    rank.sort_by(|a, b| {
+        let bc_a = barycenter(&neighbors[a], &rank_pos);
+        let bc_b = barycenter(&neighbors[b], &rank_pos);
+        match (bc_a, bc_b) {
+            (Some(x), Some(y)) => x.total_cmp(&y).then_with(|| order[a].cmp(&order[b])),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => order[a].cmp(&order[b]),
+        }
+    });
+}
+
+/// Centers each node on the median center of its `neighbors`, then pushes
+/// nodes apart so consecutive nodes keep at least `gap` between them.
+fn align_rank_to_median(
+    rank: &[&str],
+    neighbors: &Adjacency,
+    positions: &mut HashMap<String, Rect>,
+    gap: f32,
+) {
+    for id in rank {
+        let mut centers: Vec<f32> = neighbors[id]
+            .iter()
+            .map(|n| positions[*n].center().0)
+            .collect();
+        if centers.is_empty() {
+            continue;
+        }
+        centers.sort_by(f32::total_cmp);
+        let median = centers[centers.len() / 2];
+        let pos = positions.get_mut(*id).unwrap();
+        pos.x = median - pos.w / 2.0;
+    }
+    let mut prev_right = f32::NEG_INFINITY;
+    for id in rank {
+        let pos = positions.get_mut(*id).unwrap();
+        pos.x = pos.x.max(prev_right + gap);
+        prev_right = pos.right();
     }
 }
