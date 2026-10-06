@@ -1340,11 +1340,11 @@ fn first_clear_lane(
     best
 }
 
-/// A routed transition. The arrowhead sits on the last point.
+/// A routed transition. The arrowhead sits on the last point and follows
+/// the last drawn segment.
 struct StateRoute {
     points: Vec<(f32, f32)>,
     label_anchor: (f32, f32),
-    arrow_angle: f32,
 }
 
 /// Endpoint geometry shared by every routing strategy for one transition.
@@ -1423,11 +1423,9 @@ impl<'a> StateEdge<'a> {
     }
 
     fn straight_route(&self, label_anchor: (f32, f32)) -> StateRoute {
-        let ((x1, y1), (x2, y2)) = (self.start, self.end);
         StateRoute {
             points: vec![self.start, self.end],
             label_anchor,
-            arrow_angle: (y1 - y2).atan2(x1 - x2),
         }
     }
 
@@ -1460,11 +1458,6 @@ impl<'a> StateEdge<'a> {
         Some(StateRoute {
             points,
             label_anchor: ((from_x + to_x) / 2.0, mid_y),
-            arrow_angle: if to_cy > mid_y {
-                -std::f32::consts::FRAC_PI_2
-            } else {
-                std::f32::consts::FRAC_PI_2
-            },
         })
     }
 
@@ -1523,11 +1516,6 @@ impl<'a> StateEdge<'a> {
                 (to_cx, to_enter_y),
             ],
             label_anchor: ((from_cx + to_cx) / 2.0, lane_y),
-            arrow_angle: if to_enter_y > lane_y {
-                -std::f32::consts::FRAC_PI_2
-            } else {
-                std::f32::consts::FRAC_PI_2
-            },
         }
     }
 
@@ -1578,11 +1566,6 @@ impl<'a> StateEdge<'a> {
                 (to_enter_x, enter_y),
             ],
             label_anchor: (lane_x, (exit_y + enter_y) / 2.0),
-            arrow_angle: if to_enter_x > lane_x {
-                0.0
-            } else {
-                std::f32::consts::PI
-            },
         }
     }
 }
@@ -1606,15 +1589,19 @@ fn emit_route(route: &StateRoute, style: &DiagramStyle) -> String {
             style.edge_stroke
         )
     };
+    // A Z route between states at equal height ends in zero-length
+    // segments, which have no direction.
+    let heading = route
+        .points
+        .windows(2)
+        .rev()
+        .find(|segment| segment[0] != segment[1])
+        .map_or(0.0, |segment| {
+            let ((x1, y1), (x2, y2)) = (segment[0], segment[1]);
+            (y2 - y1).atan2(x2 - x1)
+        });
     let (x, y) = route.points[route.points.len() - 1];
-    // `arrow_angle` points back along the edge, away from the target.
-    svg.push_str(&arrowhead(
-        ArrowHead::Filled,
-        x,
-        y,
-        route.arrow_angle + std::f32::consts::PI,
-        style,
-    ));
+    svg.push_str(&arrowhead(ArrowHead::Filled, x, y, heading, style));
     svg
 }
 
@@ -2330,6 +2317,47 @@ Note right of Child: child note"#,
         assert!(
             outside > 20,
             "self-transition must be drawn outside the state box, got {outside} pixels"
+        );
+    }
+
+    /// Pixel bounds of each horizontal band of node fill, top to bottom.
+    fn node_bands(image: &RgbaImage) -> Vec<(u32, u32, u32, u32)> {
+        let mut bands: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for y in 0..image.height() {
+            let xs: Vec<u32> = (0..image.width())
+                .filter(|&x| is_node_fill(image.get_pixel(x, y)))
+                .collect();
+            let (Some(&left), Some(&right)) = (xs.first(), xs.last()) else {
+                continue;
+            };
+            match bands.last_mut() {
+                Some(band) if band.3 + 1 == y => {
+                    *band = (band.0.min(left), band.1, band.2.max(right), y);
+                }
+                _ => bands.push((left, y, right, y)),
+            }
+        }
+        bands
+    }
+
+    #[test]
+    fn state_arrowhead_is_drawn_outside_target_state() {
+        let image = rasterize(&render_svg("stateDiagram-v2\nA --> B"));
+        let bands = node_bands(&image);
+        assert_eq!(bands.len(), 2, "expected A above B, got {bands:?}");
+        let (left, top, right, bottom) = bands[1];
+        let near_outside = image
+            .enumerate_pixels()
+            .filter(|(x, y, p)| {
+                let inside = (left..=right).contains(x) && (top..=bottom).contains(y);
+                let near =
+                    *x + 10 >= left && *x <= right + 10 && *y + 10 >= top && *y <= bottom + 10;
+                is_edge(p) && near && !inside
+            })
+            .count();
+        assert!(
+            near_outside >= 20,
+            "arrowhead must be visible just outside B, got {near_outside} pixels"
         );
     }
 
