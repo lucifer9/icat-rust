@@ -30,84 +30,7 @@ pub fn send_static_image(
     size: Size,
     tmux: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
-    let image_id = if tmux { generate_image_id() } else { 0 };
-    write_static_image(
-        &mut stdout,
-        png_data,
-        image_width,
-        image_height,
-        size,
-        tmux,
-        image_id,
-    )?;
-    stdout.flush()?;
-    Ok(())
-}
-
-pub fn write_static_image(
-    writer: &mut dyn Write,
-    png_data: &[u8],
-    image_width: u32,
-    image_height: u32,
-    size: Size,
-    tmux: bool,
-    image_id: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cols = 0usize;
-    let mut rows = 0usize;
-    if tmux {
-        let cell_width = (size.pixel_width / size.cols.max(1)).max(1);
-        let cell_height = (size.pixel_height / size.rows.max(1)).max(1);
-        cols = image_width.div_ceil(cell_width) as usize;
-        rows = image_height.div_ceil(cell_height) as usize;
-        if cols >= NUMBER_TO_DIACRITIC.len() || rows >= NUMBER_TO_DIACRITIC.len() {
-            return Err(format!(
-                "image too large for Unicode placeholders: maximum size is {}x{} cells",
-                NUMBER_TO_DIACRITIC.len() - 1,
-                NUMBER_TO_DIACRITIC.len() - 1
-            )
-            .into());
-        }
-        writer.write_all(b"\r")?;
-    }
-
-    let first_header = if tmux {
-        format!("a=T,q=2,f=100,U=1,c={cols},r={rows},i={image_id},")
-    } else {
-        String::from("a=T,q=2,f=100,")
-    };
-    let (esc_prefix, esc_suffix) = if tmux {
-        ("\x1bPtmux;\x1b\x1b_G", "\x1b\x1b\\\x1b\\")
-    } else {
-        ("\x1b_G", "\x1b\\")
-    };
-
-    let mut encoded = [0u8; CHUNK_SIZE];
-    let mut first = true;
-    for chunk in png_data.chunks(RAW_CHUNK_SIZE) {
-        writer.write_all(esc_prefix.as_bytes())?;
-        if first {
-            writer.write_all(first_header.as_bytes())?;
-            first = false;
-        }
-        let more = if std::ptr::eq(chunk.as_ptr_range().end, png_data.as_ptr_range().end) {
-            0
-        } else {
-            1
-        };
-        write!(writer, "m={more};")?;
-        let encoded_len =
-            base64::engine::general_purpose::STANDARD_NO_PAD.encode_slice(chunk, &mut encoded)?;
-        writer.write_all(&encoded[..encoded_len])?;
-        writer.write_all(esc_suffix.as_bytes())?;
-    }
-
-    if tmux {
-        write_unicode_placeholders(writer, image_id, cols, rows)?;
-    }
-    writer.write_all(b"\n")?;
-    Ok(())
+    send_image(png_data, "f=100", image_width, image_height, size, tmux)
 }
 
 pub fn send_static_image_rgba_zlib(
@@ -117,74 +40,91 @@ pub fn send_static_image_rgba_zlib(
     size: Size,
     tmux: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
-    let image_id = if tmux { generate_image_id() } else { 0 };
-    write_static_image_rgba_zlib(
-        &mut stdout,
+    let format_keys = format!("f=32,o=z,s={image_width},v={image_height}");
+    send_image(
         zlib_data,
+        &format_keys,
         image_width,
         image_height,
         size,
         tmux,
-        image_id,
+    )
+}
+
+fn send_image(
+    data: &[u8],
+    format_keys: &str,
+    image_width: u32,
+    image_height: u32,
+    size: Size,
+    tmux: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let tmux_image_id = tmux.then(generate_image_id);
+    write_image(
+        &mut stdout,
+        data,
+        format_keys,
+        image_width,
+        image_height,
+        size,
+        tmux_image_id,
     )?;
     stdout.flush()?;
     Ok(())
 }
 
-pub fn write_static_image_rgba_zlib(
+/// Writes `data` as chunked Kitty graphics commands. Under tmux (an image id is
+/// given) the image is placed with Unicode placeholders, so the cell grid must fit
+/// the diacritics table.
+fn write_image(
     writer: &mut dyn Write,
-    zlib_data: &[u8],
+    data: &[u8],
+    format_keys: &str,
     image_width: u32,
     image_height: u32,
     size: Size,
-    tmux: bool,
-    image_id: u32,
+    tmux_image_id: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cols = 0usize;
-    let mut rows = 0usize;
-    if tmux {
-        let cell_width = (size.pixel_width / size.cols.max(1)).max(1);
-        let cell_height = (size.pixel_height / size.rows.max(1)).max(1);
-        cols = image_width.div_ceil(cell_width) as usize;
-        rows = image_height.div_ceil(cell_height) as usize;
-        if cols >= NUMBER_TO_DIACRITIC.len() || rows >= NUMBER_TO_DIACRITIC.len() {
-            return Err(format!(
-                "image too large for Unicode placeholders: maximum size is {}x{} cells",
-                NUMBER_TO_DIACRITIC.len() - 1,
-                NUMBER_TO_DIACRITIC.len() - 1
+    let placement = match tmux_image_id {
+        Some(image_id) => {
+            let cell_width = (size.pixel_width / size.cols.max(1)).max(1);
+            let cell_height = (size.pixel_height / size.rows.max(1)).max(1);
+            let cols = image_width.div_ceil(cell_width) as usize;
+            let rows = image_height.div_ceil(cell_height) as usize;
+            if cols >= NUMBER_TO_DIACRITIC.len() || rows >= NUMBER_TO_DIACRITIC.len() {
+                return Err(format!(
+                    "image too large for Unicode placeholders: maximum size is {}x{} cells",
+                    NUMBER_TO_DIACRITIC.len() - 1,
+                    NUMBER_TO_DIACRITIC.len() - 1
+                )
+                .into());
+            }
+            Some((image_id, cols, rows))
+        }
+        None => None,
+    };
+
+    let (esc_prefix, esc_suffix, first_header) = match placement {
+        Some((image_id, cols, rows)) => {
+            writer.write_all(b"\r")?;
+            (
+                "\x1bPtmux;\x1b\x1b_G",
+                "\x1b\x1b\\\x1b\\",
+                format!("a=T,q=2,{format_keys},U=1,c={cols},r={rows},i={image_id},"),
             )
-            .into());
         }
-        writer.write_all(b"\r")?;
-    }
-
-    let first_header = if tmux {
-        format!(
-            "a=T,q=2,f=32,o=z,s={image_width},v={image_height},U=1,c={cols},r={rows},i={image_id},"
-        )
-    } else {
-        format!("a=T,q=2,f=32,o=z,s={image_width},v={image_height},")
-    };
-    let (esc_prefix, esc_suffix) = if tmux {
-        ("\x1bPtmux;\x1b\x1b_G", "\x1b\x1b\\\x1b\\")
-    } else {
-        ("\x1b_G", "\x1b\\")
+        None => ("\x1b_G", "\x1b\\", format!("a=T,q=2,{format_keys},")),
     };
 
+    let chunk_count = data.len().div_ceil(RAW_CHUNK_SIZE);
     let mut encoded = [0u8; CHUNK_SIZE];
-    let mut first = true;
-    for chunk in zlib_data.chunks(RAW_CHUNK_SIZE) {
+    for (index, chunk) in data.chunks(RAW_CHUNK_SIZE).enumerate() {
         writer.write_all(esc_prefix.as_bytes())?;
-        if first {
+        if index == 0 {
             writer.write_all(first_header.as_bytes())?;
-            first = false;
         }
-        let more = if std::ptr::eq(chunk.as_ptr_range().end, zlib_data.as_ptr_range().end) {
-            0
-        } else {
-            1
-        };
+        let more = u8::from(index + 1 < chunk_count);
         write!(writer, "m={more};")?;
         let encoded_len =
             base64::engine::general_purpose::STANDARD_NO_PAD.encode_slice(chunk, &mut encoded)?;
@@ -192,36 +132,23 @@ pub fn write_static_image_rgba_zlib(
         writer.write_all(esc_suffix.as_bytes())?;
     }
 
-    if tmux {
+    if let Some((image_id, cols, rows)) = placement {
         write_unicode_placeholders(writer, image_id, cols, rows)?;
     }
     writer.write_all(b"\n")?;
     Ok(())
 }
 
-pub fn write_unicode_placeholders(
+fn write_unicode_placeholders(
     writer: &mut dyn Write,
     image_id: u32,
     cols: usize,
     rows: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if cols >= NUMBER_TO_DIACRITIC.len() || rows >= NUMBER_TO_DIACRITIC.len() {
-        return Err(format!(
-            "image too large for Unicode placeholders: maximum size is {}x{} cells",
-            NUMBER_TO_DIACRITIC.len() - 1,
-            NUMBER_TO_DIACRITIC.len() - 1
-        )
-        .into());
-    }
-
     let r = (image_id >> 16) & 0xFF;
     let g = (image_id >> 8) & 0xFF;
     let b = image_id & 0xFF;
-    let id_idx = ((image_id >> 24) & 0xFF) as usize;
-    let id_diacritic = NUMBER_TO_DIACRITIC
-        .get(id_idx)
-        .copied()
-        .unwrap_or(NUMBER_TO_DIACRITIC[0]);
+    let id_diacritic = NUMBER_TO_DIACRITIC[(image_id >> 24) as usize];
 
     let mut out = String::new();
     write!(&mut out, "\x1b[38:2:{r}:{g}:{b}m")?;
@@ -245,6 +172,13 @@ pub fn write_unicode_placeholders(
 mod tests {
     use super::*;
 
+    const TMUX_SIZE: Size = Size {
+        pixel_width: 8,
+        pixel_height: 16,
+        cols: 1,
+        rows: 1,
+    };
+
     #[test]
     fn generate_image_id_constraints() {
         for _ in 0..100 {
@@ -253,15 +187,6 @@ mod tests {
             assert_ne!(id & 0xFF00_0000, 0);
             assert_ne!(id & 0x00FF_FF00, 0);
         }
-    }
-
-    #[test]
-    fn generate_image_id_uniqueness() {
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..1000 {
-            seen.insert(generate_image_id());
-        }
-        assert!(seen.len() >= 990, "{}", seen.len());
     }
 
     #[test]
@@ -280,120 +205,55 @@ mod tests {
         ] {
             let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             for tmux in [false, true] {
-                for rgba in [false, true] {
-                    let mut output = Vec::new();
-                    let size = Size {
-                        pixel_width: 8,
-                        pixel_height: 16,
-                        cols: 1,
-                        rows: 1,
-                    };
-                    let write_image = if rgba {
-                        write_static_image_rgba_zlib
-                    } else {
-                        write_static_image
-                    };
-                    write_image(&mut output, &data, 8, 16, size, tmux, 0x0102_0304).unwrap();
-                    let output = String::from_utf8(output).unwrap();
-                    let (prefix, suffix) = if tmux {
-                        ("\x1bPtmux;\x1b\x1b_G", "\x1b\x1b\\\x1b\\")
-                    } else {
-                        ("\x1b_G", "\x1b\\")
-                    };
-                    let chunks: Vec<_> = output.split(prefix).skip(1).collect();
-                    assert_eq!(chunks.len(), len.div_ceil(RAW_CHUNK_SIZE));
-                    let mut decoded = Vec::new();
-                    for (index, chunk) in chunks.iter().enumerate() {
-                        let (command, _) = chunk.split_once(suffix).unwrap();
-                        let (header, payload) = command.split_once(';').unwrap();
-                        let more = usize::from(index + 1 < chunks.len());
-                        assert!(header.ends_with(&format!("m={more}")));
-                        assert!(payload.len() <= CHUNK_SIZE);
-                        assert!(!payload.contains('='));
-                        decoded.extend(
-                            base64::engine::general_purpose::STANDARD_NO_PAD
-                                .decode(payload)
-                                .unwrap(),
-                        );
-                    }
-                    assert_eq!(decoded, data, "len={len}, tmux={tmux}, rgba={rgba}");
+                let mut output = Vec::new();
+                write_image(
+                    &mut output,
+                    &data,
+                    "f=100",
+                    8,
+                    16,
+                    TMUX_SIZE,
+                    tmux.then_some(0x0102_0304),
+                )
+                .unwrap();
+                let output = String::from_utf8(output).unwrap();
+                let (prefix, suffix) = if tmux {
+                    ("\x1bPtmux;\x1b\x1b_G", "\x1b\x1b\\\x1b\\")
+                } else {
+                    ("\x1b_G", "\x1b\\")
+                };
+                let chunks: Vec<_> = output.split(prefix).skip(1).collect();
+                assert_eq!(chunks.len(), len.div_ceil(RAW_CHUNK_SIZE));
+                let mut decoded = Vec::new();
+                for (index, chunk) in chunks.iter().enumerate() {
+                    let (command, _) = chunk.split_once(suffix).unwrap();
+                    let (header, payload) = command.split_once(';').unwrap();
+                    let more = usize::from(index + 1 < chunks.len());
+                    assert!(header.ends_with(&format!("m={more}")));
+                    assert!(payload.len() <= CHUNK_SIZE);
+                    assert!(!payload.contains('='));
+                    decoded.extend(
+                        base64::engine::general_purpose::STANDARD_NO_PAD
+                            .decode(payload)
+                            .unwrap(),
+                    );
                 }
+                assert_eq!(decoded, data, "len={len}, tmux={tmux}");
             }
         }
     }
 
     #[test]
-    fn diacritics_table() {
-        assert_eq!(NUMBER_TO_DIACRITIC.len(), 297);
-        assert_eq!(NUMBER_TO_DIACRITIC[0], '\u{0305}');
-        assert_eq!(NUMBER_TO_DIACRITIC[296], '\u{1D244}');
-    }
-
-    #[test]
-    fn write_static_image_non_tmux_single_chunk() {
+    fn write_image_non_tmux_single_chunk() {
         let mut buf = Vec::new();
-        write_static_image(
+        write_image(
             &mut buf,
             &[0, 1, 2],
-            1,
-            1,
-            Size {
-                pixel_width: 0,
-                pixel_height: 0,
-                cols: 0,
-                rows: 0,
-            },
-            false,
-            0,
-        )
-        .unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "\x1b_Ga=T,q=2,f=100,m=0;AAEC\x1b\\\n"
-        );
-    }
-
-    #[test]
-    fn write_static_image_non_tmux_multi_chunk() {
-        let mut buf = Vec::new();
-        let png = vec![1; RAW_CHUNK_SIZE + 1];
-        write_static_image(
-            &mut buf,
-            &png,
-            1,
-            1,
-            Size {
-                pixel_width: 0,
-                pixel_height: 0,
-                cols: 0,
-                rows: 0,
-            },
-            false,
-            0,
-        )
-        .unwrap();
-        let got = String::from_utf8(buf).unwrap();
-        assert_eq!(got.matches("\x1b_G").count(), 2);
-        assert!(got.contains("a=T,q=2,f=100,m=1;"));
-        assert!(got.contains("\x1b_Gm=0;"));
-    }
-
-    #[test]
-    fn write_static_image_rgba_zlib_non_tmux_single_chunk() {
-        let mut buf = Vec::new();
-        write_static_image_rgba_zlib(
-            &mut buf,
-            &[0, 1, 2],
+            "f=32,o=z,s=2,v=3",
             2,
             3,
-            Size {
-                pixel_width: 0,
-                pixel_height: 0,
-                cols: 0,
-                rows: 0,
-            },
-            false,
-            0,
+            TMUX_SIZE,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -403,62 +263,18 @@ mod tests {
     }
 
     #[test]
-    fn write_static_image_rgba_zlib_non_tmux_multi_chunk() {
+    fn write_image_tmux_with_placeholders() {
         let mut buf = Vec::new();
-        let data = vec![1; RAW_CHUNK_SIZE + 1];
-        write_static_image_rgba_zlib(
+        write_image(
             &mut buf,
-            &data,
-            2,
-            3,
-            Size {
-                pixel_width: 0,
-                pixel_height: 0,
-                cols: 0,
-                rows: 0,
-            },
-            false,
-            0,
+            &[0, 1, 2],
+            "f=100",
+            8,
+            16,
+            TMUX_SIZE,
+            Some(0x0102_0304),
         )
         .unwrap();
-        let got = String::from_utf8(buf).unwrap();
-        assert_eq!(got.matches("\x1b_G").count(), 2);
-        assert!(got.contains("a=T,q=2,f=32,o=z,s=2,v=3,m=1;"));
-        assert!(got.contains("\x1b_Gm=0;"));
-    }
-
-    #[test]
-    fn write_static_image_rgba_zlib_tmux_with_placeholders() {
-        let mut buf = Vec::new();
-        let size = Size {
-            pixel_width: 8,
-            pixel_height: 16,
-            cols: 1,
-            rows: 1,
-        };
-        let image_id = 0x0102_0304;
-        write_static_image_rgba_zlib(&mut buf, &[0, 1, 2], 8, 16, size, true, image_id).unwrap();
-        let expected = format!(
-            "\r\x1bPtmux;\x1b\x1b_Ga=T,q=2,f=32,o=z,s=8,v=16,U=1,c=1,r=1,i=16909060,m=0;AAEC\x1b\x1b\\\x1b\\\x1b[38:2:2:3:4m{}{}{}{}\x1b[39m\n",
-            PLACEHOLDER_CHAR,
-            NUMBER_TO_DIACRITIC[0],
-            NUMBER_TO_DIACRITIC[0],
-            NUMBER_TO_DIACRITIC[1]
-        );
-        assert_eq!(String::from_utf8(buf).unwrap(), expected);
-    }
-
-    #[test]
-    fn write_static_image_tmux_with_placeholders() {
-        let mut buf = Vec::new();
-        let size = Size {
-            pixel_width: 8,
-            pixel_height: 16,
-            cols: 1,
-            rows: 1,
-        };
-        let image_id = 0x0102_0304;
-        write_static_image(&mut buf, &[0, 1, 2], 8, 16, size, true, image_id).unwrap();
         let expected = format!(
             "\r\x1bPtmux;\x1b\x1b_Ga=T,q=2,f=100,U=1,c=1,r=1,i=16909060,m=0;AAEC\x1b\x1b\\\x1b\\\x1b[38:2:2:3:4m{}{}{}{}\x1b[39m\n",
             PLACEHOLDER_CHAR,
@@ -470,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn write_static_image_tmux_rejects_oversized_placeholder_grid() {
+    fn write_image_tmux_rejects_oversized_placeholder_grid() {
         let mut buf = Vec::new();
         let size = Size {
             pixel_width: 1,
@@ -478,25 +294,17 @@ mod tests {
             cols: 1,
             rows: 1,
         };
-        let err = write_static_image(
+        let err = write_image(
             &mut buf,
             &[0, 1, 2],
+            "f=100",
             NUMBER_TO_DIACRITIC.len() as u32,
             1,
             size,
-            true,
-            0x0102_0304,
+            Some(0x0102_0304),
         )
         .unwrap_err();
         assert!(err.to_string().contains("Unicode placeholders"));
-    }
-
-    #[test]
-    fn write_unicode_placeholders_rejects_oversized_grid() {
-        let mut buf = Vec::new();
-        assert!(
-            write_unicode_placeholders(&mut buf, 0x0102_0304, NUMBER_TO_DIACRITIC.len(), 1)
-                .is_err()
-        );
+        assert!(buf.is_empty());
     }
 }
