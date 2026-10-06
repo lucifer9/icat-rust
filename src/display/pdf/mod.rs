@@ -3,7 +3,8 @@ use std::sync::OnceLock;
 
 use ::image::{DynamicImage, GrayImage, RgbImage};
 use lopdf::content::{Content, Operation};
-use lopdf::{Document, LoadOptions, Object};
+use lopdf::xobject::PdfImage;
+use lopdf::{Document, LoadOptions, Object, ObjectId};
 use regex::Regex;
 
 use crate::display::image;
@@ -15,15 +16,8 @@ const MIN_PDF_TEXT_CHARS: usize = 50;
 const DEFAULT_PDF_FONT_SIZE: f64 = 12.0;
 const MAX_PDF_TEXT_BYTES: usize = 8 * 1024 * 1024;
 
-#[cfg(not(test))]
 const MAX_PDF_DECOMPRESSED_STREAM_BYTES: usize = 64 * 1024 * 1024;
-#[cfg(test)]
-const MAX_PDF_DECOMPRESSED_STREAM_BYTES: usize = 128; // small limit for testing
-
-#[cfg(not(test))]
 const MAX_PDF_CMAP_BYTES: usize = 8 * 1024 * 1024;
-#[cfg(test)]
-const MAX_PDF_CMAP_BYTES: usize = 512;
 
 static RE_RANGE_SECTION: OnceLock<Regex> = OnceLock::new();
 static RE_RANGE_ENTRY: OnceLock<Regex> = OnceLock::new();
@@ -33,11 +27,16 @@ static RE_WHITESPACE: OnceLock<Regex> = OnceLock::new();
 
 type CidToUnicode = HashMap<u16, char>;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PdfResult {
     warning: Option<String>,
-    text: String,
-    image_data: Vec<u8>,
+    content: PdfContent,
+}
+
+#[derive(Debug)]
+enum PdfContent {
+    Text(String),
+    Image(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -63,10 +62,9 @@ pub fn pdf(
     size: Size,
     tmux: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let label = if path.is_empty() { "<stdin>" } else { path };
     let data =
-        imgutil::read_source(path).map_err(|err| format!("failed to read PDF {label}: {err}"))?;
-    run_pdf_strategies(&data, label, page.unwrap_or(0), size, tmux)
+        imgutil::read_source(path).map_err(|err| format!("failed to read PDF {path}: {err}"))?;
+    run_pdf_strategies(&data, path, page, size, tmux)
 }
 
 pub fn pdf_from_bytes(
@@ -75,52 +73,44 @@ pub fn pdf_from_bytes(
     size: Size,
     tmux: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_pdf_strategies(data, "<stdin>", page.unwrap_or(0), size, tmux)
+    run_pdf_strategies(data, "<stdin>", page, size, tmux)
 }
 
 fn run_pdf_strategies(
     data: &[u8],
     label: &str,
-    page: usize,
+    page: Option<usize>,
     size: Size,
     tmux: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let result = prepare_pdf(data, label, page)?;
-    if !result.text.is_empty() {
-        if let Some(warning) = result.warning {
-            eprintln!("{warning}");
-        }
-        print!("{}", sanitize_text(&result.text));
-        return Ok(());
-    }
     if let Some(warning) = result.warning {
         eprintln!("{warning}");
     }
-    image::image_from_bytes(&result.image_data, size, tmux)
+    match result.content {
+        PdfContent::Text(text) => {
+            print!("{}", sanitize_text(&text));
+            Ok(())
+        }
+        PdfContent::Image(image_data) => image::image_from_bytes(&image_data, size, tmux),
+    }
 }
 
 /// Try to load a PDF, falling back to scanning for valid `%%EOF` boundaries
 /// when the standard loader fails (e.g. a malformed incremental-update /Prev pointer).
 fn load_pdf_lenient(data: &[u8]) -> Result<Document, lopdf::Error> {
-    if let Ok(doc) = load_pdf_mem_bounded(data) {
-        return Ok(doc);
-    }
-    // Collect all %%EOF positions (last-to-first so we try the most-complete version first)
+    let err = match load_pdf_mem_bounded(data) {
+        Ok(doc) => return Ok(doc),
+        Err(err) => err,
+    };
+    // Try %%EOF positions last-to-first so the most complete revision wins.
     let marker = b"%%EOF";
-    let mut positions: Vec<usize> = data
-        .windows(marker.len())
+    data.windows(marker.len())
         .enumerate()
-        .filter(|(_, w)| *w == marker)
-        .map(|(i, _)| i + marker.len())
-        .collect();
-    positions.reverse();
-    for end in positions {
-        if let Ok(doc) = load_pdf_mem_bounded(&data[..end]) {
-            return Ok(doc);
-        }
-    }
-    // Last resort: full data again (will fail with the original error)
-    load_pdf_mem_bounded(data)
+        .rev()
+        .filter(|(_, window)| *window == marker)
+        .find_map(|(i, _)| load_pdf_mem_bounded(&data[..i + marker.len()]).ok())
+        .ok_or(err)
 }
 
 fn load_pdf_mem_bounded(data: &[u8]) -> Result<Document, lopdf::Error> {
@@ -133,84 +123,75 @@ fn load_pdf_mem_bounded(data: &[u8]) -> Result<Document, lopdf::Error> {
 fn prepare_pdf(
     data: &[u8],
     label: &str,
-    page: usize,
+    page: Option<usize>,
 ) -> Result<PdfResult, Box<dyn std::error::Error>> {
     let document = load_pdf_lenient(data)?;
     let pages = document.get_pages();
-    let total_pages = pages.len();
-    let (effective_page, warning) = clamp_pdf_page(page, total_pages, label);
+    let (page, warning) = clamp_pdf_page(page, pages.len(), label);
 
-    if effective_page > 0 {
-        if let Ok(image_data) = extract_largest_image(&document, effective_page as u32) {
-            return Ok(PdfResult {
-                warning,
-                text: String::new(),
-                image_data,
-            });
+    let content = if let Some(page) = page {
+        let page_id = *pages
+            .get(&(page as u32))
+            .ok_or_else(|| format!("page {page} not found"))?;
+        if let Ok(image_data) = extract_largest_image(&document, page_id) {
+            PdfContent::Image(image_data)
+        } else {
+            let text = extract_page_text(&document, page_id, &scan_cmaps_from_raw(data))?;
+            let text = text.trim();
+            if text.is_empty() {
+                return Err(format!("failed to extract content from PDF {label}").into());
+            }
+            PdfContent::Text(text.to_string())
         }
-        let text = extract_page_text(&document, effective_page as u32, &scan_cmaps_from_raw(data))?;
-        let trimmed = text.trim().to_string();
-        if trimmed.len() >= MIN_PDF_TEXT_CHARS || !trimmed.is_empty() {
-            return Ok(PdfResult {
-                warning,
-                text: trimmed,
-                image_data: Vec::new(),
-            });
+    } else {
+        // extract_text_all_pages trims each page, so the joined text has no
+        // surrounding whitespace.
+        let text = extract_text_all_pages(
+            &document,
+            pages.values().copied(),
+            &scan_cmaps_from_raw(data),
+        )?;
+        if text.len() >= MIN_PDF_TEXT_CHARS {
+            PdfContent::Text(text)
+        } else if let Some(image_data) = pages
+            .values()
+            .next()
+            .and_then(|&page_id| extract_largest_image(&document, page_id).ok())
+        {
+            PdfContent::Image(image_data)
+        } else if !text.is_empty() {
+            PdfContent::Text(text)
+        } else {
+            return Err(format!("no extractable content in PDF {label}").into());
         }
-        return Err(format!("failed to extract content from PDF {label}").into());
-    }
-
-    let text = extract_text_all_pages(&document, &scan_cmaps_from_raw(data))?;
-    if text.trim().len() >= MIN_PDF_TEXT_CHARS {
-        return Ok(PdfResult {
-            warning,
-            text,
-            image_data: Vec::new(),
-        });
-    }
-
-    if let Ok(image_data) = extract_largest_image(&document, 1) {
-        return Ok(PdfResult {
-            warning,
-            text: String::new(),
-            image_data,
-        });
-    }
-
-    let trimmed = text.trim().to_string();
-    if !trimmed.is_empty() {
-        return Ok(PdfResult {
-            warning,
-            text: trimmed,
-            image_data: Vec::new(),
-        });
-    }
-
-    Err(format!("no extractable content in PDF {label}").into())
+    };
+    Ok(PdfResult { warning, content })
 }
 
-fn clamp_pdf_page(page: usize, total: usize, label: &str) -> (usize, Option<String>) {
-    if page == 0 || total == 0 {
-        return (page, None);
+fn clamp_pdf_page(
+    page: Option<usize>,
+    total: usize,
+    label: &str,
+) -> (Option<usize>, Option<String>) {
+    match page {
+        Some(page) if total > 0 && page > total => (
+            Some(total),
+            Some(format!(
+                "warning: page {page} out of range for PDF {label}, showing last page {total}"
+            )),
+        ),
+        _ => (page, None),
     }
-    if page <= total {
-        return (page, None);
-    }
-    (
-        total,
-        Some(format!(
-            "warning: page {page} out of range for PDF {label}, showing last page {total}"
-        )),
-    )
 }
 
 fn extract_text_all_pages(
     document: &Document,
+    page_ids: impl IntoIterator<Item = ObjectId>,
     raw_fallback: &CidToUnicode,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut out = String::new();
-    for page_number in document.get_pages().keys().copied() {
-        let page_text = extract_page_text(document, page_number, raw_fallback)?;
+    for page_id in page_ids {
+        let page_text = extract_page_text(document, page_id, raw_fallback)?;
         let page_text = page_text.trim();
         if page_text.is_empty() {
             continue;
@@ -232,13 +213,9 @@ fn extract_text_all_pages(
 
 fn extract_page_text(
     document: &Document,
-    page_number: u32,
+    page_id: ObjectId,
     raw_fallback: &CidToUnicode,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let pages = document.get_pages();
-    let page_id = *pages
-        .get(&page_number)
-        .ok_or_else(|| format!("page {page_number} not found"))?;
     let content = document
         .get_page_content_with_limit(page_id, MAX_PDF_DECOMPRESSED_STREAM_BYTES)
         .map_err(|err| {
@@ -247,13 +224,6 @@ fn extract_page_text(
                 MAX_PDF_DECOMPRESSED_STREAM_BYTES
             )
         })?;
-    if content.len() > MAX_PDF_DECOMPRESSED_STREAM_BYTES {
-        return Err(format!(
-            "page content exceeds {} MiB limit",
-            MAX_PDF_DECOMPRESSED_STREAM_BYTES / (1024 * 1024)
-        )
-        .into());
-    }
     let operations = Content::decode(&content)?.operations;
     let font_cmaps = collect_font_cmaps(document, page_id)?;
     Ok(extract_text_from_operations(
@@ -299,83 +269,53 @@ fn collect_font_cmaps(
 
 fn extract_largest_image(
     document: &Document,
-    page_number: u32,
+    page_id: ObjectId,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let page_id = *document
-        .get_pages()
-        .get(&page_number)
-        .ok_or_else(|| format!("page {page_number} not found"))?;
     let mut images = document.get_page_images(page_id)?;
     // Decoding can be expensive (multi-MiB inflate + PNG encode); try images
     // largest-first and stop at the first that decodes.
     images.sort_by_key(|image| std::cmp::Reverse(image.width.saturating_mul(image.height)));
-    for image in images {
-        let filters = image.filters.clone().unwrap_or_default();
-        if let Ok(data) = decode_pdf_image(&filters, image.content, image.origin_dict) {
-            return Ok(data);
-        }
-    }
-    Err(String::from("no decodable images found on page").into())
+    images
+        .iter()
+        .find_map(|image| decode_pdf_image(document, image).ok())
+        .ok_or_else(|| String::from("no decodable images found on page").into())
 }
 
 fn decode_pdf_image(
-    filters: &[String],
-    content: &[u8],
-    dict: &lopdf::Dictionary,
+    document: &Document,
+    image: &PdfImage,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let filters = image.filters.as_deref().unwrap_or_default();
     if filters
         .iter()
         .any(|f| matches!(f.as_str(), "DCTDecode" | "JPXDecode"))
-        || ::image::guess_format(content).is_ok()
+        || ::image::guess_format(image.content).is_ok()
     {
         // Encoded images are passed through unchanged, but validate them first
         // so a corrupt or unsupported candidate does not block smaller images.
-        imgutil::decode_with_limits(content)?;
-        return Ok(content.to_vec());
+        imgutil::decode_with_limits(image.content)?;
+        return Ok(image.content.to_vec());
     }
     if filters.iter().any(|f| f == "CCITTFaxDecode") {
-        return decode_ccitt_image(filters, content, dict);
+        return decode_ccitt_image(image, filters);
     }
-    if filters.iter().any(|f| f == "FlateDecode") {
-        return decode_flate_raw_image(content, dict);
-    }
-    Err(String::from("unsupported PDF image filter").into())
+    decode_raw_image(document, image)
 }
 
 /// Decode an image whose last (or only) filter is CCITTFaxDecode.
 /// If FlateDecode precedes it in the filter list, apply zlib first.
 fn decode_ccitt_image(
+    image: &PdfImage,
     filters: &[String],
-    content: &[u8],
-    dict: &lopdf::Dictionary,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let (width, height) = pdf_image_dimensions(dict)?;
-
-    // Apply FlateDecode if it appears before CCITTFaxDecode
-    let ccitt_data: Vec<u8> = if filters
-        .iter()
-        .position(|f| f == "FlateDecode")
-        .map(|fi| {
-            filters
-                .iter()
-                .position(|f| f == "CCITTFaxDecode")
-                .map(|ci| fi < ci)
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
-    {
-        inflate_zlib_limited(content)?
+    let (width, height) = pdf_image_dimensions(image.width, image.height)?;
+    let ccitt_data = if matches!(filters, [first, ..] if first == "FlateDecode") {
+        inflate_zlib_limited(image.content)?
     } else {
-        content.to_vec()
+        image.content.to_vec()
     };
-
-    // Extract CCITTFaxDecode parameters from DecodeParms (may be an array per-filter)
-    let ccitt_parms = extract_ccitt_decode_parms(filters, dict);
-    let k = ccitt_parms.0; // K < 0 → Group4, K = 0 → Group3-1D, K > 0 → Group3-2D
-    let black_is1 = ccitt_parms.1; // true → PhotometricInterpretation = 1 (BlackIsZero)
-    let columns = ccitt_parms.2.unwrap_or(width);
-
-    let tiff_bytes = build_ccitt_tiff(width, height, columns, k, black_is1, &ccitt_data);
+    let (k, black_is1, columns) = extract_ccitt_decode_parms(filters, image.origin_dict);
+    let tiff_bytes = build_ccitt_tiff(height, columns.unwrap_or(width), k, black_is1, &ccitt_data);
     let img = ::image::load_from_memory_with_format(&tiff_bytes, ::image::ImageFormat::Tiff)?;
     imgutil::encode_png(&img)
 }
@@ -411,115 +351,113 @@ fn extract_ccitt_decode_parms(
 }
 
 /// Build a minimal TIFF file in memory wrapping raw CCITT bitstream data.
-fn build_ccitt_tiff(
-    _width: u32,
-    height: u32,
-    columns: u32,
-    k: i64,
-    black_is1: bool,
-    data: &[u8],
-) -> Vec<u8> {
-    // Compression: K < 0 → Fax4 (4), else Fax3 (3)
-    let compression: u16 = if k < 0 { 4 } else { 3 };
-    // PhotometricInterpretation: 0 = WhiteIsZero (CCITT default), 1 = BlackIsZero
-    let photometric: u16 = if black_is1 { 1 } else { 0 };
+/// `k` follows the PDF meaning: K < 0 is Group 4, K = 0 Group 3 1-D, K > 0 Group 3 2-D.
+fn build_ccitt_tiff(height: u32, columns: u32, k: i64, black_is1: bool, data: &[u8]) -> Vec<u8> {
+    const SHORT: u16 = 3;
+    const LONG: u16 = 4;
+    const HEADER_LEN: usize = 8;
 
-    let n_entries: u16 = if k < 0 { 9 } else { 10 }; // Fax4 has no T4Options entry
-    let ifd_size: u32 = 2 + n_entries as u32 * 12 + 4;
-    let data_offset: u32 = 8 + ifd_size;
+    let compression = if k < 0 { 4 } else { 3 };
+    // 0 = WhiteIsZero (CCITT default), 1 = BlackIsZero
+    let photometric = u32::from(black_is1);
+    let mut entries: Vec<(u16, u16, u32)> = vec![
+        (0x0100, SHORT, columns),          // ImageWidth
+        (0x0101, SHORT, height),           // ImageLength
+        (0x0102, SHORT, 1),                // BitsPerSample
+        (0x0103, SHORT, compression),      // Compression
+        (0x0106, SHORT, photometric),      // PhotometricInterpretation
+        (0x0115, SHORT, 1),                // SamplesPerPixel
+        (0x0116, LONG, height),            // RowsPerStrip
+        (0x0117, LONG, data.len() as u32), // StripByteCounts
+    ];
+    if k >= 0 {
+        // T4Options bit 0 selects 2-D coding.
+        entries.push((0x0124, LONG, u32::from(k > 0)));
+    }
+    // The strip data follows the IFD, whose size includes this entry itself.
+    let data_offset = HEADER_LEN + 2 + (entries.len() + 1) * 12 + 4;
+    entries.push((0x0111, LONG, data_offset as u32)); // StripOffsets
+    // TIFF requires IFD entries in ascending tag order.
+    entries.sort_by_key(|&(tag, _, _)| tag);
 
-    let mut b: Vec<u8> = Vec::with_capacity(data_offset as usize + data.len());
-
-    // Header (little-endian)
+    let mut b = Vec::with_capacity(data_offset + data.len());
     b.extend_from_slice(b"II");
     b.extend_from_slice(&42u16.to_le_bytes());
-    b.extend_from_slice(&8u32.to_le_bytes()); // IFD at offset 8
-
-    // IFD entry count
-    b.extend_from_slice(&n_entries.to_le_bytes());
-
-    // Inline helpers (using macros to avoid borrow-conflict with closures)
-    macro_rules! short_entry {
-        ($tag:expr, $val:expr) => {
-            b.extend_from_slice(&($tag as u16).to_le_bytes());
-            b.extend_from_slice(&3u16.to_le_bytes()); // type SHORT
-            b.extend_from_slice(&1u32.to_le_bytes()); // count 1
-            b.extend_from_slice(&($val as u32).to_le_bytes()); // value
-        };
+    b.extend_from_slice(&(HEADER_LEN as u32).to_le_bytes()); // IFD offset
+    b.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (tag, ty, value) in entries {
+        b.extend_from_slice(&tag.to_le_bytes());
+        b.extend_from_slice(&ty.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes()); // count
+        // Little-endian values are left-justified, so a SHORT fits the low bytes.
+        b.extend_from_slice(&value.to_le_bytes());
     }
-    macro_rules! long_entry {
-        ($tag:expr, $val:expr) => {
-            b.extend_from_slice(&($tag as u16).to_le_bytes());
-            b.extend_from_slice(&4u16.to_le_bytes()); // type LONG
-            b.extend_from_slice(&1u32.to_le_bytes()); // count 1
-            b.extend_from_slice(&($val as u32).to_le_bytes());
-        };
-    }
-
-    short_entry!(0x0100u16, columns); // ImageWidth
-    short_entry!(0x0101u16, height); // ImageLength
-    short_entry!(0x0102u16, 1u32); // BitsPerSample = 1
-    short_entry!(0x0103u16, compression); // Compression
-    short_entry!(0x0106u16, photometric); // PhotometricInterpretation
-    long_entry!(0x0111u16, data_offset); // StripOffsets
-    short_entry!(0x0115u16, 1u32); // SamplesPerPixel = 1
-    long_entry!(0x0116u16, height); // RowsPerStrip
-    long_entry!(0x0117u16, data.len() as u32); // StripByteCounts
-    if k >= 0 {
-        let t4opts: u32 = if k > 0 { 1 } else { 0 }; // bit 0: 0=1D, 1=2D
-        long_entry!(0x0124u16, t4opts); // T4Options
-    }
-
-    b.extend_from_slice(&0u32.to_le_bytes()); // next IFD offset = 0 (end)
+    b.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
     b.extend_from_slice(data);
     b
 }
 
-/// Decode a FlateDecode-only raw-pixel image stream.
-fn decode_flate_raw_image(
-    content: &[u8],
-    dict: &lopdf::Dictionary,
+/// Decode an image stored as raw 8-bit Gray or RGB samples behind the stream's
+/// filters. lopdf applies the filters and any DecodeParms predictor.
+fn decode_raw_image(
+    document: &Document,
+    image: &PdfImage,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let (width, height) = pdf_image_dimensions(dict)?;
-    let color_space = dict.get(b"ColorSpace").ok();
-    let bits_per_component = dict
-        .get(b"BitsPerComponent")
-        .ok()
-        .and_then(|value| value.as_i64().ok())
-        .unwrap_or(8);
-    if bits_per_component != 8 {
+    let (width, height) = pdf_image_dimensions(image.width, image.height)?;
+    if image.bits_per_component.unwrap_or(8) != 8 {
         return Err(String::from("unsupported PDF image bit depth").into());
     }
-    let components = match color_space {
-        Some(Object::Name(name)) if name == b"DeviceGray" => 1,
-        Some(Object::Name(name)) if name == b"DeviceRGB" => 3,
-        Some(Object::Array(array))
-            if array.first().and_then(|o| o.as_name().ok()) == Some(b"DeviceRGB") =>
-        {
-            3
-        }
-        Some(Object::Array(array))
-            if array.first().and_then(|o| o.as_name().ok()) == Some(b"DeviceGray") =>
-        {
-            1
-        }
-        _ => 3,
-    };
-    let expected = pdf_image_buffer_len(width, height, components)?;
-    let content = inflate_zlib_limited(content)?;
-    if content.len() < expected {
+    let components = image_components(document, image)?;
+    // check_limits bounds the pixel count, so this cannot overflow.
+    let expected = width as usize * height as usize * components;
+    let mut samples = document
+        .get_object(image.id)?
+        .as_stream()?
+        .decompressed_content_with_limit(MAX_PDF_DECOMPRESSED_STREAM_BYTES)?;
+    if samples.len() < expected {
         return Err(String::from("truncated PDF image data").into());
     }
+    samples.truncate(expected);
     let image = if components == 1 {
-        let buffer = GrayImage::from_raw(width, height, content[..expected].to_vec())
+        let buffer = GrayImage::from_raw(width, height, samples)
             .ok_or_else(|| String::from("invalid gray image buffer"))?;
         DynamicImage::ImageLuma8(buffer)
     } else {
-        let buffer = RgbImage::from_raw(width, height, content[..expected].to_vec())
+        let buffer = RgbImage::from_raw(width, height, samples)
             .ok_or_else(|| String::from("invalid RGB image buffer"))?;
         DynamicImage::ImageRgb8(buffer)
     };
     imgutil::encode_png(&image)
+}
+
+/// Number of 8-bit samples per pixel for color spaces that map directly to
+/// gray or RGB; ICC profiles are ignored and only their channel count is used.
+fn image_components(
+    document: &Document,
+    image: &PdfImage,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let unsupported = || -> Box<dyn std::error::Error> {
+        format!(
+            "unsupported PDF image color space {}",
+            image.color_space.as_deref().unwrap_or("<none>")
+        )
+        .into()
+    };
+    match image.color_space.as_deref() {
+        Some("DeviceGray" | "CalGray") => Ok(1),
+        Some("DeviceRGB" | "CalRGB") => Ok(3),
+        Some("ICCBased") => {
+            let (_, color_space) = document.dereference(image.origin_dict.get(b"ColorSpace")?)?;
+            let profile = color_space.as_array()?.get(1).ok_or_else(unsupported)?;
+            let (_, profile) = document.dereference(profile)?;
+            match profile.as_stream()?.dict.get(b"N")?.as_i64()? {
+                1 => Ok(1),
+                3 => Ok(3),
+                _ => Err(unsupported()),
+            }
+        }
+        _ => Err(unsupported()),
+    }
 }
 
 fn inflate_zlib_limited(content: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -542,40 +480,20 @@ fn inflate_zlib_limited(content: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::E
     Ok(buf)
 }
 
-fn pdf_image_dimensions(
-    dict: &lopdf::Dictionary,
-) -> Result<(u32, u32), Box<dyn std::error::Error>> {
-    let width = dict.get(b"Width")?.as_i64()?;
-    let height = dict.get(b"Height")?.as_i64()?;
-    if width <= 0 || height <= 0 {
-        return Err(format!("invalid PDF image dimensions {width}x{height}").into());
-    }
-    let width = u32::try_from(width)
-        .map_err(|_| format!("invalid PDF image dimensions {width}x{height}"))?;
-    let height = u32::try_from(height)
-        .map_err(|_| format!("invalid PDF image dimensions {width}x{height}"))?;
+fn pdf_image_dimensions(width: i64, height: i64) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    let invalid = || format!("invalid PDF image dimensions {width}x{height}");
+    let width = u32::try_from(width).map_err(|_| invalid())?;
+    let height = u32::try_from(height).map_err(|_| invalid())?;
     if !imgutil::check_limits(width, height) {
         return Err(format!("PDF image dimensions {width}x{height} exceed limits").into());
     }
     Ok((width, height))
 }
 
-fn pdf_image_buffer_len(
-    width: u32,
-    height: u32,
-    components: usize,
-) -> Result<usize, Box<dyn std::error::Error>> {
-    let expected = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|pixels| pixels.checked_mul(components as u64))
-        .ok_or_else(|| String::from("PDF image buffer size overflow"))?;
-    usize::try_from(expected).map_err(|_| String::from("PDF image buffer size overflow").into())
-}
-
 fn sanitize_text(input: &str) -> String {
     input
         .chars()
-        .filter(|ch| matches!(ch, '\n' | '\t' | '\r') || (!ch.is_control() && *ch != '\u{7f}'))
+        .filter(|ch| matches!(ch, '\n' | '\t' | '\r') || !ch.is_control())
         .collect()
 }
 
@@ -707,44 +625,21 @@ fn collect_pdf_text_runs(
                     line_leading = font_size * 1.2;
                 }
             }
-            "Tj" => {
-                if let Some(text) = decode_pdf_text(
-                    operation.operands.first(),
-                    current_cmap(font_cmaps, raw_fallback, &current_font),
-                ) {
-                    append_pdf_run(
-                        &mut runs,
-                        text,
-                        cur_x,
-                        cur_y,
-                        font_size,
-                        order,
-                        &mut cur_x,
-                        line_start_x,
-                    );
-                }
-            }
-            "TJ" => {
-                if let Some(Object::Array(items)) = operation.operands.first() {
-                    let mut text = String::new();
-                    for item in items {
-                        if let Some(part) = decode_pdf_text(
-                            Some(item),
-                            current_cmap(font_cmaps, raw_fallback, &current_font),
-                        ) {
-                            text.push_str(&part);
-                        }
-                    }
-                    append_pdf_run(
-                        &mut runs,
-                        text,
-                        cur_x,
-                        cur_y,
-                        font_size,
-                        order,
-                        &mut cur_x,
-                        line_start_x,
-                    );
+            "Tj" | "TJ" => {
+                let cmap = current_cmap(font_cmaps, raw_fallback, &current_font);
+                let text = match (operation.operator.as_str(), operation.operands.first()) {
+                    ("Tj", Some(operand)) => decode_pdf_text(operand, cmap),
+                    ("TJ", Some(Object::Array(items))) => Some(
+                        items
+                            .iter()
+                            .filter_map(|item| decode_pdf_text(item, cmap))
+                            .collect(),
+                    ),
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    let run_x = if cur_x.is_nan() { line_start_x } else { cur_x };
+                    cur_x += append_pdf_run(&mut runs, &text, run_x, cur_y, font_size, order);
                 }
             }
             _ => {}
@@ -753,34 +648,29 @@ fn collect_pdf_text_runs(
     runs
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Push a normalized run and return its estimated width (0 for blank text).
 fn append_pdf_run(
     runs: &mut Vec<PdfTextRun>,
-    text: String,
-    cur_x: f64,
-    cur_y: f64,
+    text: &str,
+    x: f64,
+    y: f64,
     font_size: f64,
     order: usize,
-    mutable_cur_x: &mut f64,
-    line_start_x: f64,
-) {
-    let text = normalize_pdf_run_text(&text);
+) -> f64 {
+    let text = normalize_pdf_run_text(text);
     if text.is_empty() {
-        return;
+        return 0.0;
     }
-    let x = if cur_x.is_nan() { line_start_x } else { cur_x };
     let width = estimate_pdf_text_width(&text, font_size);
     runs.push(PdfTextRun {
         text,
         x,
-        y: cur_y,
+        y,
         font_size,
         width,
         order,
     });
-    if !mutable_cur_x.is_nan() {
-        *mutable_cur_x += width;
-    }
+    width
 }
 
 fn as_f64(object: &Object) -> Option<f64> {
@@ -801,15 +691,14 @@ fn current_cmap<'a>(
         .or_else(|| (!raw_fallback.is_empty()).then_some(raw_fallback))
 }
 
-fn decode_pdf_text(object: Option<&Object>, cmap: Option<&CidToUnicode>) -> Option<String> {
-    let object = object?;
+fn decode_pdf_text(object: &Object, cmap: Option<&CidToUnicode>) -> Option<String> {
     if let Some(text) = decode_hex_like_object(object, cmap) {
         return Some(text);
     }
     match object {
-        Object::String(bytes, _) => Some(decode_pdf_string(bytes)),
+        // lopdf has already resolved literal-string escapes; map the bytes as Latin-1.
+        Object::String(bytes, _) => Some(bytes.iter().map(|&byte| char::from(byte)).collect()),
         Object::Name(name) => Some(String::from_utf8_lossy(name).into_owned()),
-        Object::Array(_) => None,
         _ => None,
     }
 }
@@ -833,42 +722,6 @@ fn decode_hex_like_object(object: &Object, cmap: Option<&CidToUnicode>) -> Optio
     Some(out)
 }
 
-fn decode_pdf_string(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            i += 1;
-            match bytes[i] {
-                b'n' => out.push('\n'),
-                b'r' => out.push('\r'),
-                b't' => out.push('\t'),
-                b'b' => out.push('\u{0008}'),
-                b'f' => out.push('\u{000C}'),
-                b'(' | b')' | b'\\' => out.push(bytes[i] as char),
-                b'0'..=b'7' => {
-                    let mut value = u32::from(bytes[i] - b'0');
-                    for _ in 0..2 {
-                        if i + 1 < bytes.len()
-                            && bytes[i + 1].is_ascii_digit()
-                            && bytes[i + 1] < b'8'
-                        {
-                            i += 1;
-                            value = value * 8 + u32::from(bytes[i] - b'0');
-                        }
-                    }
-                    out.push((value as u8) as char);
-                }
-                byte => out.push(byte as char),
-            }
-        } else {
-            out.push(bytes[i] as char);
-        }
-        i += 1;
-    }
-    out
-}
-
 fn normalize_pdf_run_text(text: &str) -> String {
     let re = RE_WHITESPACE.get_or_init(|| Regex::new(r"[ \t]+").unwrap());
     re.replace_all(text.trim(), " ").into_owned()
@@ -889,9 +742,6 @@ fn estimate_pdf_text_width(text: &str, font_size: f64) -> f64 {
 }
 
 fn render_pdf_text_runs(runs: &[PdfTextRun]) -> String {
-    if runs.is_empty() {
-        return String::new();
-    }
     let mut lines = group_pdf_text_runs(runs);
     let base_x = lines
         .iter()
@@ -904,7 +754,7 @@ fn render_pdf_text_runs(runs: &[PdfTextRun]) -> String {
         }
         render_pdf_line(&mut out, line, base_x);
     }
-    out.trim_end_matches('\n').to_string()
+    out
 }
 
 fn group_pdf_text_runs(runs: &[PdfTextRun]) -> Vec<PdfTextLine> {
@@ -912,11 +762,7 @@ fn group_pdf_text_runs(runs: &[PdfTextRun]) -> Vec<PdfTextLine> {
     for run in runs {
         if let Some(line) = lines.iter_mut().find(|line| same_pdf_text_line(line, run)) {
             line.runs.push(run.clone());
-            line.y = if line.y.is_nan() {
-                run.y
-            } else {
-                (line.y + run.y) / 2.0
-            };
+            line.y = (line.y + run.y) / 2.0;
             line.font_size = line.font_size.max(run.font_size);
         } else {
             lines.push(PdfTextLine {
@@ -947,13 +793,8 @@ fn render_pdf_line(out: &mut String, line: &mut PdfTextLine, base_x: f64) {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.order.cmp(&b.order))
     });
-    let font_size = if line.font_size > 0.0 {
-        line.font_size
-    } else {
-        DEFAULT_PDF_FONT_SIZE
-    };
-    let space_width = (font_size * 0.5).max(1.0);
-    let indent_width = (font_size * 4.0).max(1.0);
+    let space_width = (line.font_size * 0.5).max(1.0);
+    let indent_width = (line.font_size * 4.0).max(1.0);
     if let Some(x) = first_known_x(&line.runs)
         && !base_x.is_nan()
     {
@@ -1036,6 +877,17 @@ mod tests {
         out
     }
 
+    fn prepared_text(data: &[u8], page: Option<usize>) -> String {
+        match prepare_pdf(data, "test.pdf", page).unwrap().content {
+            PdfContent::Text(text) => text,
+            PdfContent::Image(_) => panic!("expected text content"),
+        }
+    }
+
+    fn first_page_id(doc: &Document) -> ObjectId {
+        doc.get_pages()[&1]
+    }
+
     fn stream_object(body: &str) -> String {
         format!("<< /Length {} >>\nstream\n{}\nendstream", body.len(), body)
     }
@@ -1097,7 +949,7 @@ mod tests {
 
     #[test]
     fn load_pdf_lenient_bounds_xref_stream_decompression() {
-        let compressed = zlib_bytes(&[0; MAX_PDF_DECOMPRESSED_STREAM_BYTES + 1]);
+        let compressed = zlib_bytes(&vec![0; MAX_PDF_DECOMPRESSED_STREAM_BYTES + 1]);
         assert!(compressed.len() < MAX_PDF_DECOMPRESSED_STREAM_BYTES);
         let pdf = xref_stream_pdf(&compressed);
 
@@ -1128,9 +980,9 @@ mod tests {
     }
 
     #[test]
-    fn decode_pdf_string_works() {
-        assert_eq!(decode_pdf_string(br"hello\nworld"), "hello\nworld");
-        assert_eq!(decode_pdf_string(br"\101\102"), "AB");
+    fn prepare_pdf_keeps_escaped_backslash_in_literal_string() {
+        let data = build_test_pdf(r"BT (C:\\new) Tj ET", None, false);
+        assert_eq!(prepared_text(&data, Some(1)), r"C:\new");
     }
 
     #[test]
@@ -1326,62 +1178,78 @@ mod tests {
 
     #[test]
     fn prepare_pdf_sample_text() {
-        let data = sample_text_pdf_data();
-        let result = prepare_pdf(&data, "sample-text.pdf", 0).unwrap();
-        assert_eq!(result.text.trim(), "你好世界");
-        assert!(result.image_data.is_empty());
+        assert_eq!(prepared_text(&sample_text_pdf_data(), None), "你好世界");
     }
 
     #[test]
     fn prepare_pdf_uses_raw_cmap_fallback_when_font_lacks_tounicode() {
         let data = build_test_pdf(SAMPLE_TEXT_CONTENT, Some(SAMPLE_TEXT_CMAP), false);
-        let result = prepare_pdf(&data, "raw-fallback.pdf", 0).unwrap();
-        assert_eq!(result.text.trim(), "你好世界");
+        assert_eq!(prepared_text(&data, None), "你好世界");
     }
 
     #[test]
-    fn current_cmap_prefers_font_then_nonempty_fallback() {
-        let mut font_map = CidToUnicode::new();
-        font_map.insert(1, 'A');
-        let mut cmaps = HashMap::new();
-        cmaps.insert(b"F1".to_vec(), font_map);
-        let mut fallback = CidToUnicode::new();
-        fallback.insert(1, 'B');
+    fn prepare_pdf_prefers_font_tounicode_over_raw_scanned_cmap() {
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let to_unicode_id = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            b"beginbfchar\n<0001> <0041>\nendbfchar".to_vec(),
+        ));
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "Helvetica",
+            "ToUnicode" => to_unicode_id,
+        });
+        let content_id = doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            b"BT /F1 12 Tf <0001> Tj ET".to_vec(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            "Contents" => content_id,
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        // An unrelated CMap written after the font's makes the raw scan disagree.
+        doc.add_object(Stream::new(
+            lopdf::Dictionary::new(),
+            b"beginbfchar\n<0001> <0042>\nendbfchar".to_vec(),
+        ));
+        let mut data = Vec::new();
+        doc.save_to(&mut data).unwrap();
+        assert_eq!(scan_cmaps_from_raw(&data).get(&1), Some(&'B'));
 
-        assert_eq!(
-            current_cmap(&cmaps, &fallback, b"F1").unwrap().get(&1),
-            Some(&'A'),
-            "the font's own cmap wins"
-        );
-        assert_eq!(
-            current_cmap(&cmaps, &fallback, b"F2").unwrap().get(&1),
-            Some(&'B'),
-            "unknown fonts use the non-empty fallback"
-        );
-        assert!(
-            current_cmap(&cmaps, &CidToUnicode::new(), b"F2").is_none(),
-            "an empty fallback yields no cmap"
-        );
+        assert_eq!(prepared_text(&data, None), "A");
     }
 
     #[test]
     fn prepare_pdf_out_of_range_clamps_to_last_page() {
         let data = sample_text_pdf_data();
-        let result = prepare_pdf(&data, "sample-text.pdf", 999999).unwrap();
+        let result = prepare_pdf(&data, "sample-text.pdf", Some(999999)).unwrap();
         assert!(result.warning.unwrap().contains("showing last page"));
     }
 
     #[test]
     fn extract_page_text_rejects_oversized_content_stream() {
-        // MAX_PDF_DECOMPRESSED_STREAM_BYTES is 128 bytes in cfg(test).
-        // Build a PDF whose content stream is longer than 128 bytes.
-        let oversized_content = "BT ".to_string() + &"A ".repeat(100) + "ET";
-        assert!(
-            oversized_content.len() > 128,
-            "sanity: content must exceed test limit"
-        );
+        let oversized_content =
+            "BT ".to_string() + &" ".repeat(MAX_PDF_DECOMPRESSED_STREAM_BYTES) + "ET";
         let pdf_data = build_test_pdf(&oversized_content, None, false);
-        let err = prepare_pdf(&pdf_data, "big.pdf", 1).unwrap_err();
+        let err = prepare_pdf(&pdf_data, "big.pdf", Some(1)).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("page content") || msg.contains("limit"),
@@ -1391,7 +1259,7 @@ mod tests {
 
     #[test]
     fn extract_page_text_bounds_flate_decompression() {
-        let compressed = zlib_bytes(&[b' '; MAX_PDF_DECOMPRESSED_STREAM_BYTES + 1]);
+        let compressed = zlib_bytes(&vec![b' '; MAX_PDF_DECOMPRESSED_STREAM_BYTES + 1]);
         assert!(
             compressed.len() < MAX_PDF_DECOMPRESSED_STREAM_BYTES,
             "fixture should be small before decompression"
@@ -1401,7 +1269,7 @@ mod tests {
             compressed,
         )]);
 
-        let err = extract_page_text(&doc, 1, &CidToUnicode::new()).unwrap_err();
+        let err = extract_page_text(&doc, first_page_id(&doc), &CidToUnicode::new()).unwrap_err();
         assert!(
             err.to_string().contains("limit"),
             "expected bounded decompression error, got: {err}"
@@ -1416,7 +1284,7 @@ mod tests {
             content,
         )]);
 
-        let text = extract_page_text(&doc, 1, &CidToUnicode::new()).unwrap();
+        let text = extract_page_text(&doc, first_page_id(&doc), &CidToUnicode::new()).unwrap();
 
         assert_eq!(text, "hello");
     }
@@ -1431,7 +1299,7 @@ mod tests {
             Stream::new(lopdf::Dictionary::new(), b"(world) Tj ET".to_vec()),
         ]);
 
-        let text = extract_page_text(&doc, 1, &CidToUnicode::new()).unwrap();
+        let text = extract_page_text(&doc, first_page_id(&doc), &CidToUnicode::new()).unwrap();
 
         assert_eq!(text, "hello\nworld");
     }
@@ -1442,7 +1310,7 @@ mod tests {
         let pages_id = doc.new_object_id();
         let cmap_id = doc.add_object(Stream::new(
             dictionary! { "Filter" => "FlateDecode" },
-            zlib_bytes(&[b'A'; MAX_PDF_CMAP_BYTES + 1]),
+            zlib_bytes(&vec![b'A'; MAX_PDF_CMAP_BYTES + 1]),
         ));
         let font_id = doc.add_object(dictionary! {
             "Type" => "Font",
@@ -1475,62 +1343,48 @@ mod tests {
         assert!(err.to_string().contains("limit"));
     }
 
-    #[test]
-    fn decode_flate_raw_image_rejects_invalid_dimensions_before_allocating() {
-        let dict = dictionary! {
-            "Width" => -1,
-            "Height" => 1,
-            "ColorSpace" => "DeviceRGB",
-            "BitsPerComponent" => 8,
-        };
+    fn decode_only_raw_image(doc: &Document) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let images = doc.get_page_images(first_page_id(doc)).unwrap();
+        decode_raw_image(doc, &images[0])
+    }
 
-        let err = decode_flate_raw_image(&[0, 0, 0], &dict).unwrap_err();
+    #[test]
+    fn decode_raw_image_rejects_invalid_dimensions_before_allocating() {
+        let doc = build_pdf_doc_with_images(&[(
+            -1,
+            1,
+            "DeviceRGB",
+            "FlateDecode",
+            zlib_bytes(&[0, 0, 0]),
+        )]);
+
+        let err = decode_only_raw_image(&doc).unwrap_err();
 
         assert!(err.to_string().contains("invalid PDF image dimensions"));
     }
 
     #[test]
-    fn decode_flate_raw_image_rejects_dimensions_over_image_limits() {
-        let dict = dictionary! {
-            "Width" => 10001,
-            "Height" => 10000,
-            "ColorSpace" => "DeviceGray",
-            "BitsPerComponent" => 8,
-        };
+    fn decode_raw_image_rejects_dimensions_over_image_limits() {
+        let doc = build_pdf_doc_with_images(&[(10001, 10000, "DeviceGray", "FlateDecode", vec![])]);
 
-        let err = decode_flate_raw_image(&[], &dict).unwrap_err();
+        let err = decode_only_raw_image(&doc).unwrap_err();
 
         assert!(err.to_string().contains("exceed limits"));
     }
 
-    #[test]
-    fn decode_flate_raw_image_inflates_raw_pixels() {
-        let dict = dictionary! {
-            "Width" => 1,
-            "Height" => 1,
-            "ColorSpace" => "DeviceRGB",
-            "BitsPerComponent" => 8,
-        };
-        let content = zlib_bytes(&[255, 0, 0]);
-
-        let png = decode_flate_raw_image(&content, &dict).unwrap();
-
-        assert!(imgutil::is_png(&png));
-    }
-
-    /// Build an in-memory document whose single page holds the given DeviceRGB
-    /// images as (width, height, filter, raw stream bytes).
-    fn build_pdf_doc_with_images(images: &[(i64, i64, &str, Vec<u8>)]) -> Document {
+    /// Build an in-memory document whose single page holds the given 8-bit
+    /// images as (width, height, color space, filter, raw stream bytes).
+    fn build_pdf_doc_with_images(images: &[(i64, i64, &str, &str, Vec<u8>)]) -> Document {
         let mut doc = Document::with_version("1.4");
         let pages_id = doc.new_object_id();
         let mut xobject = lopdf::Dictionary::new();
-        for (i, (width, height, filter, data)) in images.iter().enumerate() {
+        for (i, (width, height, color_space, filter, data)) in images.iter().enumerate() {
             let dict = dictionary! {
                 "Type" => "XObject",
                 "Subtype" => "Image",
                 "Width" => *width,
                 "Height" => *height,
-                "ColorSpace" => "DeviceRGB",
+                "ColorSpace" => Object::Name(color_space.as_bytes().to_vec()),
                 "BitsPerComponent" => 8,
                 "Filter" => Object::Name(filter.as_bytes().to_vec()),
             };
@@ -1561,6 +1415,16 @@ mod tests {
         doc
     }
 
+    fn set_image_decode_parms(doc: &mut Document, parms: lopdf::Dictionary) {
+        for object in doc.objects.values_mut() {
+            if let Object::Stream(stream) = object
+                && stream.dict.has(b"Width")
+            {
+                stream.dict.set("DecodeParms", parms.clone());
+            }
+        }
+    }
+
     fn png_dimensions(data: &[u8]) -> (u32, u32) {
         let img = ::image::load_from_memory(data).unwrap();
         (img.width(), img.height())
@@ -1569,12 +1433,72 @@ mod tests {
     #[test]
     fn extract_largest_image_picks_largest_decodable() {
         let doc = build_pdf_doc_with_images(&[
-            (1, 1, "FlateDecode", zlib_bytes(&[10, 20, 30])),
-            (2, 1, "FlateDecode", zlib_bytes(&[1, 2, 3, 4, 5, 6])),
+            (1, 1, "DeviceRGB", "FlateDecode", zlib_bytes(&[10, 20, 30])),
+            (
+                2,
+                1,
+                "DeviceRGB",
+                "FlateDecode",
+                zlib_bytes(&[1, 2, 3, 4, 5, 6]),
+            ),
         ]);
-        let png = extract_largest_image(&doc, 1).unwrap();
+        let png = extract_largest_image(&doc, first_page_id(&doc)).unwrap();
         assert!(imgutil::is_png(&png));
         assert_eq!(png_dimensions(&png), (2, 1));
+    }
+
+    #[test]
+    fn extract_largest_image_skips_unsupported_color_space() {
+        let doc = build_pdf_doc_with_images(&[
+            (2, 2, "DeviceCMYK", "FlateDecode", zlib_bytes(&[0; 16])),
+            (1, 1, "DeviceRGB", "FlateDecode", zlib_bytes(&[10, 20, 30])),
+        ]);
+        let png = extract_largest_image(&doc, first_page_id(&doc)).unwrap();
+        assert_eq!(png_dimensions(&png), (1, 1));
+    }
+
+    #[test]
+    fn extract_largest_image_decodes_icc_based_rgb() {
+        let mut doc = build_pdf_doc_with_images(&[(
+            1,
+            1,
+            "DeviceRGB",
+            "FlateDecode",
+            zlib_bytes(&[10, 20, 30]),
+        )]);
+        let profile_id = doc.add_object(Stream::new(dictionary! { "N" => 3 }, Vec::new()));
+        for object in doc.objects.values_mut() {
+            if let Object::Stream(stream) = object
+                && stream.dict.has(b"Width")
+            {
+                stream.dict.set(
+                    "ColorSpace",
+                    vec![Object::Name(b"ICCBased".to_vec()), profile_id.into()],
+                );
+            }
+        }
+        let png = extract_largest_image(&doc, first_page_id(&doc)).unwrap();
+        let pixel = ::image::load_from_memory(&png).unwrap().to_rgb8()[(0, 0)];
+        assert_eq!(pixel.0, [10, 20, 30]);
+    }
+
+    #[test]
+    fn extract_largest_image_applies_png_predictor() {
+        let mut doc = build_pdf_doc_with_images(&[(
+            1,
+            1,
+            "DeviceRGB",
+            "FlateDecode",
+            // PNG row filter byte 0 (None) followed by one RGB pixel.
+            zlib_bytes(&[0, 10, 20, 30]),
+        )]);
+        set_image_decode_parms(
+            &mut doc,
+            dictionary! { "Predictor" => 15, "Colors" => 3, "Columns" => 1 },
+        );
+        let png = extract_largest_image(&doc, first_page_id(&doc)).unwrap();
+        let pixel = ::image::load_from_memory(&png).unwrap().to_rgb8()[(0, 0)];
+        assert_eq!(pixel.0, [10, 20, 30]);
     }
 
     #[test]
@@ -1585,11 +1509,11 @@ mod tests {
             .encode_image(&DynamicImage::ImageRgb8(image))
             .unwrap();
         let doc = build_pdf_doc_with_images(&[
-            (2, 2, "DCTDecode", jpeg),
-            (1, 1, "FlateDecode", zlib_bytes(&[10, 20, 30])),
+            (2, 2, "DeviceRGB", "DCTDecode", jpeg),
+            (1, 1, "DeviceRGB", "FlateDecode", zlib_bytes(&[10, 20, 30])),
         ]);
 
-        let encoded = extract_largest_image(&doc, 1).unwrap();
+        let encoded = extract_largest_image(&doc, first_page_id(&doc)).unwrap();
 
         assert_eq!(png_dimensions(&encoded), (2, 2));
     }
@@ -1597,45 +1521,72 @@ mod tests {
     #[test]
     fn extract_largest_image_falls_back_when_largest_is_corrupt() {
         let doc = build_pdf_doc_with_images(&[
-            (4, 4, "FlateDecode", b"not zlib data".to_vec()),
-            (1, 1, "FlateDecode", zlib_bytes(&[10, 20, 30])),
+            (4, 4, "DeviceRGB", "FlateDecode", b"not zlib data".to_vec()),
+            (1, 1, "DeviceRGB", "FlateDecode", zlib_bytes(&[10, 20, 30])),
         ]);
-        let png = extract_largest_image(&doc, 1).unwrap();
+        let png = extract_largest_image(&doc, first_page_id(&doc)).unwrap();
         assert!(imgutil::is_png(&png));
         assert_eq!(png_dimensions(&png), (1, 1));
     }
 
     #[test]
     fn extract_largest_image_errors_when_nothing_decodes() {
-        let doc = build_pdf_doc_with_images(&[(2, 2, "FlateDecode", b"broken".to_vec())]);
-        let err = extract_largest_image(&doc, 1).unwrap_err();
+        let doc =
+            build_pdf_doc_with_images(&[(2, 2, "DeviceRGB", "FlateDecode", b"broken".to_vec())]);
+        let err = extract_largest_image(&doc, first_page_id(&doc)).unwrap_err();
         assert!(err.to_string().contains("no decodable images"));
     }
 
     #[test]
     fn extract_largest_image_skips_corrupt_dct_and_unsupported_jpx() {
         let doc = build_pdf_doc_with_images(&[
-            (4, 4, "DCTDecode", b"not a jpeg".to_vec()),
-            (3, 3, "JPXDecode", b"not a jpeg 2000 image".to_vec()),
-            (1, 1, "FlateDecode", zlib_bytes(&[10, 20, 30])),
+            (4, 4, "DeviceRGB", "DCTDecode", b"not a jpeg".to_vec()),
+            (
+                3,
+                3,
+                "DeviceRGB",
+                "JPXDecode",
+                b"not a jpeg 2000 image".to_vec(),
+            ),
+            (1, 1, "DeviceRGB", "FlateDecode", zlib_bytes(&[10, 20, 30])),
         ]);
 
-        let png = extract_largest_image(&doc, 1).unwrap();
+        let png = extract_largest_image(&doc, first_page_id(&doc)).unwrap();
 
         assert!(imgutil::is_png(&png));
         assert_eq!(png_dimensions(&png), (1, 1));
     }
 
     #[test]
-    fn decode_ccitt_image_caps_preceding_flate_inflation() {
-        let dict = dictionary! {
-            "Width" => 1,
-            "Height" => 1,
-        };
-        let content = zlib_bytes(&[0u8; MAX_PDF_DECOMPRESSED_STREAM_BYTES + 1]);
-        let filters = vec!["FlateDecode".to_string(), "CCITTFaxDecode".to_string()];
+    fn extract_largest_image_decodes_ccitt_group4() {
+        // Group 4 codes an all-white row against the white reference line as
+        // a single V0 bit, so two rows are `11`.
+        let mut doc =
+            build_pdf_doc_with_images(&[(8, 2, "DeviceGray", "CCITTFaxDecode", vec![0b1100_0000])]);
+        set_image_decode_parms(&mut doc, dictionary! { "K" => -1, "Columns" => 8 });
 
-        let err = decode_ccitt_image(&filters, &content, &dict).unwrap_err();
+        let png = extract_largest_image(&doc, first_page_id(&doc)).unwrap();
+
+        assert_eq!(png_dimensions(&png), (8, 2));
+    }
+
+    #[test]
+    fn decode_ccitt_image_caps_preceding_flate_inflation() {
+        let dict = lopdf::Dictionary::new();
+        let content = zlib_bytes(&vec![0u8; MAX_PDF_DECOMPRESSED_STREAM_BYTES + 1]);
+        let filters = vec!["FlateDecode".to_string(), "CCITTFaxDecode".to_string()];
+        let image = PdfImage {
+            id: (1, 0),
+            width: 1,
+            height: 1,
+            color_space: None,
+            filters: Some(filters.clone()),
+            bits_per_component: None,
+            content: &content,
+            origin_dict: &dict,
+        };
+
+        let err = decode_ccitt_image(&image, &filters).unwrap_err();
 
         assert!(err.to_string().contains("PDF image stream exceeds"));
     }
