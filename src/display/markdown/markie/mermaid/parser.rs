@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use super::types::*;
 
 #[derive(Debug, Clone)]
@@ -11,42 +9,63 @@ pub enum MermaidDiagram {
     ErDiagram(ErDiagram),
 }
 
-/// Parse a mermaid diagram from source text
+/// Parse a mermaid diagram from source text.
+///
+/// Unsupported diagram types and diagrams without any nodes are errors so the
+/// caller can show the source instead of an empty picture.
 pub fn parse_mermaid(input: &str) -> Result<MermaidDiagram, String> {
-    let input = input.trim();
-
-    // Detect diagram type from first line
+    let input = skip_preamble(input.trim());
     let first_line = input.lines().next().unwrap_or("");
+    let kind = first_line.split_whitespace().next().unwrap_or("");
 
-    if first_line.starts_with("flowchart")
-        || first_line.starts_with("graph")
-        || first_line.starts_with("flowchart ")
-        || first_line.starts_with("graph ")
-    {
-        let diagram =
-            parse_flowchart(input).map_err(|e| format!("Flowchart parse error: {}", e))?;
-        Ok(MermaidDiagram::Flowchart(diagram))
-    } else if first_line.starts_with("sequenceDiagram") || first_line.starts_with("sequence") {
-        let diagram = parse_sequence(input).map_err(|e| format!("Sequence parse error: {}", e))?;
-        Ok(MermaidDiagram::Sequence(diagram))
-    } else if first_line.starts_with("classDiagram") || first_line.starts_with("class") {
+    let diagram = if kind == "graph" || kind.starts_with("flowchart") {
+        MermaidDiagram::Flowchart(parse_flowchart(input))
+    } else if kind == "sequenceDiagram" {
+        MermaidDiagram::Sequence(parse_sequence(input))
+    } else if kind.starts_with("classDiagram") {
         let diagram = parse_class(input).map_err(|e| format!("Class parse error: {}", e))?;
-        Ok(MermaidDiagram::ClassDiagram(diagram))
-    } else if first_line.starts_with("stateDiagram") || first_line.starts_with("state") {
+        MermaidDiagram::ClassDiagram(diagram)
+    } else if kind.starts_with("stateDiagram") {
         let diagram = parse_state(input).map_err(|e| format!("State parse error: {}", e))?;
-        Ok(MermaidDiagram::StateDiagram(diagram))
-    } else if first_line.starts_with("erDiagram") || first_line.starts_with("er") {
-        let diagram = parse_er(input).map_err(|e| format!("ER parse error: {}", e))?;
-        Ok(MermaidDiagram::ErDiagram(diagram))
+        MermaidDiagram::StateDiagram(diagram)
+    } else if kind == "erDiagram" {
+        MermaidDiagram::ErDiagram(parse_er(input))
     } else {
-        let diagram_type = first_line.split_whitespace().next().unwrap_or(first_line);
-        eprintln!(
-            "Warning: unrecognized Mermaid diagram type '{}', attempting flowchart parse",
-            diagram_type
-        );
-        let diagram =
-            parse_flowchart(input).map_err(|e| format!("Flowchart parse error: {}", e))?;
-        Ok(MermaidDiagram::Flowchart(diagram))
+        return Err(format!("unsupported Mermaid diagram type: {kind}"));
+    };
+
+    if diagram.is_empty() {
+        return Err(format!("Mermaid {kind} diagram has nothing to draw"));
+    }
+    Ok(diagram)
+}
+
+/// Skip `%%` comment/directive lines and a `---` front-matter block before the
+/// diagram header; every parser expects the header on its first line.
+fn skip_preamble(mut input: &str) -> &str {
+    if let Some(rest) = input.strip_prefix("---")
+        && let Some(end) = rest.find("\n---")
+    {
+        input = rest[end + 4..].trim_start();
+    }
+    while input.starts_with("%%") {
+        input = input
+            .split_once('\n')
+            .map_or("", |(_, rest)| rest.trim_start());
+    }
+    input
+}
+
+impl MermaidDiagram {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Flowchart(fc) => fc.nodes.is_empty(),
+            Self::Sequence(seq) => seq.participants.is_empty(),
+            Self::ClassDiagram(cls) => cls.classes.is_empty(),
+            // The implicit start state is always present; it alone draws nothing useful.
+            Self::StateDiagram(st) => st.states.iter().all(|s| s.is_start),
+            Self::ErDiagram(er) => er.entities.is_empty(),
+        }
     }
 }
 
@@ -54,7 +73,7 @@ pub fn parse_mermaid(input: &str) -> Result<MermaidDiagram, String> {
 // FLOWCHART PARSER
 // ============================================
 
-fn parse_flowchart(input: &str) -> Result<Flowchart, String> {
+fn parse_flowchart(input: &str) -> Flowchart {
     let mut lines = input.lines().peekable();
 
     // Parse direction from first line
@@ -92,9 +111,7 @@ fn parse_flowchart(input: &str) -> Result<Flowchart, String> {
             } else {
                 raw_title.to_string()
             };
-            let id = format!("subgraph_{}", subgraphs.len());
             current_subgraph = Some(Subgraph {
-                id: id.clone(),
                 title,
                 nodes: Vec::new(),
             });
@@ -146,9 +163,8 @@ fn parse_flowchart(input: &str) -> Result<Flowchart, String> {
                 style: parsed.style,
                 arrow_head: parsed.arrow_head,
                 arrow_tail: parsed.arrow_tail,
-                min_length: 1,
             });
-        } else if let Some((id, label, shape)) = parse_node_definition(line) {
+        } else if let Some((id, label, shape)) = extract_shaped_node(line) {
             nodes.push(FlowchartNode {
                 id: id.clone(),
                 label: label.clone(),
@@ -163,12 +179,12 @@ fn parse_flowchart(input: &str) -> Result<Flowchart, String> {
         }
     }
 
-    Ok(Flowchart {
+    Flowchart {
         direction,
         nodes,
         edges,
         subgraphs,
-    })
+    }
 }
 
 fn parse_flow_direction(line: &str) -> FlowDirection {
@@ -336,22 +352,9 @@ fn parse_edge_line(line: &str) -> Option<ParsedEdgeLine> {
 fn extract_node_id(part: &str) -> Option<String> {
     let part = part.trim();
 
-    // Handle shaped nodes like A[Label], A(Label), A{Label}, etc.
-    // Check multi-char patterns first, then single chars
-    let multi_char_patterns = ["[[", "((", "[/", "[\\"];
-    for pattern in &multi_char_patterns {
-        if part.contains(pattern) {
-            let pos = part.find(pattern)?;
-            return Some(part[..pos].trim().to_string());
-        }
-    }
-
-    let single_char_patterns = ['[', '(', '{', '<'];
-    for bracket in &single_char_patterns {
-        if part.contains(*bracket) {
-            let pos = part.find(*bracket)?;
-            return Some(part[..pos].trim().to_string());
-        }
+    // An unterminated shape like `A[Label` still names node `A`.
+    if let Some(pos) = part.find(['[', '(', '{', '<']) {
+        return Some(part[..pos].trim().to_string());
     }
 
     // Simple node id - alphanumeric and underscores
@@ -365,9 +368,20 @@ fn extract_node_id(part: &str) -> Option<String> {
 
 /// Extract node ID, label, and shape from a part of an edge definition
 fn extract_node_info(part: &str) -> Option<(String, String, NodeShape)> {
+    if let Some(shaped) = extract_shaped_node(part) {
+        return Some(shaped);
+    }
+
+    // Simple node - just an ID
+    let id = extract_node_id(part)?;
+    Some((id.clone(), id, NodeShape::RoundedRect))
+}
+
+/// Parse a node written with an explicit shape, such as `id[Label]` or `id{Label}`.
+fn extract_shaped_node(part: &str) -> Option<(String, String, NodeShape)> {
     let part = part.trim();
 
-    // Check for shaped node definitions inline
+    // Order matters: check longer patterns first
     let patterns: &[(&str, &str, NodeShape)] = &[
         ("(((", ")))", NodeShape::DoubleCircle),
         ("[[", "]]", NodeShape::Subroutine),
@@ -389,46 +403,6 @@ fn extract_node_info(part: &str) -> Option<(String, String, NodeShape)> {
             let after_open = &part[pos + open.len()..];
             if let Some(end_pos) = after_open.find(close) {
                 let id = part[..pos].trim().to_string();
-                let label = normalize_flowchart_label(&after_open[..end_pos]);
-
-                if !id.is_empty() {
-                    return Some((id, label, shape.clone()));
-                }
-            }
-        }
-    }
-
-    // Simple node - just an ID
-    let id = extract_node_id(part)?;
-    Some((id.clone(), id, NodeShape::RoundedRect))
-}
-
-fn parse_node_definition(line: &str) -> Option<(String, String, NodeShape)> {
-    let line = line.trim();
-
-    // Patterns: id[Label], id(Label), id{Label}, etc.
-    // Order matters: check longer patterns first
-    let patterns: &[(&str, &str, NodeShape)] = &[
-        ("(((", ")))", NodeShape::DoubleCircle),
-        ("[[", "]]", NodeShape::Subroutine),
-        ("((", "))", NodeShape::Circle),
-        ("[(", ")]", NodeShape::Cylinder),
-        ("([", "])", NodeShape::Stadium),
-        ("[/", "/]", NodeShape::Parallelogram),
-        ("[\\", "\\]", NodeShape::ParallelogramAlt),
-        ("[/", "\\]", NodeShape::Trapezoid),
-        ("[\\", "/]", NodeShape::TrapezoidAlt),
-        ("{{", "}}", NodeShape::Hexagon),
-        ("[", "]", NodeShape::Rect),
-        ("(", ")", NodeShape::RoundedRect),
-        ("{", "}", NodeShape::Rhombus),
-    ];
-
-    for (open, close, shape) in patterns {
-        if let Some(pos) = line.find(open) {
-            let after_open = &line[pos + open.len()..];
-            if let Some(end_pos) = after_open.find(close) {
-                let id = line[..pos].trim().to_string();
                 let label = normalize_flowchart_label(&after_open[..end_pos]);
 
                 if !id.is_empty() {
@@ -465,7 +439,7 @@ fn normalize_flowchart_label(raw: &str) -> String {
 // SEQUENCE DIAGRAM PARSER
 // ============================================
 
-fn parse_sequence(input: &str) -> Result<SequenceDiagram, String> {
+fn parse_sequence(input: &str) -> SequenceDiagram {
     let lines: Vec<String> = input
         .lines()
         .skip(1)
@@ -474,49 +448,52 @@ fn parse_sequence(input: &str) -> Result<SequenceDiagram, String> {
         .map(str::to_string)
         .collect();
 
+    // Mermaid orders participants by first appearance, whether declared with
+    // `participant`/`actor` or implied by a message endpoint.
     let mut participants: Vec<Participant> = Vec::new();
     for line in &lines {
-        // Participant declaration
-        if line.starts_with("participant ") {
-            let rest = line.strip_prefix("participant ").unwrap_or("");
-            // Mermaid syntax: participant A as "Display Name" or participant A
-            // The ID comes first, then optional "as Alias"
-            let parts: Vec<&str> = rest.splitn(2, " as ").collect();
-            if parts.len() == 2 {
-                participants.push(Participant {
-                    id: parts[0].trim().to_string(),
-                    alias: Some(parts[1].trim().to_string()),
-                });
-            } else {
-                participants.push(Participant {
-                    id: rest.trim().to_string(),
-                    alias: None,
-                });
+        let declaration = line
+            .strip_prefix("participant ")
+            .or_else(|| line.strip_prefix("actor "));
+        if let Some(rest) = declaration {
+            let (id, alias) = match rest.split_once(" as ") {
+                Some((id, alias)) => (id.trim(), Some(alias.trim().to_string())),
+                None => (rest.trim(), None),
+            };
+            match participants.iter_mut().find(|p| p.id == id) {
+                Some(existing) => existing.alias = alias.or(existing.alias.take()),
+                None => participants.push(Participant {
+                    id: id.to_string(),
+                    alias,
+                }),
             }
-            continue;
+        } else if parse_sequence_note(line).is_none()
+            && let Some((msg, _)) = parse_sequence_message(line)
+        {
+            for id in [msg.from, msg.to] {
+                if !participants.iter().any(|p| p.id == id) {
+                    participants.push(Participant { id, alias: None });
+                }
+            }
         }
     }
 
     let mut index = 0;
-    let elements = parse_sequence_elements(&lines, &mut index, true);
+    let elements = parse_sequence_elements(&lines, &mut index);
 
-    Ok(SequenceDiagram {
+    SequenceDiagram {
         participants,
         elements,
-    })
+    }
 }
 
-fn parse_sequence_elements(
-    lines: &[String],
-    index: &mut usize,
-    allow_break_tokens: bool,
-) -> Vec<SequenceElement> {
+fn parse_sequence_elements(lines: &[String], index: &mut usize) -> Vec<SequenceElement> {
     let mut elements = Vec::new();
 
     while *index < lines.len() {
         let line = lines[*index].trim();
 
-        if allow_break_tokens && (line == "end" || line == "else" || line.starts_with("else ")) {
+        if line == "end" || line == "else" || line.starts_with("else ") {
             break;
         }
 
@@ -525,14 +502,16 @@ fn parse_sequence_elements(
             continue;
         }
 
-        if let Some(msg) = parse_sequence_message(line) {
-            elements.push(SequenceElement::Message(msg));
+        // Notes first: their text may contain arrows such as `a->b`.
+        if let Some(note) = parse_sequence_note(line) {
+            elements.push(note);
             *index += 1;
             continue;
         }
 
-        if let Some(note) = parse_sequence_note(line) {
-            elements.push(note);
+        if let Some((msg, activation)) = parse_sequence_message(line) {
+            elements.push(SequenceElement::Message(msg));
+            elements.extend(activation);
             *index += 1;
             continue;
         }
@@ -546,7 +525,7 @@ fn parse_sequence_elements(
             };
 
             *index += 1;
-            let messages = parse_sequence_elements(lines, index, true);
+            let messages = parse_sequence_elements(lines, index);
 
             let mut else_branches = Vec::new();
             while *index < lines.len() {
@@ -558,7 +537,7 @@ fn parse_sequence_elements(
                         .unwrap_or("")
                         .to_string();
                     *index += 1;
-                    let branch_messages = parse_sequence_elements(lines, index, true);
+                    let branch_messages = parse_sequence_elements(lines, index);
                     else_branches.push((branch_label, branch_messages));
                 } else {
                     break;
@@ -648,17 +627,19 @@ fn parse_sequence_note(line: &str) -> Option<SequenceElement> {
     })
 }
 
-fn parse_sequence_message(line: &str) -> Option<SequenceMessage> {
+/// Parse `From->>To: Label`, plus the activation change that a `+`/`-` prefix on
+/// the receiver requests (`+` activates the receiver, `-` deactivates the sender).
+fn parse_sequence_message(line: &str) -> Option<(SequenceMessage, Option<SequenceElement>)> {
     // Order matters: longer patterns first to avoid partial matches
     let patterns = [
         ("-->>", MessageType::Dotted, MessageKind::Reply),
         ("->>", MessageType::Solid, MessageKind::Sync),
-        (">>+", MessageType::Solid, MessageKind::Async),
-        (">>-", MessageType::Solid, MessageKind::Async),
+        ("--x", MessageType::Dotted, MessageKind::Sync),
+        ("--)", MessageType::Dotted, MessageKind::Async),
         ("-->", MessageType::Dotted, MessageKind::Sync),
         ("->", MessageType::Solid, MessageKind::Sync),
         ("-x", MessageType::Solid, MessageKind::Sync),
-        ("-)", MessageType::Solid, MessageKind::Sync),
+        ("-)", MessageType::Solid, MessageKind::Async),
     ];
 
     for (pattern, msg_type, kind) in &patterns {
@@ -667,21 +648,34 @@ fn parse_sequence_message(line: &str) -> Option<SequenceMessage> {
             let rest = &line[pos + pattern.len()..];
 
             // Parse "To: Label" or just "To"
-            let (to, label) = if let Some(colon_pos) = rest.find(':') {
-                let to_part = rest[..colon_pos].trim().to_string();
-                let label_part = rest[colon_pos + 1..].trim().to_string();
-                (to_part, Some(label_part))
-            } else {
-                (rest.trim().to_string(), None)
+            let (to, label) = match rest.split_once(':') {
+                Some((to, label)) => (to.trim(), label.trim().to_string()),
+                None => (rest.trim(), String::new()),
             };
 
-            return Some(SequenceMessage {
+            let (to, activation) = if let Some(to) = to.strip_prefix('+') {
+                let to = to.trim().to_string();
+                let activation = SequenceElement::Activation(Activation {
+                    participant: to.clone(),
+                });
+                (to, Some(activation))
+            } else if let Some(to) = to.strip_prefix('-') {
+                let deactivation = SequenceElement::Deactivation(Activation {
+                    participant: from.clone(),
+                });
+                (to.trim().to_string(), Some(deactivation))
+            } else {
+                (to.to_string(), None)
+            };
+
+            let message = SequenceMessage {
                 from,
                 to,
-                label: label.unwrap_or_default(),
+                label,
                 msg_type: msg_type.clone(),
                 kind: kind.clone(),
-            });
+            };
+            return Some((message, activation));
         }
     }
 
@@ -731,24 +725,10 @@ fn parse_class(input: &str) -> Result<ClassDiagram, String> {
             };
 
             // Check if it's a one-liner or has body
-            if name.ends_with('{') {
-                current_class = Some(ClassDefinition {
-                    name: name.trim_end_matches('{').trim().to_string(),
-                    stereotype,
-                    attributes: Vec::new(),
-                    methods: Vec::new(),
-                    is_abstract: false,
-                    is_interface: false,
-                });
+            if let Some(name) = name.strip_suffix('{') {
+                current_class = Some(empty_class(name.trim().to_string(), stereotype));
             } else {
-                classes.push(ClassDefinition {
-                    name,
-                    stereotype,
-                    attributes: Vec::new(),
-                    methods: Vec::new(),
-                    is_abstract: false,
-                    is_interface: false,
-                });
+                classes.push(empty_class(name, stereotype));
             }
             continue;
         }
@@ -770,28 +750,16 @@ fn parse_class(input: &str) -> Result<ClassDiagram, String> {
             }
 
             // Attribute or method
-            if line.starts_with('+')
-                || line.starts_with('-')
-                || line.starts_with('#')
-                || line.starts_with('~')
-            {
-                let vis = match line.chars().next() {
-                    Some('+') => Visibility::Public,
-                    Some('-') => Visibility::Private,
-                    Some('#') => Visibility::Protected,
-                    Some('~') => Visibility::Package,
-                    _ => Visibility::Public,
-                };
-
-                let member = &line[1..].trim();
+            if let Some(vis) = line.chars().next().and_then(Visibility::from_symbol) {
+                let member = line[1..].trim();
 
                 // Check if method (has parentheses)
                 if member.contains('(') {
                     if let Some(method) = parse_class_method(vis, member) {
                         cls.methods.push(method);
                     }
-                } else if let Some(attr) = parse_class_attribute(vis, member) {
-                    cls.attributes.push(attr);
+                } else {
+                    cls.attributes.push(parse_class_attribute(vis, member));
                 }
             }
             continue;
@@ -803,23 +771,42 @@ fn parse_class(input: &str) -> Result<ClassDiagram, String> {
         }
     }
 
+    // Relations may name classes that are never declared with `class`.
+    for rel in &relations {
+        for name in [&rel.from, &rel.to] {
+            if !classes.iter().any(|c| &c.name == name) {
+                classes.push(empty_class(name.clone(), None));
+            }
+        }
+    }
+
     Ok(ClassDiagram { classes, relations })
 }
 
-fn parse_class_attribute(vis: Visibility, member: &str) -> Option<ClassAttribute> {
-    let parts: Vec<&str> = member.splitn(2, ':').collect();
-    let name = parts[0].trim();
-    let type_ann = parts.get(1).map(|s| s.trim().to_string());
+fn empty_class(name: String, stereotype: Option<String>) -> ClassDefinition {
+    ClassDefinition {
+        name,
+        stereotype,
+        attributes: Vec::new(),
+        methods: Vec::new(),
+        is_abstract: false,
+        is_interface: false,
+    }
+}
 
-    Some(ClassAttribute {
+fn parse_class_attribute(vis: Visibility, member: &str) -> ClassAttribute {
+    let (name, type_annotation) = match member.split_once(':') {
+        Some((name, ty)) => (name, Some(ty.trim().to_string())),
+        None => (member, None),
+    };
+
+    ClassAttribute {
         member: ClassMember {
             visibility: vis,
-            name: name.to_string(),
-            is_static: false,
-            is_abstract: false,
+            name: name.trim().to_string(),
         },
-        type_annotation: type_ann,
-    })
+        type_annotation,
+    }
 }
 
 fn parse_class_method(vis: Visibility, member: &str) -> Option<ClassMethod> {
@@ -843,16 +830,9 @@ fn parse_class_method(vis: Visibility, member: &str) -> Option<ClassMethod> {
     } else {
         params_str
             .split(',')
-            .filter_map(|p| {
-                let parts: Vec<&str> = p.trim().splitn(2, ':').collect();
-                if parts.is_empty() {
-                    None
-                } else {
-                    Some((
-                        parts[0].trim().to_string(),
-                        parts.get(1).map(|s| s.trim().to_string()),
-                    ))
-                }
+            .map(|p| match p.split_once(':') {
+                Some((name, ty)) => (name.trim().to_string(), Some(ty.trim().to_string())),
+                None => (p.trim().to_string(), None),
             })
             .collect()
     };
@@ -861,8 +841,6 @@ fn parse_class_method(vis: Visibility, member: &str) -> Option<ClassMethod> {
         member: ClassMember {
             visibility: vis,
             name: name.to_string(),
-            is_static: false,
-            is_abstract: false,
         },
         parameters,
         return_type,
@@ -900,8 +878,6 @@ fn parse_class_relation(line: &str) -> Option<ClassRelation> {
                 to,
                 relation_type: rel_type.clone(),
                 label,
-                multiplicity_from: None,
-                multiplicity_to: None,
             });
         }
     }
@@ -956,10 +932,10 @@ fn parse_state(input: &str) -> Result<StateDiagram, String> {
 
             let (id, label, is_composite) =
                 parse_state_definition(rest).map_err(|e| format!("line {}: {}", line_num, e))?;
-            let state = ensure_state(&mut states, &id, &label, false, false, is_composite);
+            ensure_state(&mut states, &id, &label, false, false, is_composite);
 
-            if let Some(parent_id) = composite_stack.last().cloned() {
-                add_state_child_state(&mut states, &parent_id, &state);
+            if let Some(parent_id) = composite_stack.last() {
+                add_state_child_state(&mut states, parent_id, &id);
             }
 
             if is_composite {
@@ -975,10 +951,7 @@ fn parse_state(input: &str) -> Result<StateDiagram, String> {
                 let from = line[..pos].trim().to_string();
                 let rest = &line[pos + arrow.len()..];
 
-                let (to, label) = if rest.contains(':') {
-                    let colon_pos = rest.find(':').ok_or_else(|| {
-                        format!("line {}: expected ':' separator in transition", line_num)
-                    })?;
+                let (to, label) = if let Some(colon_pos) = rest.find(':') {
                     (
                         rest[..colon_pos].trim().to_string(),
                         Some(rest[colon_pos + 1..].trim().to_string()),
@@ -1004,31 +977,28 @@ fn parse_state(input: &str) -> Result<StateDiagram, String> {
                 }
 
                 // Add states from transition if not already present
-                let from_state = if from != "[*]" {
-                    Some(ensure_state(
+                if from != "[*]" {
+                    ensure_state(
                         &mut states,
                         &normalized_from,
                         &normalized_from,
                         false,
                         false,
                         false,
-                    ))
+                    );
                 } else {
                     ensure_state(&mut states, START_STATE_ID, "[*]", true, false, false);
-                    None
-                };
-                let to_state = if to != "[*]" {
-                    Some(ensure_state(
+                }
+                if to != "[*]" {
+                    ensure_state(
                         &mut states,
                         &normalized_to,
                         &normalized_to,
                         false,
                         false,
                         false,
-                    ))
-                } else {
-                    None
-                };
+                    );
+                }
 
                 let transition = StateTransition {
                     from: normalized_from,
@@ -1036,14 +1006,14 @@ fn parse_state(input: &str) -> Result<StateDiagram, String> {
                     label,
                 };
 
-                if let Some(parent_id) = composite_stack.last().cloned() {
-                    if let Some(state) = from_state.as_ref() {
-                        add_state_child_state(&mut states, &parent_id, state);
+                if let Some(parent_id) = composite_stack.last() {
+                    if from != "[*]" {
+                        add_state_child_state(&mut states, parent_id, &transition.from);
                     }
-                    if let Some(state) = to_state.as_ref() {
-                        add_state_child_state(&mut states, &parent_id, state);
+                    if to != "[*]" {
+                        add_state_child_state(&mut states, parent_id, &transition.to);
                     }
-                    add_state_child_transition(&mut states, &parent_id, &transition);
+                    add_state_child_transition(&mut states, parent_id, &transition);
                 }
 
                 if composite_stack.is_empty() {
@@ -1051,34 +1021,6 @@ fn parse_state(input: &str) -> Result<StateDiagram, String> {
                 }
             }
         }
-    }
-
-    // Sync composite state data into parent children entries.
-    // During parsing, children are added as clones before the composite's own children
-    // are parsed, so the child-of-parent copy may be stale.  Walk every parent and
-    // update its child entries from the authoritative top-level state.
-    let state_index: HashMap<String, usize> = states
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.id.clone(), i))
-        .collect();
-    // Collect (parent_idx, child_pos, source_idx) tuples first to avoid borrow issues.
-    let mut patches: Vec<(usize, usize, usize)> = Vec::new();
-    for (pi, parent) in states.iter().enumerate() {
-        for (ci, child_elem) in parent.children.iter().enumerate() {
-            if let StateElement::State(child_state) = child_elem
-                && let Some(&si) = state_index.get(&child_state.id)
-                && si != pi
-                && states[si].is_composite
-                && !child_state.is_composite
-            {
-                patches.push((pi, ci, si));
-            }
-        }
-    }
-    for (pi, ci, si) in patches {
-        let fresh = states[si].clone();
-        states[pi].children[ci] = StateElement::State(fresh);
     }
 
     Ok(StateDiagram {
@@ -1109,10 +1051,7 @@ fn parse_state_definition(rest: &str) -> Result<(String, String, bool), String> 
         return Ok((id.to_string(), label.to_string(), is_composite));
     }
 
-    if value.contains('"') {
-        let label_start = value
-            .find('"')
-            .ok_or("Missing opening quote in state label")?;
+    if let Some(label_start) = value.find('"') {
         let label_end = value[label_start + 1..]
             .find('"')
             .ok_or("Missing closing quote in state label")?
@@ -1156,7 +1095,7 @@ fn ensure_state(
     is_start: bool,
     is_end: bool,
     is_composite: bool,
-) -> State {
+) {
     if let Some(state) = states.iter_mut().find(|state| state.id == id) {
         if !label.is_empty() {
             state.label = label.to_string();
@@ -1164,10 +1103,10 @@ fn ensure_state(
         state.is_start |= is_start;
         state.is_end |= is_end;
         state.is_composite |= is_composite;
-        return state.clone();
+        return;
     }
 
-    let state = State {
+    states.push(State {
         id: id.to_string(),
         label: if label.is_empty() {
             id.to_string()
@@ -1178,26 +1117,33 @@ fn ensure_state(
         is_end,
         is_composite,
         children: Vec::new(),
-    };
-    states.push(state.clone());
-    state
+    });
 }
 
-fn add_state_child_state(states: &mut [State], parent_id: &str, child: &State) {
-    if parent_id == child.id {
+fn add_state_child_state(states: &mut [State], parent_id: &str, child_id: &str) {
+    // Nesting a state inside its own descendant would make layout recurse forever.
+    if parent_id == child_id || is_descendant(states, child_id, parent_id) {
         return;
     }
 
     if let Some(parent) = states.iter_mut().find(|state| state.id == parent_id) {
         parent.is_composite = true;
-        let has_child = parent
-            .children
-            .iter()
-            .any(|element| matches!(element, StateElement::State(state) if state.id == child.id));
-        if !has_child {
-            parent.children.push(StateElement::State(child.clone()));
+        if !parent.child_state_ids().any(|id| id == child_id) {
+            parent
+                .children
+                .push(StateElement::State(child_id.to_string()));
         }
     }
+}
+
+/// Whether `id` is nested, at any depth, inside `ancestor_id`.
+fn is_descendant(states: &[State], ancestor_id: &str, id: &str) -> bool {
+    let Some(ancestor) = states.iter().find(|state| state.id == ancestor_id) else {
+        return false;
+    };
+    ancestor
+        .child_state_ids()
+        .any(|child| child == id || is_descendant(states, child, id))
 }
 
 fn add_state_child_transition(states: &mut [State], parent_id: &str, transition: &StateTransition) {
@@ -1221,50 +1167,25 @@ fn add_state_child_transition(states: &mut [State], parent_id: &str, transition:
 }
 
 fn add_state_note(states: &mut Vec<State>, state_id: &str, text: String) {
-    let state = ensure_state(states, state_id, state_id, false, false, false);
-    if let Some(target_state) = states.iter_mut().find(|s| s.id == state.id) {
-        let has_note = target_state.children.iter().any(|element| {
-            matches!(
-                element,
-                StateElement::Note {
-                    state,
-                    text: existing_text,
-                } if state == state_id && existing_text == &text
-            )
+    ensure_state(states, state_id, state_id, false, false, false);
+    let target_state = states
+        .iter_mut()
+        .find(|s| s.id == state_id)
+        .expect("ensure_state just added the state");
+    let has_note = target_state.children.iter().any(|element| {
+        matches!(
+            element,
+            StateElement::Note {
+                state,
+                text: existing_text,
+            } if state == state_id && existing_text == &text
+        )
+    });
+    if !has_note {
+        target_state.children.push(StateElement::Note {
+            state: state_id.to_string(),
+            text,
         });
-        if !has_note {
-            target_state.children.push(StateElement::Note {
-                state: state_id.to_string(),
-                text: text.clone(),
-            });
-        }
-    }
-
-    for parent in states.iter_mut() {
-        let contains_state = parent
-            .children
-            .iter()
-            .any(|element| matches!(element, StateElement::State(s) if s.id == state_id));
-        if !contains_state {
-            continue;
-        }
-
-        let has_note = parent.children.iter().any(|element| {
-            matches!(
-                element,
-                StateElement::Note {
-                    state,
-                    text: existing_text,
-                } if state == state_id && existing_text == &text
-            )
-        });
-
-        if !has_note {
-            parent.children.push(StateElement::Note {
-                state: state_id.to_string(),
-                text: text.clone(),
-            });
-        }
     }
 }
 
@@ -1272,7 +1193,7 @@ fn add_state_note(states: &mut Vec<State>, state_id: &str, text: String) {
 // ER DIAGRAM PARSER
 // ============================================
 
-fn parse_er(input: &str) -> Result<ErDiagram, String> {
+fn parse_er(input: &str) -> ErDiagram {
     let mut lines = input.lines().skip(1); // Skip "erDiagram"
 
     let mut entities: Vec<ErEntity> = Vec::new();
@@ -1315,7 +1236,6 @@ fn parse_er(input: &str) -> Result<ErDiagram, String> {
                 current_attributes.push(ErAttribute {
                     name: name.to_string(),
                     is_key,
-                    is_composite: false,
                 });
                 continue;
             }
@@ -1379,415 +1299,309 @@ fn parse_er(input: &str) -> Result<ErDiagram, String> {
     }
     entities.extend(new_entities);
 
-    Ok(ErDiagram {
+    ErDiagram {
         entities,
         relationships,
-    })
+    }
 }
 
 fn parse_er_relationship(line: &str) -> Option<ErRelationship> {
-    let patterns = [
-        // Solid line patterns (--)
-        (
-            "||--||",
-            ErCardinality::ExactlyOne,
-            ErCardinality::ExactlyOne,
-        ),
-        (
-            "||--o{",
-            ErCardinality::ExactlyOne,
-            ErCardinality::ZeroOrMore,
-        ),
-        (
-            "||--|{",
-            ErCardinality::ExactlyOne,
-            ErCardinality::OneOrMore,
-        ),
-        (
-            "}o--o{",
-            ErCardinality::ZeroOrMore,
-            ErCardinality::ZeroOrMore,
-        ),
-        (
-            "}o--||",
-            ErCardinality::ZeroOrMore,
-            ErCardinality::ExactlyOne,
-        ),
-        (
-            "}o--|{",
-            ErCardinality::ZeroOrMore,
-            ErCardinality::OneOrMore,
-        ),
-        (
-            "|o--o{",
-            ErCardinality::ZeroOrOne,
-            ErCardinality::ZeroOrMore,
-        ),
-        (
-            "|o--||",
-            ErCardinality::ZeroOrOne,
-            ErCardinality::ExactlyOne,
-        ),
-        ("|o--|{", ErCardinality::ZeroOrOne, ErCardinality::OneOrMore),
-        // Dotted line patterns (..)
-        (
-            "||..||",
-            ErCardinality::ExactlyOne,
-            ErCardinality::ExactlyOne,
-        ),
-        (
-            "||..o{",
-            ErCardinality::ExactlyOne,
-            ErCardinality::ZeroOrMore,
-        ),
-        (
-            "||..|{",
-            ErCardinality::ExactlyOne,
-            ErCardinality::OneOrMore,
-        ),
-        (
-            "}o..o{",
-            ErCardinality::ZeroOrMore,
-            ErCardinality::ZeroOrMore,
-        ),
-        (
-            "}o..||",
-            ErCardinality::ZeroOrMore,
-            ErCardinality::ExactlyOne,
-        ),
-        (
-            "}o..|{",
-            ErCardinality::ZeroOrMore,
-            ErCardinality::OneOrMore,
-        ),
-        (
-            "|o..o{",
-            ErCardinality::ZeroOrOne,
-            ErCardinality::ZeroOrMore,
-        ),
-        (
-            "|o..||",
-            ErCardinality::ZeroOrOne,
-            ErCardinality::ExactlyOne,
-        ),
-        ("|o..|{", ErCardinality::ZeroOrOne, ErCardinality::OneOrMore),
-        // }| patterns (OneOrMore from-side) - solid
-        (
-            "}|--||",
-            ErCardinality::OneOrMore,
-            ErCardinality::ExactlyOne,
-        ),
-        (
-            "}|--o{",
-            ErCardinality::OneOrMore,
-            ErCardinality::ZeroOrMore,
-        ),
-        ("}|--|{", ErCardinality::OneOrMore, ErCardinality::OneOrMore),
-        // }| patterns (OneOrMore from-side) - dotted
-        (
-            "}|..||",
-            ErCardinality::OneOrMore,
-            ErCardinality::ExactlyOne,
-        ),
-        (
-            "}|..o{",
-            ErCardinality::OneOrMore,
-            ErCardinality::ZeroOrMore,
-        ),
-        ("}|..|{", ErCardinality::OneOrMore, ErCardinality::OneOrMore),
-    ];
+    // A relationship is `<left cardinality><-- or ..><right cardinality>`, e.g. `||--o{`.
+    let (pos, from_cardinality, to_cardinality) = line
+        .match_indices("--")
+        .chain(line.match_indices(".."))
+        .find_map(|(pos, _)| {
+            let left = er_cardinality(line.get(pos.checked_sub(2)?..pos)?)?;
+            let right = er_cardinality(line.get(pos + 2..pos + 4)?)?;
+            Some((pos, left, right))
+        })?;
 
-    for (pattern, from_card, to_card) in &patterns {
-        if let Some(pos) = line.find(pattern) {
-            let from = line[..pos].trim().to_string();
-            let rest = line[pos + pattern.len()..].trim();
+    let from = line[..pos - 2].trim().to_string();
+    let rest = line[pos + 4..].trim();
 
-            let (to, label) = if let Some((to_part, label_part)) = rest.split_once(':') {
-                let to = to_part.trim().to_string();
-                let label = label_part.trim().trim_matches('"').trim().to_string();
-                let label = if label.is_empty() { None } else { Some(label) };
-                (to, label)
-            } else if let Some(stripped) = rest.strip_prefix('"') {
-                let end = stripped.find('"')?;
-                (stripped[..end].to_string(), None)
-            } else {
-                (rest.trim().to_string(), None)
-            };
+    let (to, label) = if let Some((to_part, label_part)) = rest.split_once(':') {
+        let to = to_part.trim().to_string();
+        let label = label_part.trim().trim_matches('"').trim().to_string();
+        let label = if label.is_empty() { None } else { Some(label) };
+        (to, label)
+    } else if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        (stripped[..end].to_string(), None)
+    } else {
+        (rest.to_string(), None)
+    };
 
-            return Some(ErRelationship {
-                from,
-                to,
-                from_cardinality: from_card.clone(),
-                to_cardinality: to_card.clone(),
-                label,
-            });
-        }
+    Some(ErRelationship {
+        from,
+        to,
+        from_cardinality,
+        to_cardinality,
+        label,
+    })
+}
+
+/// Crow's-foot markers; like Mermaid's lexer, either orientation is accepted on both sides.
+fn er_cardinality(marker: &str) -> Option<ErCardinality> {
+    match marker {
+        "||" => Some(ErCardinality::ExactlyOne),
+        "|o" | "o|" => Some(ErCardinality::ZeroOrOne),
+        "}o" | "o{" => Some(ErCardinality::ZeroOrMore),
+        "}|" | "|{" => Some(ErCardinality::OneOrMore),
+        _ => None,
     }
-
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn flowchart(src: &str) -> Flowchart {
+        match parse_mermaid(src).unwrap() {
+            MermaidDiagram::Flowchart(fc) => fc,
+            other => panic!("expected flowchart, got {other:?}"),
+        }
+    }
+
+    fn sequence(src: &str) -> SequenceDiagram {
+        match parse_mermaid(src).unwrap() {
+            MermaidDiagram::Sequence(seq) => seq,
+            other => panic!("expected sequence diagram, got {other:?}"),
+        }
+    }
+
+    fn class(src: &str) -> ClassDiagram {
+        match parse_mermaid(src).unwrap() {
+            MermaidDiagram::ClassDiagram(cls) => cls,
+            other => panic!("expected class diagram, got {other:?}"),
+        }
+    }
+
+    fn state(src: &str) -> StateDiagram {
+        match parse_mermaid(src).unwrap() {
+            MermaidDiagram::StateDiagram(st) => st,
+            other => panic!("expected state diagram, got {other:?}"),
+        }
+    }
+
+    fn er(src: &str) -> ErDiagram {
+        match parse_mermaid(src).unwrap() {
+            MermaidDiagram::ErDiagram(er) => er,
+            other => panic!("expected ER diagram, got {other:?}"),
+        }
+    }
+
+    fn edge<'a>(fc: &'a Flowchart, from: &str, to: &str) -> &'a FlowchartEdge {
+        fc.edges
+            .iter()
+            .find(|e| e.from == from && e.to == to)
+            .unwrap_or_else(|| panic!("missing edge {from} -> {to}"))
+    }
+
+    fn messages(elements: &[SequenceElement]) -> Vec<&SequenceMessage> {
+        elements
+            .iter()
+            .filter_map(|e| match e {
+                SequenceElement::Message(m) => Some(m),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn participant_ids(seq: &SequenceDiagram) -> Vec<&str> {
+        seq.participants.iter().map(|p| p.id.as_str()).collect()
+    }
+
     #[test]
     fn test_parse_simple_flowchart() {
-        let input = r#"
-flowchart TD
-    A --> B
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Flowchart(fc) = result {
-            assert_eq!(fc.nodes.len(), 2);
-            assert_eq!(fc.edges.len(), 1);
-            assert_eq!(fc.nodes[0].id, "A");
-            assert_eq!(fc.nodes[0].label, "A");
-            assert_eq!(fc.nodes[1].id, "B");
-            assert_eq!(fc.edges[0].from, "A");
-            assert_eq!(fc.edges[0].to, "B");
-        } else {
-            panic!("Expected flowchart");
-        }
+        let fc = flowchart("\nflowchart TD\n    A --> B\n");
+        assert_eq!(fc.nodes.len(), 2);
+        assert_eq!(fc.edges.len(), 1);
+        assert_eq!(fc.nodes[0].id, "A");
+        assert_eq!(fc.nodes[0].label, "A");
+        assert_eq!(fc.nodes[1].id, "B");
+        assert_eq!(fc.edges[0].from, "A");
+        assert_eq!(fc.edges[0].to, "B");
     }
 
     #[test]
     fn test_parse_flowchart_with_labels() {
-        let input = r#"
+        let fc = flowchart(
+            r#"
 flowchart TD
     A[Start] --> B{Decision?}
     B -->|Yes| C[Continue]
     B -->|No| D[Stop]
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Flowchart(fc) = result {
-            assert_eq!(fc.nodes.len(), 4);
+"#,
+        );
+        assert_eq!(fc.nodes.len(), 4);
 
-            // Check node A
-            let node_a = fc.nodes.iter().find(|n| n.id == "A").unwrap();
-            assert_eq!(node_a.label, "Start", "Node A should have label 'Start'");
-            assert_eq!(node_a.shape, NodeShape::Rect);
+        let node = |id: &str| fc.nodes.iter().find(|n| n.id == id).unwrap();
+        assert_eq!(node("A").label, "Start");
+        assert_eq!(node("A").shape, NodeShape::Rect);
+        assert_eq!(node("B").label, "Decision?");
+        assert_eq!(node("B").shape, NodeShape::Rhombus);
+        assert_eq!(node("C").label, "Continue");
+        assert_eq!(node("D").label, "Stop");
 
-            // Check node B (decision diamond)
-            let node_b = fc.nodes.iter().find(|n| n.id == "B").unwrap();
-            assert_eq!(
-                node_b.label, "Decision?",
-                "Node B should have label 'Decision?'"
-            );
-            assert_eq!(node_b.shape, NodeShape::Rhombus);
-
-            // Check node C
-            let node_c = fc.nodes.iter().find(|n| n.id == "C").unwrap();
-            assert_eq!(
-                node_c.label, "Continue",
-                "Node C should have label 'Continue'"
-            );
-
-            // Check node D
-            let node_d = fc.nodes.iter().find(|n| n.id == "D").unwrap();
-            assert_eq!(node_d.label, "Stop", "Node D should have label 'Stop'");
-
-            // Check edge labels
-            let edge_bc = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "B" && e.to == "C")
-                .unwrap();
-            assert_eq!(edge_bc.label, Some("Yes".to_string()));
-
-            let edge_bd = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "B" && e.to == "D")
-                .unwrap();
-            assert_eq!(edge_bd.label, Some("No".to_string()));
-        } else {
-            panic!("Expected flowchart");
-        }
+        assert_eq!(edge(&fc, "B", "C").label.as_deref(), Some("Yes"));
+        assert_eq!(edge(&fc, "B", "D").label.as_deref(), Some("No"));
     }
 
     #[test]
     fn test_parse_flowchart_shapes() {
-        let input = r#"
+        let fc = flowchart(
+            r#"
 flowchart LR
     A([Stadium]) --> B[[Subroutine]]
     B --> C[(Database)]
     C --> D((Circle))
     D --> E{Diamond}
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Flowchart(fc) = result {
-            assert_eq!(fc.nodes.len(), 5);
-
-            let node_a = fc.nodes.iter().find(|n| n.id == "A").unwrap();
-            assert_eq!(node_a.label, "Stadium");
-            assert_eq!(node_a.shape, NodeShape::Stadium);
-
-            let node_b = fc.nodes.iter().find(|n| n.id == "B").unwrap();
-            assert_eq!(node_b.label, "Subroutine");
-            assert_eq!(node_b.shape, NodeShape::Subroutine);
-
-            let node_c = fc.nodes.iter().find(|n| n.id == "C").unwrap();
-            assert_eq!(node_c.label, "Database");
-            assert_eq!(node_c.shape, NodeShape::Cylinder);
-
-            let node_d = fc.nodes.iter().find(|n| n.id == "D").unwrap();
-            assert_eq!(node_d.label, "Circle");
-            assert_eq!(node_d.shape, NodeShape::Circle);
-
-            let node_e = fc.nodes.iter().find(|n| n.id == "E").unwrap();
-            assert_eq!(node_e.label, "Diamond");
-            assert_eq!(node_e.shape, NodeShape::Rhombus);
-        } else {
-            panic!("Expected flowchart");
+    F[/Lean/]
+"#,
+        );
+        let expected = [
+            ("A", "Stadium", NodeShape::Stadium),
+            ("B", "Subroutine", NodeShape::Subroutine),
+            ("C", "Database", NodeShape::Cylinder),
+            ("D", "Circle", NodeShape::Circle),
+            ("E", "Diamond", NodeShape::Rhombus),
+            ("F", "Lean", NodeShape::Parallelogram),
+        ];
+        assert_eq!(fc.nodes.len(), expected.len());
+        for (id, label, shape) in expected {
+            let node = fc.nodes.iter().find(|n| n.id == id).unwrap();
+            assert_eq!(node.label, label, "label of {id}");
+            assert_eq!(node.shape, shape, "shape of {id}");
         }
-    }
-
-    #[test]
-    fn test_extract_node_info() {
-        // Rect
-        let (id, label, shape) = extract_node_info("A[Start]").unwrap();
-        assert_eq!(id, "A");
-        assert_eq!(label, "Start");
-        assert_eq!(shape, NodeShape::Rect);
-
-        // Rhombus
-        let (id, label, shape) = extract_node_info("B{Decision?}").unwrap();
-        assert_eq!(id, "B");
-        assert_eq!(label, "Decision?");
-        assert_eq!(shape, NodeShape::Rhombus);
-
-        // Circle
-        let (id, label, shape) = extract_node_info("C((Circle))").unwrap();
-        assert_eq!(id, "C");
-        assert_eq!(label, "Circle");
-        assert_eq!(shape, NodeShape::Circle);
-
-        // Simple node
-        let (id, label, shape) = extract_node_info("D").unwrap();
-        assert_eq!(id, "D");
-        assert_eq!(label, "D");
-        assert_eq!(shape, NodeShape::RoundedRect);
-    }
-
-    #[test]
-    fn test_extract_node_info_normalizes_quoted_labels_and_breaks() {
-        let (id, label, shape) = extract_node_info(r#"A["Build<br/>Render"]"#).unwrap();
-        assert_eq!(id, "A");
-        assert_eq!(label, "Build\nRender");
-        assert_eq!(shape, NodeShape::Rect);
     }
 
     #[test]
     fn test_parse_flowchart_normalizes_quoted_labels() {
-        let input = r#"
+        let fc = flowchart(
+            r#"
 flowchart TD
     A["Start Here"] --> B["Ship<br>Now"]
-"#;
-        let result = parse_mermaid(input).unwrap();
-
-        if let MermaidDiagram::Flowchart(fc) = result {
-            let node_a = fc.nodes.iter().find(|n| n.id == "A").unwrap();
-            let node_b = fc.nodes.iter().find(|n| n.id == "B").unwrap();
-            assert_eq!(node_a.label, "Start Here");
-            assert_eq!(node_b.label, "Ship\nNow");
-        } else {
-            panic!("Expected flowchart");
-        }
-    }
-
-    #[test]
-    fn test_parse_sequence_diagram() {
-        let input = r#"
-sequenceDiagram
-    participant Alice
-    participant Bob
-    Alice->>Bob: Hello!
-    Bob-->>Alice: Hi!
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Sequence(seq) = result {
-            assert_eq!(seq.participants.len(), 2);
-            assert_eq!(seq.participants[0].id, "Alice");
-            assert_eq!(seq.participants[1].id, "Bob");
-
-            // Check messages exist
-            let msg_count = seq
-                .elements
-                .iter()
-                .filter(|e| matches!(e, SequenceElement::Message(_)))
-                .count();
-            assert_eq!(msg_count, 2);
-        } else {
-            panic!("Expected sequence diagram");
-        }
+    C["Build<br/>Render"]
+"#,
+        );
+        let label = |id: &str| &fc.nodes.iter().find(|n| n.id == id).unwrap().label;
+        assert_eq!(label("A"), "Start Here");
+        assert_eq!(label("B"), "Ship\nNow");
+        assert_eq!(label("C"), "Build\nRender");
     }
 
     #[test]
     fn test_parse_sequence_messages() {
-        let input = r#"
+        let seq = sequence(
+            r#"
 sequenceDiagram
     participant Alice
     participant Bob
     Alice->>Bob: Hello
     Bob-->>Alice: Hi there
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Sequence(seq) = result {
-            assert_eq!(seq.participants.len(), 2, "Should have 2 participants");
+"#,
+        );
+        assert_eq!(participant_ids(&seq), ["Alice", "Bob"]);
 
-            // Check messages are parsed
-            let msg_count = seq
-                .elements
-                .iter()
-                .filter(|e| matches!(e, SequenceElement::Message(_)))
-                .count();
-            assert_eq!(msg_count, 2, "Should have 2 messages, got {}", msg_count);
-
-            // Check first message
-            let first_msg = seq.elements.iter().find_map(|e| {
-                if let SequenceElement::Message(m) = e {
-                    Some(m)
-                } else {
-                    None
-                }
-            });
-            assert!(first_msg.is_some(), "Should have at least one message");
-            let msg = first_msg.unwrap();
-            assert_eq!(msg.from, "Alice", "From should be Alice, got {}", msg.from);
-            assert_eq!(msg.to, "Bob", "To should be Bob, got {}", msg.to);
-            assert_eq!(
-                msg.label, "Hello",
-                "Label should be Hello, got '{}'",
-                msg.label
-            );
-        } else {
-            panic!("Expected sequence diagram");
-        }
+        let msgs = messages(&seq.elements);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            (msgs[0].from.as_str(), msgs[0].to.as_str()),
+            ("Alice", "Bob")
+        );
+        assert_eq!(msgs[0].label, "Hello");
+        assert_eq!(msgs[0].kind, MessageKind::Sync);
+        assert_eq!(
+            (msgs[1].from.as_str(), msgs[1].to.as_str()),
+            ("Bob", "Alice")
+        );
+        assert_eq!(msgs[1].label, "Hi there");
+        assert_eq!(msgs[1].kind, MessageKind::Reply);
     }
 
     #[test]
     fn test_parse_sequence_with_aliases() {
-        let input = r#"
+        let seq = sequence(
+            r#"
 sequenceDiagram
     participant U as User
     participant S as Server
     U->>S: Request
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Sequence(seq) = result {
-            assert_eq!(seq.participants.len(), 2);
+"#,
+        );
+        assert_eq!(participant_ids(&seq), ["U", "S"]);
+        assert_eq!(seq.participants[0].alias.as_deref(), Some("User"));
+        assert_eq!(seq.participants[1].alias.as_deref(), Some("Server"));
+    }
 
-            let user = &seq.participants[0];
-            assert_eq!(user.id, "U");
-            assert_eq!(user.alias, Some("User".to_string()));
+    #[test]
+    fn sequence_participants_come_from_actors_and_messages_in_order() {
+        let seq = sequence(
+            r#"
+sequenceDiagram
+    actor C as Carol
+    Alice->>John: Hi
+    loop poll
+        John-->>Dave: ping
+    end
+    Note right of John: retry->later
+    participant Alice as Alice Smith
+"#,
+        );
+        assert_eq!(participant_ids(&seq), ["C", "Alice", "John", "Dave"]);
+        assert!(seq.elements.iter().any(|e| matches!(
+            e,
+            SequenceElement::Note { participant, text, .. }
+                if participant == "John" && text == "retry->later"
+        )));
+        assert_eq!(seq.participants[0].alias.as_deref(), Some("Carol"));
+        assert_eq!(seq.participants[1].alias.as_deref(), Some("Alice Smith"));
+    }
 
-            let server = &seq.participants[1];
-            assert_eq!(server.id, "S");
-            assert_eq!(server.alias, Some("Server".to_string()));
-        } else {
-            panic!("Expected sequence diagram");
-        }
+    #[test]
+    fn sequence_activation_shorthand_targets_participant() {
+        let seq = sequence(
+            "sequenceDiagram\n    participant A\n    participant B\n    A->>+B: Hello\n    B-->>-A: Hi\n",
+        );
+        assert_eq!(participant_ids(&seq), ["A", "B"]);
+
+        let msgs = messages(&seq.elements);
+        assert_eq!((msgs[0].from.as_str(), msgs[0].to.as_str()), ("A", "B"));
+        assert_eq!(msgs[0].label, "Hello");
+        assert_eq!((msgs[1].from.as_str(), msgs[1].to.as_str()), ("B", "A"));
+        assert_eq!(msgs[1].label, "Hi");
+
+        // `+` activates the receiver after the message, `-` deactivates the sender.
+        assert!(matches!(
+            &seq.elements[1],
+            SequenceElement::Activation(a) if a.participant == "B"
+        ));
+        assert!(matches!(
+            &seq.elements[3],
+            SequenceElement::Deactivation(a) if a.participant == "B"
+        ));
+    }
+
+    #[test]
+    fn sequence_arrow_variants_parse_endpoints() {
+        let seq = sequence(
+            "sequenceDiagram\n    A-)B: async\n    A--)B: dotted async\n    A-xB: lost\n    A--xB: dotted lost\n",
+        );
+        assert_eq!(participant_ids(&seq), ["A", "B"]);
+        let msgs = messages(&seq.elements);
+        let parsed: Vec<_> = msgs
+            .iter()
+            .map(|m| (m.from.as_str(), m.to.as_str(), &m.msg_type, &m.kind))
+            .collect();
+        assert_eq!(
+            parsed,
+            [
+                ("A", "B", &MessageType::Solid, &MessageKind::Async),
+                ("A", "B", &MessageType::Dotted, &MessageKind::Async),
+                ("A", "B", &MessageType::Solid, &MessageKind::Sync),
+                ("A", "B", &MessageType::Dotted, &MessageKind::Sync),
+            ]
+        );
     }
 
     #[test]
@@ -1809,7 +1623,8 @@ sequenceDiagram
 
     #[test]
     fn test_parse_sequence_notes_and_blocks() {
-        let input = r#"
+        let seq = sequence(
+            r#"
 sequenceDiagram
     participant Alice
     participant Bob
@@ -1819,126 +1634,103 @@ sequenceDiagram
     else retry
         Bob-->>Alice: try again
     end
-"#;
+"#,
+        );
+        assert!(seq.elements.iter().any(|e| matches!(
+            e,
+            SequenceElement::Note { position, participant, text }
+                if position == "right" && participant == "Alice" && text == "Start here"
+        )));
 
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Sequence(seq) = result {
-            assert!(seq
-                .elements
-                .iter()
-                .any(|e| matches!(e, SequenceElement::Note { position, participant, text } if position == "right" && participant == "Alice" && text == "Start here")));
-
-            let block = seq.elements.iter().find_map(|e| {
-                if let SequenceElement::Block(block) = e {
-                    Some(block)
-                } else {
-                    None
-                }
-            });
-            assert!(block.is_some());
-            let block = block.unwrap();
-            assert_eq!(block.messages.len(), 1);
-            assert_eq!(block.else_branches.len(), 1);
-            assert_eq!(block.else_branches[0].0, "retry");
-            assert_eq!(block.else_branches[0].1.len(), 1);
-        } else {
-            panic!("Expected sequence diagram");
-        }
+        let block = seq
+            .elements
+            .iter()
+            .find_map(|e| match e {
+                SequenceElement::Block(block) => Some(block),
+                _ => None,
+            })
+            .expect("missing alt block");
+        assert_eq!(block.label, "success path");
+        assert_eq!(block.messages.len(), 1);
+        assert_eq!(block.else_branches.len(), 1);
+        assert_eq!(block.else_branches[0].0, "retry");
+        assert_eq!(block.else_branches[0].1.len(), 1);
     }
 
     #[test]
     fn test_parse_flowchart_bidirectional_arrows_precedence() {
-        let input = r#"
-flowchart TD
-    A <==> B
-    C <--> D
-    E <.-> F
-"#;
-
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Flowchart(fc) = result {
-            assert_eq!(fc.edges.len(), 3);
-
-            let a_b = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "A" && e.to == "B")
-                .unwrap();
-            assert_eq!(a_b.style, EdgeStyle::Thick);
-            assert_eq!(a_b.arrow_head, ArrowType::Arrow);
-            assert_eq!(a_b.arrow_tail, ArrowType::Arrow);
-
-            let c_d = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "C" && e.to == "D")
-                .unwrap();
-            assert_eq!(c_d.style, EdgeStyle::Solid);
-            assert_eq!(c_d.arrow_head, ArrowType::Arrow);
-            assert_eq!(c_d.arrow_tail, ArrowType::Arrow);
-
-            let e_f = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "E" && e.to == "F")
-                .unwrap();
-            assert_eq!(e_f.style, EdgeStyle::Dotted);
-            assert_eq!(e_f.arrow_head, ArrowType::Arrow);
-            assert_eq!(e_f.arrow_tail, ArrowType::Arrow);
-        } else {
-            panic!("Expected flowchart");
+        let fc = flowchart("flowchart TD\n    A <==> B\n    C <--> D\n    E <.-> F\n");
+        assert_eq!(fc.edges.len(), 3);
+        for (from, to, style) in [
+            ("A", "B", EdgeStyle::Thick),
+            ("C", "D", EdgeStyle::Solid),
+            ("E", "F", EdgeStyle::Dotted),
+        ] {
+            let e = edge(&fc, from, to);
+            assert_eq!(e.style, style);
+            assert_eq!(e.arrow_head, ArrowType::Arrow);
+            assert_eq!(e.arrow_tail, ArrowType::Arrow);
         }
     }
 
     #[test]
     fn test_parse_class_diagram() {
-        let input = r#"
+        let cls = class(
+            r#"
 classDiagram
     class Animal {
         +String name
-        +int age
+        -age: int
         +makeSound()
+        #eat(food: Food, amount) bool
     }
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::ClassDiagram(cls) = result {
-            assert!(!cls.classes.is_empty(), "Should have at least one class");
-            let animal = cls.classes.iter().find(|c| c.name == "Animal");
-            assert!(animal.is_some(), "Should find Animal class");
-            let animal = animal.unwrap();
-            assert!(
-                animal.attributes.len() >= 2,
-                "Animal should have at least 2 attributes, got {}",
-                animal.attributes.len()
-            );
-            assert!(
-                !animal.methods.is_empty(),
-                "Animal should have at least 1 method, got {}",
-                animal.methods.len()
-            );
-            // Attribute name includes type in current parsing
-            assert!(
-                animal
-                    .attributes
-                    .iter()
-                    .any(|a| a.member.name.contains("name")),
-                "Should have name attribute"
-            );
-            assert!(
-                animal
-                    .methods
-                    .iter()
-                    .any(|m| m.member.name.contains("makeSound")),
-                "Should have makeSound method"
-            );
-        } else {
-            panic!("Expected class diagram");
-        }
+"#,
+        );
+        assert_eq!(cls.classes.len(), 1);
+        let animal = &cls.classes[0];
+        assert_eq!(animal.name, "Animal");
+
+        // Only `name: Type` declares a type; `Type name` stays a plain name.
+        let attrs: Vec<_> = animal
+            .attributes
+            .iter()
+            .map(|a| {
+                (
+                    &a.member.visibility,
+                    a.member.name.as_str(),
+                    a.type_annotation.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            attrs,
+            [
+                (&Visibility::Public, "String name", None),
+                (&Visibility::Private, "age", Some("int")),
+            ]
+        );
+
+        assert_eq!(animal.methods.len(), 2);
+        assert_eq!(animal.methods[0].member.name, "makeSound");
+        assert!(animal.methods[0].parameters.is_empty());
+        assert_eq!(animal.methods[0].return_type, None);
+        let eat = &animal.methods[1];
+        assert_eq!(eat.member.visibility, Visibility::Protected);
+        assert_eq!(eat.member.name, "eat");
+        assert_eq!(
+            eat.parameters,
+            [
+                ("food".to_string(), Some("Food".to_string())),
+                ("amount".to_string(), None),
+            ]
+        );
+        assert_eq!(eat.return_type, None);
     }
 
     #[test]
     fn test_parse_class_relations_with_labels() {
-        let input = r#"
+        let cls = class(
+            r#"
 classDiagram
     class User {
         +String id
@@ -1952,37 +1744,38 @@ classDiagram
 
     User --> Session : creates
     User ..> AuditLog : writes
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::ClassDiagram(cls) = result {
-            assert_eq!(cls.classes.len(), 3);
-            assert_eq!(cls.relations.len(), 2);
+"#,
+        );
+        assert_eq!(cls.classes.len(), 3);
+        assert_eq!(cls.relations.len(), 2);
 
-            let creates = cls
-                .relations
+        let relation = |to: &str| {
+            cls.relations
                 .iter()
-                .find(|r| r.from == "User" && r.to == "Session")
-                .expect("missing creates relation");
-            assert_eq!(creates.label.as_deref(), Some("creates"));
+                .find(|r| r.from == "User" && r.to == to)
+                .unwrap_or_else(|| panic!("missing relation to {to}"))
+        };
+        assert_eq!(relation("Session").label.as_deref(), Some("creates"));
+        assert_eq!(relation("AuditLog").label.as_deref(), Some("writes"));
+        assert_eq!(
+            relation("AuditLog").relation_type,
+            ClassRelationType::Dependency
+        );
+    }
 
-            let writes = cls
-                .relations
-                .iter()
-                .find(|r| r.from == "User" && r.to == "AuditLog")
-                .expect("missing writes relation");
-            assert_eq!(writes.label.as_deref(), Some("writes"));
-            assert!(matches!(
-                writes.relation_type,
-                ClassRelationType::Dependency
-            ));
-        } else {
-            panic!("Expected class diagram");
-        }
+    #[test]
+    fn class_relations_create_missing_classes() {
+        let cls = class(
+            "classDiagram\n    Animal <|-- Duck\n    Animal <|-- Fish\n    class Pond\n    Pond o-- Duck\n",
+        );
+        let names: Vec<&str> = cls.classes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Pond", "Animal", "Duck", "Fish"]);
+        assert_eq!(cls.relations.len(), 3);
     }
 
     #[test]
     fn test_parse_er_entity_blocks_and_relationship_labels() {
-        let input = r#"
+        let er = er(r#"
 erDiagram
     USER ||--o{ ORDER : places
     ORDER ||--|{ ORDER_ITEM : contains
@@ -1999,256 +1792,152 @@ erDiagram
     ORDER_ITEM {
         string order_id
     }
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::ErDiagram(er) = result {
-            assert_eq!(er.entities.len(), 3);
-            assert_eq!(er.relationships.len(), 2);
+"#);
+        assert_eq!(er.entities.len(), 3);
+        assert_eq!(er.relationships.len(), 2);
 
-            let user = er
-                .entities
-                .iter()
-                .find(|e| e.name == "USER")
-                .expect("missing USER");
-            assert_eq!(user.attributes.len(), 2);
-            assert_eq!(user.attributes[0].name, "string id");
-            assert_eq!(user.attributes[1].name, "string email");
+        let user = er
+            .entities
+            .iter()
+            .find(|e| e.name == "USER")
+            .expect("missing USER");
+        assert_eq!(user.attributes.len(), 2);
+        assert_eq!(user.attributes[0].name, "string id");
+        assert_eq!(user.attributes[1].name, "string email");
 
-            let places = er
-                .relationships
-                .iter()
-                .find(|r| r.from == "USER" && r.to == "ORDER")
-                .expect("missing places relationship");
-            assert_eq!(places.label.as_deref(), Some("places"));
-        } else {
-            panic!("Expected ER diagram");
-        }
+        let places = er
+            .relationships
+            .iter()
+            .find(|r| r.from == "USER" && r.to == "ORDER")
+            .expect("missing places relationship");
+        assert_eq!(places.label.as_deref(), Some("places"));
+    }
+
+    #[test]
+    fn er_relationship_cardinalities_compose_both_sides() {
+        let er = er(
+            "erDiagram\n    A ||--o| B : has\n    C }o..o| D\n    E |o--|{ F\n    G }|..|| H\n    I-X }o--o{ J-Y\n",
+        );
+        use ErCardinality::*;
+        let parsed: Vec<_> = er
+            .relationships
+            .iter()
+            .map(|r| {
+                (
+                    r.from.as_str(),
+                    r.to.as_str(),
+                    &r.from_cardinality,
+                    &r.to_cardinality,
+                )
+            })
+            .collect();
+        assert_eq!(
+            parsed,
+            [
+                ("A", "B", &ExactlyOne, &ZeroOrOne),
+                ("C", "D", &ZeroOrMore, &ZeroOrOne),
+                ("E", "F", &ZeroOrOne, &OneOrMore),
+                ("G", "H", &OneOrMore, &ExactlyOne),
+                ("I-X", "J-Y", &ZeroOrMore, &ZeroOrMore),
+            ]
+        );
+        assert_eq!(er.relationships[0].label.as_deref(), Some("has"));
+        let names: Vec<&str> = er.entities.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["A", "B", "C", "D", "E", "F", "G", "H", "I-X", "J-Y"]
+        );
     }
 
     #[test]
     fn test_parse_state_diagram() {
-        let input = r#"
-stateDiagram
-    [*] --> Idle
-    Idle --> Processing
-    Processing --> [*]
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::StateDiagram(st) = result {
-            assert!(!st.states.is_empty());
-            assert!(!st.transitions.is_empty());
-
-            // Check start state exists
-            let has_start = st.states.iter().any(|s| s.is_start);
-            assert!(has_start);
-
-            // Check transitions
-            let idle_to_processing = st
-                .transitions
+        let st = state(
+            "\nstateDiagram\n    [*] --> Idle\n    Idle --> Processing\n    Processing --> [*]\n",
+        );
+        assert!(st.states.iter().any(|s| s.is_start));
+        assert!(st.states.iter().any(|s| s.is_end));
+        assert!(
+            st.transitions
                 .iter()
-                .any(|t| t.from == "Idle" && t.to == "Processing");
-            assert!(idle_to_processing);
-        } else {
-            panic!("Expected state diagram");
-        }
+                .any(|t| t.from == "Idle" && t.to == "Processing")
+        );
     }
 
     #[test]
     fn test_parse_state_composite_with_note_children() {
-        let input = r#"
+        let st = state(
+            r#"
 stateDiagram
     state Parent {
         state Child
         Child --> Child: loop
     }
     Note right of Child: child note
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::StateDiagram(st) = result {
-            let parent = st.states.iter().find(|s| s.id == "Parent").unwrap();
-            assert!(parent.is_composite);
-            assert!(
-                parent
-                    .children
-                    .iter()
-                    .any(|e| matches!(e, StateElement::State(s) if s.id == "Child"))
-            );
-            assert!(parent.children.iter().any(
-                |e| matches!(e, StateElement::Transition(t) if t.from == "Child" && t.to == "Child")
-            ));
+"#,
+        );
+        let parent = st.states.iter().find(|s| s.id == "Parent").unwrap();
+        assert!(parent.is_composite);
+        assert!(
+            parent
+                .children
+                .iter()
+                .any(|e| matches!(e, StateElement::State(id) if id == "Child"))
+        );
+        assert!(parent.children.iter().any(
+            |e| matches!(e, StateElement::Transition(t) if t.from == "Child" && t.to == "Child")
+        ));
 
-            let child = st.states.iter().find(|s| s.id == "Child").unwrap();
-            assert!(child.children.iter().any(|e| {
-                matches!(
-                    e,
-                    StateElement::Note {
-                        state,
-                        text,
-                    } if state == "Child" && text == "child note"
-                )
-            }));
-        } else {
-            panic!("Expected state diagram");
-        }
-    }
-
-    #[test]
-    fn test_flowchart_cycle() {
-        let input = r#"
-flowchart TD
-    A --> B
-    B --> C
-    C --> A
-"#;
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Flowchart(fc) = result {
-            assert_eq!(fc.nodes.len(), 3);
-            assert_eq!(fc.edges.len(), 3);
-        } else {
-            panic!("Expected flowchart");
-        }
+        let child = st.states.iter().find(|s| s.id == "Child").unwrap();
+        assert!(child.children.iter().any(|e| matches!(
+            e,
+            StateElement::Note { state, text } if state == "Child" && text == "child note"
+        )));
     }
 
     #[test]
     fn test_parse_flowchart_cross_and_circle_arrows() {
-        let input = r#"
-flowchart TD
-    A --x B
-    C x-- D
-    E --o F
-    G o-- H
-    I x--x J
-    K o--o L
-"#;
-
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Flowchart(fc) = result {
-            assert_eq!(fc.edges.len(), 6);
-
-            let a_b = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "A" && e.to == "B")
-                .unwrap();
-            assert_eq!(a_b.arrow_head, ArrowType::Cross);
-            assert_eq!(a_b.arrow_tail, ArrowType::None);
-
-            let c_d = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "C" && e.to == "D")
-                .unwrap();
-            assert_eq!(c_d.arrow_head, ArrowType::None);
-            assert_eq!(c_d.arrow_tail, ArrowType::Cross);
-
-            let e_f = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "E" && e.to == "F")
-                .unwrap();
-            assert_eq!(e_f.arrow_head, ArrowType::Circle);
-            assert_eq!(e_f.arrow_tail, ArrowType::None);
-
-            let g_h = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "G" && e.to == "H")
-                .unwrap();
-            assert_eq!(g_h.arrow_head, ArrowType::None);
-            assert_eq!(g_h.arrow_tail, ArrowType::Circle);
-
-            let i_j = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "I" && e.to == "J")
-                .unwrap();
-            assert_eq!(i_j.arrow_head, ArrowType::Cross);
-            assert_eq!(i_j.arrow_tail, ArrowType::Cross);
-
-            let k_l = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "K" && e.to == "L")
-                .unwrap();
-            assert_eq!(k_l.arrow_head, ArrowType::Circle);
-            assert_eq!(k_l.arrow_tail, ArrowType::Circle);
-        } else {
-            panic!("Expected flowchart");
+        let fc = flowchart(
+            "flowchart TD\n    A --x B\n    C x-- D\n    E --o F\n    G o-- H\n    I x--x J\n    K o--o L\n",
+        );
+        assert_eq!(fc.edges.len(), 6);
+        for (from, to, head, tail) in [
+            ("A", "B", ArrowType::Cross, ArrowType::None),
+            ("C", "D", ArrowType::None, ArrowType::Cross),
+            ("E", "F", ArrowType::Circle, ArrowType::None),
+            ("G", "H", ArrowType::None, ArrowType::Circle),
+            ("I", "J", ArrowType::Cross, ArrowType::Cross),
+            ("K", "L", ArrowType::Circle, ArrowType::Circle),
+        ] {
+            let e = edge(&fc, from, to);
+            assert_eq!(e.arrow_head, head, "{from} -> {to}");
+            assert_eq!(e.arrow_tail, tail, "{from} -> {to}");
         }
     }
 
     #[test]
     fn test_parse_flowchart_dotted_cross_and_circle_arrows() {
-        let input = r#"
-flowchart TD
-    A -.x B
-    C x-. D
-    E -.o F
-    G o-. H
-"#;
-
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Flowchart(fc) = result {
-            assert_eq!(fc.edges.len(), 4);
-
-            let a_b = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "A" && e.to == "B")
-                .unwrap();
-            assert_eq!(a_b.style, EdgeStyle::Dotted);
-            assert_eq!(a_b.arrow_head, ArrowType::Cross);
-            assert_eq!(a_b.arrow_tail, ArrowType::None);
-
-            let c_d = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "C" && e.to == "D")
-                .unwrap();
-            assert_eq!(c_d.style, EdgeStyle::Dotted);
-            assert_eq!(c_d.arrow_head, ArrowType::None);
-            assert_eq!(c_d.arrow_tail, ArrowType::Cross);
-
-            let e_f = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "E" && e.to == "F")
-                .unwrap();
-            assert_eq!(e_f.style, EdgeStyle::Dotted);
-            assert_eq!(e_f.arrow_head, ArrowType::Circle);
-            assert_eq!(e_f.arrow_tail, ArrowType::None);
-
-            let g_h = fc
-                .edges
-                .iter()
-                .find(|e| e.from == "G" && e.to == "H")
-                .unwrap();
-            assert_eq!(g_h.style, EdgeStyle::Dotted);
-            assert_eq!(g_h.arrow_head, ArrowType::None);
-            assert_eq!(g_h.arrow_tail, ArrowType::Circle);
-        } else {
-            panic!("Expected flowchart");
+        let fc = flowchart("flowchart TD\n    A -.x B\n    C x-. D\n    E -.o F\n    G o-. H\n");
+        assert_eq!(fc.edges.len(), 4);
+        for (from, to, head, tail) in [
+            ("A", "B", ArrowType::Cross, ArrowType::None),
+            ("C", "D", ArrowType::None, ArrowType::Cross),
+            ("E", "F", ArrowType::Circle, ArrowType::None),
+            ("G", "H", ArrowType::None, ArrowType::Circle),
+        ] {
+            let e = edge(&fc, from, to);
+            assert_eq!(e.style, EdgeStyle::Dotted, "{from} -> {to}");
+            assert_eq!(e.arrow_head, head, "{from} -> {to}");
+            assert_eq!(e.arrow_tail, tail, "{from} -> {to}");
         }
     }
 
     #[test]
     fn test_parse_flowchart_open_arrow_variant() {
-        let input = r#"
-flowchart TD
-    A --o> B
-"#;
-
-        let result = parse_mermaid(input).unwrap();
-        if let MermaidDiagram::Flowchart(fc) = result {
-            assert_eq!(fc.edges.len(), 1);
-            let edge = &fc.edges[0];
-            assert_eq!(edge.from, "A");
-            assert_eq!(edge.to, "B");
-            assert_eq!(edge.arrow_head, ArrowType::Arrow);
-            assert_eq!(edge.arrow_tail, ArrowType::Circle);
-        } else {
-            panic!("Expected flowchart");
-        }
+        let fc = flowchart("flowchart TD\n    A --o> B\n");
+        assert_eq!(fc.edges.len(), 1);
+        let e = edge(&fc, "A", "B");
+        assert_eq!(e.arrow_head, ArrowType::Arrow);
+        assert_eq!(e.arrow_tail, ArrowType::Circle);
     }
 }
 
@@ -2256,45 +1945,82 @@ flowchart TD
 mod error_tests {
     use super::*;
 
+    fn parse_err(src: &str) -> String {
+        match parse_mermaid(src) {
+            Ok(diagram) => panic!("expected an error, got {diagram:?}"),
+            Err(err) => err,
+        }
+    }
+
     #[test]
     fn test_parse_class_missing_stereotype_end() {
-        let input = "classDiagram\nclass <<abstract Animal";
-        let result = parse_mermaid(input);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("missing '>>' in stereotype"));
+        let err = parse_err("classDiagram\nclass <<abstract Animal");
+        assert!(err.contains("missing '>>' in stereotype"), "{err}");
     }
 
     #[test]
     fn test_parse_state_missing_definition() {
-        let input = "stateDiagram\nstate {";
-        let result = parse_mermaid(input);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing state definition"));
+        let err = parse_err("stateDiagram\nstate {");
+        assert!(err.contains("Missing state definition"), "{err}");
     }
 
     #[test]
     fn test_parse_state_missing_closing_quote() {
-        let input = "stateDiagram\nstate \"Label";
-        let result = parse_mermaid(input);
-        assert!(result.is_err());
+        let err = parse_err("stateDiagram\nstate \"Label");
         assert!(
-            result
-                .unwrap_err()
-                .contains("Missing closing quote in state label")
+            err.contains("Missing closing quote in state label"),
+            "{err}"
         );
     }
 
     #[test]
     fn test_parse_state_missing_identifier() {
-        let input = "stateDiagram\nstate \"Label\"";
-        let result = parse_mermaid(input);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing state identifier"));
+        let err = parse_err("stateDiagram\nstate \"Label\"");
+        assert!(err.contains("Missing state identifier"), "{err}");
     }
 
     #[test]
-    fn test_unknown_diagram_type_produces_result() {
-        let result = parse_mermaid("unknownDiagram\n  A --> B");
-        assert!(result.is_ok(), "Unknown diagram type should not error");
+    fn unsupported_diagram_type_is_rejected() {
+        let err = parse_err("pie title Pets\n  \"Dogs\" : 50");
+        assert_eq!(err, "unsupported Mermaid diagram type: pie");
+        let err = parse_err("unknownDiagram\n  A --> B");
+        assert_eq!(err, "unsupported Mermaid diagram type: unknownDiagram");
+    }
+
+    #[test]
+    fn diagrams_without_content_are_rejected() {
+        for src in [
+            "flowchart LR\n  ??? invalid syntax ???",
+            "graph TD",
+            "sequenceDiagram\n  %% nothing here",
+            "classDiagram",
+            "stateDiagram-v2\n",
+            "erDiagram",
+        ] {
+            parse_err(src);
+        }
+    }
+
+    #[test]
+    fn directives_and_front_matter_before_header_are_skipped() {
+        for src in [
+            "%%{init: {'theme': 'dark'}}%%\nflowchart TD\n  A --> B",
+            "---\ntitle: Demo\n---\n%% comment\nsequenceDiagram\n  A->>B: hi",
+        ] {
+            assert!(parse_mermaid(src).is_ok(), "{src}");
+        }
+    }
+
+    #[test]
+    fn diagrams_with_only_nodes_are_accepted() {
+        for src in [
+            "flowchart TD\n  A[Alone]",
+            "classDiagram\n  class Solo",
+            "stateDiagram\n  state Solo",
+            "erDiagram\n  SOLO",
+            "sequenceDiagram\n  participant Solo",
+        ] {
+            assert!(parse_mermaid(src).is_ok(), "{src}");
+        }
     }
 }

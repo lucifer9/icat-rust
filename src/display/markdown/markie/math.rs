@@ -1,4 +1,5 @@
 use crate::display::markdown::markie::TextMeasure;
+use crate::display::markdown::markie::xml::{escape_xml, sanitize_xml_text};
 use latex2mathml::{DisplayStyle, latex_to_mathml};
 use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event as XmlEvent};
@@ -27,7 +28,7 @@ enum MathNode {
     Frac {
         num: Box<MathNode>,
         den: Box<MathNode>,
-        line_thickness: Option<f32>, // None = default, Some(0.0) = no line
+        has_rule: bool,
     },
     Sqrt {
         radicand: Box<MathNode>,
@@ -45,19 +46,12 @@ enum MathNode {
     /// Table for matrices, cases, aligned equations
     Table {
         rows: Vec<Vec<MathNode>>,
-        column_align: Vec<String>, // "left", "center", "right"
     },
     /// Stretchy operator (parentheses, brackets that scale)
     StretchyOp {
         op: String,
         form: String, // "prefix", "postfix", "infix"
     },
-}
-
-impl Default for MathNode {
-    fn default() -> Self {
-        MathNode::Row(Vec::new())
-    }
 }
 
 #[derive(Debug)]
@@ -75,7 +69,25 @@ pub fn render_math<T: TextMeasure>(
     measure: &mut T,
     display: bool,
 ) -> Result<MathResult, String> {
-    render_math_at(latex, font_size, text_color, measure, display, 0.0, 0.0)
+    let latex = preprocess_latex(latex);
+    let style = if display {
+        DisplayStyle::Block
+    } else {
+        DisplayStyle::Inline
+    };
+
+    let mathml =
+        latex_to_mathml(&latex, style).map_err(|e| format!("LaTeX parse error: {:?}", e))?;
+
+    let root = parse_mathml(&mathml)?;
+    let mbox = layout_node(&root, font_size, text_color, measure, 0.0, 0.0);
+
+    Ok(MathResult {
+        width: mbox.width,
+        ascent: mbox.ascent,
+        descent: mbox.descent,
+        svg_fragment: mbox.svg,
+    })
 }
 
 /// Map unsupported LaTeX environments to supported equivalents for latex2mathml.
@@ -126,36 +138,6 @@ fn preprocess_latex(latex: &str) -> String {
     result
 }
 
-pub fn render_math_at<T: TextMeasure>(
-    latex: &str,
-    font_size: f32,
-    text_color: &str,
-    measure: &mut T,
-    display: bool,
-    x: f32,
-    baseline_y: f32,
-) -> Result<MathResult, String> {
-    let latex = preprocess_latex(latex);
-    let style = if display {
-        DisplayStyle::Block
-    } else {
-        DisplayStyle::Inline
-    };
-
-    let mathml =
-        latex_to_mathml(&latex, style).map_err(|e| format!("LaTeX parse error: {:?}", e))?;
-
-    let root = parse_mathml(&mathml)?;
-    let mbox = layout_node(&root, font_size, text_color, measure, x, baseline_y);
-
-    Ok(MathResult {
-        width: mbox.width,
-        ascent: mbox.ascent,
-        descent: mbox.descent,
-        svg_fragment: mbox.svg,
-    })
-}
-
 struct MathBox {
     width: f32,
     ascent: f32,
@@ -197,30 +179,11 @@ fn parse_mathml(mathml: &str) -> Result<MathNode, String> {
     let mut stack: Vec<(String, Vec<MathNode>, Attrs)> = Vec::new();
     let mut buf = Vec::new();
 
-    // Track table row context for mtable parsing
-    let mut current_table_rows: Vec<Vec<MathNode>> = Vec::new();
-    let mut current_row_cells: Vec<MathNode> = Vec::new();
-    let mut in_table = 0i32; // nesting counter
-    let mut in_row = 0i32;
-
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(XmlEvent::Start(ref e)) => {
                 let name = e.name().as_ref().to_string();
                 let attrs = parse_mathml_attrs(e)?;
-
-                if name == "mtable" {
-                    in_table += 1;
-                    if in_table == 1 {
-                        current_table_rows.clear();
-                    }
-                } else if name == "mtr" && in_table == 1 {
-                    in_row += 1;
-                    current_row_cells.clear();
-                } else if name == "mtd" && in_table == 1 && in_row == 1 {
-                    // mtd content goes on stack
-                }
-
                 stack.push((name, Vec::new(), attrs));
             }
             Ok(XmlEvent::Text(ref e)) => {
@@ -240,37 +203,11 @@ fn parse_mathml(mathml: &str) -> Result<MathNode, String> {
             }
             Ok(XmlEvent::End(_)) => {
                 if let Some((tag, children, attrs)) = stack.pop() {
-                    // Handle table elements specially
-                    if tag == "mtd" && in_table == 1 && in_row == 1 {
-                        let cell = if children.len() == 1 {
-                            children.into_iter().next().unwrap_or_default()
-                        } else {
-                            MathNode::Row(children)
-                        };
-                        current_row_cells.push(cell);
-                    } else if tag == "mtr" && in_table == 1 {
-                        in_row -= 1;
-                        if !current_row_cells.is_empty() {
-                            current_table_rows.push(std::mem::take(&mut current_row_cells));
-                        }
-                    } else if tag == "mtable" && in_table == 1 {
-                        in_table -= 1;
-                        let table_node = MathNode::Table {
-                            rows: std::mem::take(&mut current_table_rows),
-                            column_align: vec!["center".to_string()], // default center
-                        };
-                        if let Some((_, parent_children, _)) = stack.last_mut() {
-                            parent_children.push(table_node);
-                        } else {
-                            return Ok(table_node);
-                        }
+                    let node = build_node(&tag, children, &attrs);
+                    if let Some((_, parent_children, _)) = stack.last_mut() {
+                        parent_children.push(node);
                     } else {
-                        let node = build_node(&tag, children, &attrs);
-                        if let Some((_, parent_children, _)) = stack.last_mut() {
-                            parent_children.push(node);
-                        } else {
-                            return Ok(node);
-                        }
+                        return Ok(node);
                     }
                 }
             }
@@ -315,19 +252,12 @@ fn get_attr(attrs: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
-fn build_node(tag: &str, mut children: Vec<MathNode>, attrs: &Attrs) -> MathNode {
+fn build_node(tag: &str, children: Vec<MathNode>, attrs: &Attrs) -> MathNode {
     match tag {
-        "mi" => {
-            let text = extract_text(&children);
-            MathNode::Ident(text)
-        }
-        "mn" => {
-            let text = extract_text(&children);
-            MathNode::Number(text)
-        }
+        "mi" => MathNode::Ident(extract_text(&children)),
+        "mn" => MathNode::Number(extract_text(&children)),
         "mo" => {
             let text = extract_text(&children);
-            // Check for stretchy attribute
             let stretchy = get_attr(attrs, "stretchy")
                 .map(|v| v == "true")
                 .unwrap_or(false);
@@ -339,114 +269,82 @@ fn build_node(tag: &str, mut children: Vec<MathNode>, attrs: &Attrs) -> MathNode
                 MathNode::Operator(text)
             }
         }
-        "mtext" => {
-            let text = extract_text(&children);
-            MathNode::Text(text)
-        }
-        "msup" if children.len() >= 2 => {
-            let sup = children.pop().unwrap_or_default();
-            let base = children.pop().unwrap_or_default();
-            MathNode::Sup {
-                base: Box::new(base),
-                sup: Box::new(sup),
-            }
-        }
-        "msub" if children.len() >= 2 => {
-            let sub = children.pop().unwrap_or_default();
-            let base = children.pop().unwrap_or_default();
-            MathNode::Sub {
-                base: Box::new(base),
-                sub: Box::new(sub),
-            }
-        }
-        "msubsup" if children.len() >= 3 => {
-            let sup = children.pop().unwrap_or_default();
-            let sub = children.pop().unwrap_or_default();
-            let base = children.pop().unwrap_or_default();
-            MathNode::SubSup {
-                base: Box::new(base),
-                sub: Box::new(sub),
-                sup: Box::new(sup),
-            }
-        }
-        "mfrac" if children.len() >= 2 => {
-            let den = children.pop().unwrap_or_default();
-            let num = children.pop().unwrap_or_default();
-            // Check for linethickness attribute (used by binomial)
-            let line_thickness = get_attr(attrs, "linethickness").and_then(|v| {
-                if v == "0" {
-                    Some(0.0)
-                } else {
-                    v.parse::<f32>().ok()
-                }
-            });
-            MathNode::Frac {
-                num: Box::new(num),
-                den: Box::new(den),
-                line_thickness,
-            }
-        }
-        "msqrt" => {
-            let radicand = if children.len() == 1 {
-                children.pop().unwrap_or_default()
-            } else {
-                MathNode::Row(children)
-            };
-            MathNode::Sqrt {
-                radicand: Box::new(radicand),
-            }
-        }
-        "mroot" if children.len() >= 2 => {
-            // Note: in MathML mroot, the index comes AFTER the radicand
-            let index = children.pop().unwrap_or_default();
-            let radicand = children.pop().unwrap_or_default();
-            MathNode::Root {
-                radicand: Box::new(radicand),
-                index: Box::new(index),
-            }
-        }
-        "mover" if children.len() >= 2 => {
-            let over = children.pop().unwrap_or_default();
-            let base = children.pop().unwrap_or_default();
-            MathNode::UnderOver {
-                base: Box::new(base),
-                under: None,
-                over: Some(Box::new(over)),
-            }
-        }
-        "munder" if children.len() >= 2 => {
-            let under = children.pop().unwrap_or_default();
-            let base = children.pop().unwrap_or_default();
-            MathNode::UnderOver {
-                base: Box::new(base),
-                under: Some(Box::new(under)),
-                over: None,
-            }
-        }
-        "munderover" if children.len() >= 3 => {
-            let over = children.pop().unwrap_or_default();
-            let under = children.pop().unwrap_or_default();
-            let base = children.pop().unwrap_or_default();
-            MathNode::UnderOver {
-                base: Box::new(base),
-                under: Some(Box::new(under)),
-                over: Some(Box::new(over)),
-            }
-        }
-        "math" | "mrow" | "mstyle" | "mpadded" => {
-            if children.len() == 1 {
-                children.pop().unwrap_or_default()
-            } else {
-                MathNode::Row(children)
-            }
-        }
-        _ => {
-            if children.len() == 1 {
-                children.pop().unwrap_or_default()
-            } else {
-                MathNode::Row(children)
-            }
-        }
+        "mtext" => MathNode::Text(extract_text(&children)),
+        "msup" => with_children(children, |[base, sup]| MathNode::Sup {
+            base: Box::new(base),
+            sup: Box::new(sup),
+        }),
+        "msub" => with_children(children, |[base, sub]| MathNode::Sub {
+            base: Box::new(base),
+            sub: Box::new(sub),
+        }),
+        "msubsup" => with_children(children, |[base, sub, sup]| MathNode::SubSup {
+            base: Box::new(base),
+            sub: Box::new(sub),
+            sup: Box::new(sup),
+        }),
+        "mfrac" => with_children(children, |[num, den]| MathNode::Frac {
+            num: Box::new(num),
+            den: Box::new(den),
+            // Binomials are fractions with `linethickness="0"`.
+            has_rule: get_attr(attrs, "linethickness").and_then(|v| v.parse::<f32>().ok())
+                != Some(0.0),
+        }),
+        "msqrt" => MathNode::Sqrt {
+            radicand: Box::new(row_or_single(children)),
+        },
+        // In MathML `mroot` the index comes after the radicand.
+        "mroot" => with_children(children, |[radicand, index]| MathNode::Root {
+            radicand: Box::new(radicand),
+            index: Box::new(index),
+        }),
+        "mover" => with_children(children, |[base, over]| MathNode::UnderOver {
+            base: Box::new(base),
+            under: None,
+            over: Some(Box::new(over)),
+        }),
+        "munder" => with_children(children, |[base, under]| MathNode::UnderOver {
+            base: Box::new(base),
+            under: Some(Box::new(under)),
+            over: None,
+        }),
+        "munderover" => with_children(children, |[base, under, over]| MathNode::UnderOver {
+            base: Box::new(base),
+            under: Some(Box::new(under)),
+            over: Some(Box::new(over)),
+        }),
+        // Keep every `mtd` cell as its own column, even in a one-cell row.
+        "mtr" => MathNode::Row(children),
+        "mtable" => MathNode::Table {
+            // Each child is a built `mtr`; rows without cells add no content.
+            rows: children
+                .into_iter()
+                .filter_map(|row| match row {
+                    MathNode::Row(cells) if !cells.is_empty() => Some(cells),
+                    _ => None,
+                })
+                .collect(),
+        },
+        _ => row_or_single(children),
+    }
+}
+
+/// Builds a fixed-arity element such as `msup`; any other child count is laid
+/// out as a plain row.
+fn with_children<const N: usize>(
+    children: Vec<MathNode>,
+    build: impl FnOnce([MathNode; N]) -> MathNode,
+) -> MathNode {
+    match <[MathNode; N]>::try_from(children) {
+        Ok(parts) => build(parts),
+        Err(children) => row_or_single(children),
+    }
+}
+
+fn row_or_single(children: Vec<MathNode>) -> MathNode {
+    match <[MathNode; 1]>::try_from(children) {
+        Ok([only]) => only,
+        Err(children) => MathNode::Row(children),
     }
 }
 
@@ -464,18 +362,55 @@ fn extract_text(children: &[MathNode]) -> String {
     s
 }
 
-fn escape_xml(text: &str) -> String {
-    crate::display::markdown::markie::xml::escape_xml(text)
+/// Default ascent and descent of a text run, as fractions of its font size.
+const ASCENT_RATIO: f32 = 0.75;
+const DESCENT_RATIO: f32 = 0.25;
+
+fn measure_token<T: TextMeasure>(text: &str, font_size: f32, italic: bool, measure: &mut T) -> f32 {
+    let cleaned = sanitize_xml_text(text);
+    measure.measure_width(&cleaned, font_size, false, false, italic)
 }
 
-fn measure_token<T: TextMeasure>(
+#[derive(Clone, Copy)]
+enum MathFont {
+    Serif,
+    SerifItalic,
+    SansSerif,
+}
+
+/// Lays out one text run on the baseline with the default ascent and descent.
+fn text_box<T: TextMeasure>(
     text: &str,
+    font: MathFont,
     font_size: f32,
-    italic: bool,
+    color: &str,
     measure: &mut T,
-) -> (f32, f32) {
-    let cleaned = crate::display::markdown::markie::xml::sanitize_xml_text(text);
-    measure.measure_text(&cleaned, font_size, false, false, italic, None)
+    x: f32,
+    baseline_y: f32,
+) -> MathBox {
+    let (family, style) = match font {
+        MathFont::Serif => ("serif", ""),
+        MathFont::SerifItalic => ("serif", " font-style=\"italic\""),
+        MathFont::SansSerif => ("sans-serif", ""),
+    };
+    let italic = matches!(font, MathFont::SerifItalic);
+    let width = measure_token(text, font_size, italic, measure);
+    let svg = format!(
+        r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.2}" fill="{}"{}>{}</text>"#,
+        x,
+        baseline_y,
+        family,
+        font_size,
+        color,
+        style,
+        escape_xml(text)
+    );
+    MathBox {
+        width,
+        ascent: font_size * ASCENT_RATIO,
+        descent: font_size * DESCENT_RATIO,
+        svg,
+    }
 }
 
 fn layout_node<T: TextMeasure>(
@@ -489,92 +424,56 @@ fn layout_node<T: TextMeasure>(
     match node {
         MathNode::Ident(text) => {
             let italic = text.len() == 1 && text.chars().next().is_some_and(|c| c.is_alphabetic());
-            let (w, _h) = measure_token(text, font_size, italic, measure);
-            let style = if italic { " font-style=\"italic\"" } else { "" };
-            let svg = format!(
-                r#"<text x="{:.2}" y="{:.2}" font-family="serif" font-size="{:.2}" fill="{}"{}>{}</text>"#,
-                x,
-                baseline_y,
-                font_size,
-                color,
-                style,
-                escape_xml(text)
-            );
-            MathBox {
-                width: w,
-                ascent: font_size * 0.75,
-                descent: font_size * 0.25,
-                svg,
-            }
+            let font = if italic {
+                MathFont::SerifItalic
+            } else {
+                MathFont::Serif
+            };
+            text_box(text, font, font_size, color, measure, x, baseline_y)
         }
-        MathNode::Number(text) => {
-            let (w, _h) = measure_token(text, font_size, false, measure);
-            let svg = format!(
-                r#"<text x="{:.2}" y="{:.2}" font-family="serif" font-size="{:.2}" fill="{}">{}</text>"#,
-                x,
-                baseline_y,
-                font_size,
-                color,
-                escape_xml(text)
-            );
-            MathBox {
-                width: w,
-                ascent: font_size * 0.75,
-                descent: font_size * 0.25,
-                svg,
-            }
-        }
+        MathNode::Number(text) => text_box(
+            text,
+            MathFont::Serif,
+            font_size,
+            color,
+            measure,
+            x,
+            baseline_y,
+        ),
         MathNode::Operator(text) => {
             let is_large = is_large_operator(text);
             let effective_size = if is_large { font_size * 1.4 } else { font_size };
-            let (w, _h) = measure_token(text, effective_size, false, measure);
             let spacing = font_size * 0.15;
-            let total_w = w + spacing * 2.0;
             let y_offset = if is_large {
                 baseline_y + (effective_size - font_size) * 0.2
             } else {
                 baseline_y
             };
-            let svg = format!(
-                r#"<text x="{:.2}" y="{:.2}" font-family="serif" font-size="{:.2}" fill="{}">{}</text>"#,
-                x + spacing,
-                y_offset,
+            let mut op_box = text_box(
+                text,
+                MathFont::Serif,
                 effective_size,
                 color,
-                escape_xml(text)
+                measure,
+                x + spacing,
+                y_offset,
             );
-            MathBox {
-                width: total_w,
-                ascent: if is_large {
-                    effective_size * 0.8
-                } else {
-                    font_size * 0.75
-                },
-                descent: if is_large {
-                    effective_size * 0.3
-                } else {
-                    font_size * 0.25
-                },
-                svg,
+            op_box.width += spacing * 2.0;
+            if is_large {
+                op_box.ascent = effective_size * 0.8;
+                op_box.descent = effective_size * 0.3;
             }
+            op_box
         }
-        MathNode::Text(text) => {
-            let (w, _h) = measure_token(text, font_size, false, measure);
-            let svg = format!(
-                r#"<text x="{:.2}" y="{:.2}" font-family="sans-serif" font-size="{:.2}" fill="{}">{}</text>"#,
-                x,
-                baseline_y,
-                font_size,
-                color,
-                escape_xml(text)
-            );
-            MathBox {
-                width: w,
-                ascent: font_size * 0.75,
-                descent: font_size * 0.25,
-                svg,
-            }
-        }
+        MathNode::Text(text) => text_box(
+            text,
+            MathFont::SansSerif,
+            font_size,
+            color,
+            measure,
+            x,
+            baseline_y,
+        ),
         MathNode::Space(em) => MathBox {
             width: font_size * em,
             ascent: 0.0,
@@ -655,11 +554,7 @@ fn layout_node<T: TextMeasure>(
                 baseline_y,
             },
         ),
-        MathNode::Frac {
-            num,
-            den,
-            line_thickness,
-        } => {
+        MathNode::Frac { num, den, has_rule } => {
             let frac_size = font_size * 0.85;
 
             let num_box = layout_node(num, frac_size, color, measure, 0.0, 0.0);
@@ -681,8 +576,7 @@ fn layout_node<T: TextMeasure>(
             let num_rendered = layout_node(num, frac_size, color, measure, num_x, num_baseline);
             let den_rendered = layout_node(den, frac_size, color, measure, den_x, den_baseline);
 
-            // Only draw line if line_thickness is not Some(0.0) (for binomials)
-            let rule_svg = if line_thickness != &Some(0.0) {
+            let rule_svg = if *has_rule {
                 format!(
                     r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="1" />"#,
                     x,
@@ -695,8 +589,10 @@ fn layout_node<T: TextMeasure>(
                 String::new()
             };
 
-            let ascent = (baseline_y - num_baseline + num_rendered.ascent).max(font_size * 0.75);
-            let descent = (den_baseline - baseline_y + den_rendered.descent).max(font_size * 0.25);
+            let ascent =
+                (baseline_y - num_baseline + num_rendered.ascent).max(font_size * ASCENT_RATIO);
+            let descent =
+                (den_baseline - baseline_y + den_rendered.descent).max(font_size * DESCENT_RATIO);
 
             MathBox {
                 width: frac_width,
@@ -800,30 +696,9 @@ fn layout_node<T: TextMeasure>(
                 svg: format!("{}{}{}", index_box.svg, radical_svg, inner_box.svg),
             }
         }
-        MathNode::Table { rows, column_align } => {
-            layout_table(rows, column_align, font_size, color, measure, x, baseline_y)
-        }
+        MathNode::Table { rows } => layout_table(rows, font_size, color, measure, x, baseline_y),
         MathNode::StretchyOp { op, form } => {
-            let (w, _h) = measure_token(op, font_size, false, measure);
-            let offset = match form.as_str() {
-                "prefix" => font_size * 0.08,
-                "postfix" => -font_size * 0.08,
-                _ => 0.0,
-            };
-            let svg = format!(
-                r#"<text x="{:.2}" y="{:.2}" font-family="serif" font-size="{:.2}" fill="{}">{}</text>"#,
-                x + offset,
-                baseline_y,
-                font_size,
-                color,
-                escape_xml(op)
-            );
-            MathBox {
-                width: w,
-                ascent: font_size * 0.75,
-                descent: font_size * 0.25,
-                svg,
-            }
+            layout_regular_stretchy_operator(op, form, font_size, color, measure, x, baseline_y)
         }
     }
 }
@@ -836,8 +711,8 @@ fn layout_row<T: TextMeasure>(
     start_x: f32,
     baseline_y: f32,
 ) -> MathBox {
-    let mut target_ascent: f32 = font_size * 0.75;
-    let mut target_descent: f32 = font_size * 0.25;
+    let mut target_ascent: f32 = font_size * ASCENT_RATIO;
+    let mut target_descent: f32 = font_size * DESCENT_RATIO;
 
     for child in children {
         if matches!(child, MathNode::StretchyOp { .. }) {
@@ -850,8 +725,8 @@ fn layout_row<T: TextMeasure>(
 
     let mut cx = start_x;
     let mut svg = String::new();
-    let mut max_ascent: f32 = font_size * 0.75;
-    let mut max_descent: f32 = font_size * 0.25;
+    let mut max_ascent: f32 = font_size * ASCENT_RATIO;
+    let mut max_descent: f32 = font_size * DESCENT_RATIO;
 
     for child in children {
         let child_box = match child {
@@ -929,7 +804,6 @@ fn layout_stretched_delimiter<T: TextMeasure>(
     let mid = baseline_y + (target_descent - target_ascent) * 0.08;
     let left = x + stroke_width;
     let right = x + width - stroke_width;
-    let escaped = escape_xml(op);
     let d = match op {
         "[" => format!(
             "M {right:.2} {top:.2} L {left:.2} {top:.2} L {left:.2} {bottom:.2} L {right:.2} {bottom:.2}"
@@ -982,8 +856,8 @@ fn layout_stretched_delimiter<T: TextMeasure>(
         ascent: target_ascent,
         descent: target_descent,
         svg: format!(
-            r#"<path data-math-delimiter="{}" d="{}" stroke="{}" stroke-width="{:.2}" stroke-linecap="round" stroke-linejoin="round" fill="none" />"#,
-            escaped, d, color, stroke_width
+            r#"<path d="{}" stroke="{}" stroke-width="{:.2}" stroke-linecap="round" stroke-linejoin="round" fill="none" />"#,
+            d, color, stroke_width
         ),
     }
 }
@@ -997,26 +871,20 @@ fn layout_regular_stretchy_operator<T: TextMeasure>(
     x: f32,
     baseline_y: f32,
 ) -> MathBox {
-    let (w, _h) = measure_token(op, font_size, false, measure);
     let offset = match form {
         "prefix" => font_size * 0.08,
         "postfix" => -font_size * 0.08,
         _ => 0.0,
     };
-    let svg = format!(
-        r#"<text x="{:.2}" y="{:.2}" font-family="serif" font-size="{:.2}" fill="{}">{}</text>"#,
-        x + offset,
-        baseline_y,
+    text_box(
+        op,
+        MathFont::Serif,
         font_size,
         color,
-        escape_xml(op)
-    );
-    MathBox {
-        width: w,
-        ascent: font_size * 0.75,
-        descent: font_size * 0.25,
-        svg,
-    }
+        measure,
+        x + offset,
+        baseline_y,
+    )
 }
 
 fn is_supported_stretched_delimiter(op: &str) -> bool {
@@ -1115,7 +983,6 @@ fn layout_underover<T: TextMeasure>(
 
 fn layout_table<T: TextMeasure>(
     rows: &[Vec<MathNode>],
-    _column_align: &[String],
     font_size: f32,
     color: &str,
     measure: &mut T,
@@ -1125,8 +992,8 @@ fn layout_table<T: TextMeasure>(
     if rows.is_empty() {
         return MathBox {
             width: 0.0,
-            ascent: font_size * 0.75,
-            descent: font_size * 0.25,
+            ascent: font_size * ASCENT_RATIO,
+            descent: font_size * DESCENT_RATIO,
             svg: String::new(),
         };
     }
@@ -1140,8 +1007,8 @@ fn layout_table<T: TextMeasure>(
     let mut row_heights: Vec<(f32, f32)> = Vec::new(); // (ascent, descent) per row
 
     for row in rows {
-        let mut row_ascent = cell_size * 0.75;
-        let mut row_descent = cell_size * 0.25;
+        let mut row_ascent = cell_size * ASCENT_RATIO;
+        let mut row_descent = cell_size * DESCENT_RATIO;
 
         for (col_idx, cell) in row.iter().enumerate() {
             let cell_box = layout_node(cell, cell_size, color, measure, 0.0, 0.0);
@@ -1222,91 +1089,7 @@ fn is_large_operator(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct MockMeasure;
-
-    impl TextMeasure for MockMeasure {
-        fn measure_text(
-            &mut self,
-            text: &str,
-            font_size: f32,
-            _is_code: bool,
-            _is_bold: bool,
-            _is_italic: bool,
-            _max_width: Option<f32>,
-        ) -> (f32, f32) {
-            (text.len() as f32 * font_size * 0.6, font_size)
-        }
-    }
-
-    #[test]
-    fn test_extract_text() {
-        // Scenario 1: Empty input
-        assert_eq!(extract_text(&[]), "");
-
-        // Scenario 2: Supported variants
-        let children = vec![
-            MathNode::Text("Hello ".to_string()),
-            MathNode::Ident("x".to_string()),
-            MathNode::Number("123".to_string()),
-            MathNode::Operator("+".to_string()),
-        ];
-        assert_eq!(extract_text(&children), "Hello x123+");
-
-        // Scenario 3: Ignored variants
-        let ignored = vec![
-            MathNode::Row(vec![]),
-            MathNode::Sup {
-                base: Box::new(MathNode::Text("b".to_string())),
-                sup: Box::new(MathNode::Text("s".to_string())),
-            },
-            MathNode::Sub {
-                base: Box::new(MathNode::Text("b".to_string())),
-                sub: Box::new(MathNode::Text("s".to_string())),
-            },
-            MathNode::SubSup {
-                base: Box::new(MathNode::Text("b".to_string())),
-                sub: Box::new(MathNode::Text("s".to_string())),
-                sup: Box::new(MathNode::Text("p".to_string())),
-            },
-            MathNode::Frac {
-                num: Box::new(MathNode::Text("n".to_string())),
-                den: Box::new(MathNode::Text("d".to_string())),
-                line_thickness: None,
-            },
-            MathNode::Sqrt {
-                radicand: Box::new(MathNode::Text("r".to_string())),
-            },
-            MathNode::Root {
-                radicand: Box::new(MathNode::Text("r".to_string())),
-                index: Box::new(MathNode::Text("i".to_string())),
-            },
-            MathNode::UnderOver {
-                base: Box::new(MathNode::Text("b".to_string())),
-                under: Some(Box::new(MathNode::Text("u".to_string()))),
-                over: Some(Box::new(MathNode::Text("o".to_string()))),
-            },
-            MathNode::Space(1.0),
-            MathNode::Table {
-                rows: vec![],
-                column_align: vec![],
-            },
-            MathNode::StretchyOp {
-                op: "(".to_string(),
-                form: "prefix".to_string(),
-            },
-        ];
-        assert_eq!(extract_text(&ignored), "");
-
-        // Scenario 4: Mixture
-        let mixture = vec![
-            MathNode::Text("val: ".to_string()),
-            MathNode::Space(2.0),
-            MathNode::Number("42".to_string()),
-            MathNode::Row(vec![MathNode::Text("inner".to_string())]),
-        ];
-        assert_eq!(extract_text(&mixture), "val: 42");
-    }
+    use crate::display::markdown::markie::MockMeasure;
 
     #[test]
     fn test_parse_mathml_decodes_references_and_empty_element_attributes() {
@@ -1333,19 +1116,41 @@ mod tests {
     }
 
     #[test]
-    fn test_render_math_basic() {
+    fn supported_expressions_render_visible_geometry() {
         let mut measure = MockMeasure;
-        let result = render_math("x + 1", 16.0, "#000000", &mut measure, false);
+        let expressions = [
+            "x + 1",
+            r"\frac{a}{b}",
+            r"\sqrt{x}",
+            r"\sqrt[3]{x}",
+            r"\sum_{i=0}^n i",
+            "x_{i}",
+            "x^{2}",
+            "x_{i}^{2}",
+            r"\text{plain text}",
+            r"\binom{n}{k}",
+            r"\begin{matrix} a & b \\ c & d \end{matrix}",
+            r"\begin{bmatrix} a & b \\ c & d \end{bmatrix}",
+            r"\begin{aligned} a &= b + c \\ d &= e + f \end{aligned}",
+            r"\begin{cases} x + y = 1 \\ x - y = 0 \end{cases}",
+            r"\begin{array}{cc} 1 & 2 \\ 3 & 4 \end{array}",
+        ];
 
-        assert!(result.is_ok());
-        let math_res = result.unwrap();
-        assert!(math_res.width > 0.0);
-        assert!(math_res.ascent > 0.0);
-        assert!(math_res.descent > 0.0);
-        assert!(math_res.svg_fragment.contains("<text"));
-        assert!(math_res.svg_fragment.contains("x"));
-        assert!(math_res.svg_fragment.contains("+"));
-        assert!(math_res.svg_fragment.contains("1"));
+        for display in [false, true] {
+            for latex in expressions {
+                let result = render_math(latex, 16.0, "#000000", &mut measure, display)
+                    .unwrap_or_else(|err| panic!("{latex} failed to render: {err}"));
+                assert!(
+                    result.width > 0.0 && result.ascent + result.descent > 0.0,
+                    "{latex} has empty geometry"
+                );
+                let image = rasterize(&result);
+                assert!(
+                    image.pixels().any(|pixel| pixel[3] > 0),
+                    "{latex} rendered no ink"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1357,126 +1162,81 @@ mod tests {
         assert!(result.unwrap_err().contains("LaTeX parse error"));
     }
 
-    #[test]
-    fn test_render_math_display_mode() {
-        let mut measure = MockMeasure;
-        let inline_res = render_math("x^2", 16.0, "#000000", &mut measure, false).unwrap();
-        let display_res = render_math("x^2", 16.0, "#000000", &mut measure, true).unwrap();
+    const RASTER_PAD: f32 = 4.0;
 
-        // They might have different metrics or structures, but both should be valid SVGs
-        assert!(inline_res.svg_fragment.contains("<text"));
-        assert!(display_res.svg_fragment.contains("<text"));
+    fn rasterize(result: &MathResult) -> image::RgbaImage {
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}"><g transform="translate({RASTER_PAD} {})">{}</g></svg>"#,
+            result.width + RASTER_PAD * 2.0,
+            result.ascent + result.descent + RASTER_PAD * 2.0,
+            result.ascent + RASTER_PAD,
+            result.svg_fragment
+        );
+        crate::display::markdown::markie::svg_to_image(&svg)
+            .unwrap()
+            .to_rgba8()
     }
 
-    #[test]
-    fn test_render_math_complex() {
-        let mut measure = MockMeasure;
-        let expressions = vec![
-            "\\frac{a}{b}",
-            "\\sqrt{x}",
-            "\\sqrt[3]{x}",
-            "\\sum_{i=0}^n i",
-            "x_{i}",
-            "x^{2}",
-            "x_{i}^{2}",
-            "\\text{plain text}",
-            "\\begin{matrix} a & b \\\\ c & d \\end{matrix}",
-            "\\binom{n}{k}",
-        ];
-
-        for expr in expressions {
-            let result = render_math(expr, 16.0, "#000000", &mut measure, true);
-            assert!(
-                result.is_ok(),
-                "Failed to render complex expression: {}",
-                expr
-            );
-            let res = result.unwrap();
-            assert!(res.width > 0.0);
-            assert!(!res.svg_fragment.is_empty());
+    /// Height of the ink drawn between columns `x0..x1` of the formula box.
+    fn ink_height(image: &image::RgbaImage, x0: f32, x1: f32) -> u32 {
+        let x0 = (x0 + RASTER_PAD).floor() as u32;
+        let x1 = ((x1 + RASTER_PAD).ceil() as u32).min(image.width());
+        let rows: Vec<u32> = (0..image.height())
+            .filter(|&y| (x0..x1).any(|x| image.get_pixel(x, y)[3] > 64))
+            .collect();
+        match (rows.first(), rows.last()) {
+            (Some(top), Some(bottom)) => bottom - top + 1,
+            _ => 0,
         }
     }
 
     #[test]
-    fn test_render_aligned_environment() {
+    fn test_multiline_delimiters_span_the_content_height() {
         let mut measure = MockMeasure;
-        let latex = r"\begin{aligned} a &= b + c \\ d &= e + f \end{aligned}";
-        let result = render_math(latex, 16.0, "#000000", &mut measure, true);
-        assert!(
-            result.is_ok(),
-            "aligned environment should render successfully, got: {:?}",
-            result.err()
-        );
-        let res = result.unwrap();
-        assert!(res.width > 0.0);
-    }
-
-    #[test]
-    fn test_render_cases_environment() {
-        let mut measure = MockMeasure;
-        let latex = r"\begin{cases} x + y = 1 \\ x - y = 0 \end{cases}";
-        let result = render_math(latex, 16.0, "#000000", &mut measure, true);
-        assert!(
-            result.is_ok(),
-            "cases environment should render successfully, got: {:?}",
-            result.err()
-        );
-        let res = result.unwrap();
-        assert!(res.width > 0.0);
-    }
-
-    #[test]
-    fn test_multiline_delimiters_render_as_stretched_paths() {
-        let mut measure = MockMeasure;
+        let font_size = 16.0;
         let cases = [
             (
-                "bmatrix",
                 r"\begin{bmatrix} a & b & c \\ d & e & f \\ g & h & i \end{bmatrix}",
-                &[("[", 1), ("]", 1)][..],
+                Some("["),
+                Some("]"),
             ),
             (
-                "pmatrix",
                 r"\begin{pmatrix} a & b & c \\ d & e & f \\ g & h & i \end{pmatrix}",
-                &[("(", 1), (")", 1)][..],
+                Some("("),
+                Some(")"),
             ),
             (
-                "cases",
                 r"\begin{cases} x + 1 & x > 0 \\ x - 1 & x \leq 0 \end{cases}",
-                &[("{", 1)][..],
+                Some("{"),
+                None,
             ),
             (
-                "absolute matrix",
                 r"\left| \begin{matrix} a & b \\ c & d \\ e & f \end{matrix} \right|",
-                &[("|", 2)][..],
+                Some("|"),
+                Some("|"),
             ),
         ];
 
-        for (name, latex, expected_delimiters) in cases {
-            let result = render_math(latex, 16.0, "#000000", &mut measure, true).unwrap();
-            for (delimiter, expected_count) in expected_delimiters {
-                let marker = format!("data-math-delimiter=\"{delimiter}\"");
-                let count = result.svg_fragment.matches(&marker).count();
-                assert_eq!(
-                    count, *expected_count,
-                    "{name} delimiter {delimiter} should be rendered as stretched path(s): {}",
-                    result.svg_fragment
+        for (latex, left, right) in cases {
+            let result = render_math(latex, font_size, "#000000", &mut measure, true).unwrap();
+            let image = rasterize(&result);
+            let min_height = (result.ascent + result.descent) * 0.8;
+            let mut columns = Vec::new();
+            if let Some(op) = left {
+                columns.push((op, 0.0, stretched_delimiter_width(op, font_size)));
+            }
+            if let Some(op) = right {
+                let width = stretched_delimiter_width(op, font_size);
+                columns.push((op, result.width - width, result.width));
+            }
+            for (op, x0, x1) in columns {
+                let height = ink_height(&image, x0, x1) as f32;
+                assert!(
+                    height >= min_height,
+                    "{latex}: delimiter {op} ink height {height} should reach {min_height}"
                 );
             }
         }
-    }
-
-    #[test]
-    fn test_render_array_environment() {
-        let mut measure = MockMeasure;
-        let latex = r"\begin{array}{cc} 1 & 2 \\ 3 & 4 \end{array}";
-        let result = render_math(latex, 16.0, "#000000", &mut measure, true);
-        assert!(
-            result.is_ok(),
-            "array environment should render successfully, got: {:?}",
-            result.err()
-        );
-        let res = result.unwrap();
-        assert!(res.width > 0.0);
     }
 
     #[test]
@@ -1502,13 +1262,22 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_preserves_supported_environments() {
+    fn nested_matrix_keeps_outer_rows() {
         let mut measure = MockMeasure;
-        let latex = r"\begin{bmatrix} a & b \\ c & d \end{bmatrix}";
-        let result = render_math(latex, 16.0, "#000000", &mut measure, true);
+        let mut height = |latex: &str| {
+            let result = render_math(latex, 16.0, "#000000", &mut measure, true).unwrap();
+            result.ascent + result.descent
+        };
+        let nested = height(
+            r"\begin{pmatrix} \begin{pmatrix}a&b\\c&d\end{pmatrix} & x \\ y & z \end{pmatrix}",
+        );
+        let flat_two_rows = height(r"\begin{pmatrix} a & x \\ y & z \end{pmatrix}");
+
+        // The outer matrix has two rows and its first row holds a two-row
+        // matrix, so it must be taller than a plain two-row matrix.
         assert!(
-            result.is_ok(),
-            "bmatrix should still work after preprocessing"
+            nested > flat_two_rows,
+            "nested matrix height {nested} should exceed two-row matrix height {flat_two_rows}"
         );
     }
 }

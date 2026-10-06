@@ -1,11 +1,8 @@
-#![allow(dead_code)]
-
 pub(super) mod layout;
 pub(super) mod math;
 pub(super) mod mermaid;
 pub(super) mod xml;
 
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, Weight};
@@ -14,15 +11,15 @@ use resvg::usvg;
 use tiny_skia::{Pixmap, Transform};
 
 pub(super) trait TextMeasure {
-    fn measure_text(
+    /// Advance width of `text` laid out on a single line.
+    fn measure_width(
         &mut self,
         text: &str,
         font_size: f32,
         is_code: bool,
         is_bold: bool,
         is_italic: bool,
-        max_width: Option<f32>,
-    ) -> (f32, f32);
+    ) -> f32;
 }
 
 pub(super) struct FontSystemMeasure<'a> {
@@ -36,18 +33,16 @@ impl<'a> FontSystemMeasure<'a> {
 }
 
 impl TextMeasure for FontSystemMeasure<'_> {
-    fn measure_text(
+    fn measure_width(
         &mut self,
         text: &str,
         font_size: f32,
         is_code: bool,
         is_bold: bool,
         is_italic: bool,
-        max_width: Option<f32>,
-    ) -> (f32, f32) {
-        let line_height = font_size * 1.2;
-        let mut buffer = Buffer::new(self.font_system, Metrics::new(font_size, line_height));
-        buffer.set_size(max_width, None);
+    ) -> f32 {
+        let mut buffer = Buffer::new(self.font_system, Metrics::new(font_size, font_size * 1.2));
+        buffer.set_size(None, None);
         let attrs = Attrs::new()
             .family(if is_code {
                 Family::Monospace
@@ -66,14 +61,28 @@ impl TextMeasure for FontSystemMeasure<'_> {
             });
         buffer.set_text(text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(self.font_system, false);
+        buffer
+            .layout_runs()
+            .map(|run| run.line_w)
+            .fold(0.0, f32::max)
+    }
+}
 
-        let mut width: f32 = 0.0;
-        let mut height: f32 = 0.0;
-        for run in buffer.layout_runs() {
-            width = width.max(run.line_w);
-            height += run.line_height;
-        }
-        (width, height.max(line_height))
+/// Deterministic measure for layout tests: every char is 0.6 em wide.
+#[cfg(test)]
+pub(super) struct MockMeasure;
+
+#[cfg(test)]
+impl TextMeasure for MockMeasure {
+    fn measure_width(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        _is_code: bool,
+        _is_bold: bool,
+        _is_italic: bool,
+    ) -> f32 {
+        text.chars().count() as f32 * font_size * 0.6
     }
 }
 
@@ -86,10 +95,6 @@ pub(super) fn svg_to_image(svg: &str) -> Result<DynamicImage, String> {
         .get_or_init(|| {
             let mut db = fontdb::Database::new();
             db.load_system_fonts();
-            let local_fonts = Path::new("fonts");
-            if local_fonts.is_dir() {
-                db.load_fonts_dir(local_fonts);
-            }
             Arc::new(db)
         })
         .clone();

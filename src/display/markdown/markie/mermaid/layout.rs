@@ -1,104 +1,60 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::display::markdown::markie::TextMeasure;
+use crate::display::markdown::markie::layout::Rect;
 
 use super::types::*;
 
-/// Bounding box for layout elements
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BBox {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
+/// Edge and center accessors used throughout diagram layout and rendering.
+pub(super) trait RectExt {
+    fn right(&self) -> f32;
+    fn bottom(&self) -> f32;
+    fn center(&self) -> (f32, f32);
 }
 
-impl BBox {
-    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
+impl RectExt for Rect {
+    fn right(&self) -> f32 {
+        self.x + self.w
     }
 
-    pub fn right(&self) -> f32 {
-        self.x + self.width
+    fn bottom(&self) -> f32 {
+        self.y + self.h
     }
 
-    pub fn bottom(&self) -> f32 {
-        self.y + self.height
-    }
-
-    pub fn with_padding(&self, padding: f32) -> Self {
-        Self::new(
-            self.x - padding,
-            self.y - padding,
-            self.width + padding * 2.0,
-            self.height + padding * 2.0,
-        )
-    }
-}
-
-/// Layout position for a node
-#[derive(Debug, Clone, Copy)]
-pub struct LayoutPos {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
-
-impl LayoutPos {
-    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    pub fn center(&self) -> (f32, f32) {
-        (self.x + self.width / 2.0, self.y + self.height / 2.0)
-    }
-
-    pub fn right(&self) -> f32 {
-        self.x + self.width
-    }
-
-    pub fn bottom(&self) -> f32 {
-        self.y + self.height
+    fn center(&self) -> (f32, f32) {
+        (self.x + self.w / 2.0, self.y + self.h / 2.0)
     }
 }
 
 /// Intermediate waypoints for edges routed through dummy nodes.
 pub type EdgeWaypoints = HashMap<(String, String), Vec<(f32, f32)>>;
 
+// Slightly larger default spacing improves readability in dense docs.
+const NODE_SPACING_X: f32 = 64.0;
+const NODE_SPACING_Y: f32 = 72.0;
+const EDGE_LABEL_PADDING: f32 = 8.0;
+const NODE_PADDING_H: f32 = 18.0;
+const NODE_PADDING_V: f32 = 12.0;
+
+/// Baseline-to-baseline distance of class member rows, relative to the font size.
+pub(super) const CLASS_MEMBER_LINE_HEIGHT: f32 = 0.9;
+/// ER attribute rows are drawn slightly smaller than the entity name.
+pub(super) const ER_ATTRIBUTE_FONT_SCALE: f32 = 0.9;
+
+// Composite state interior: children are stacked with routing lanes on both sides.
+pub(super) const STATE_CHILD_GAP: f32 = 20.0;
+pub(super) const STATE_INNER_PAD: f32 = 16.0;
+pub(super) const STATE_ROUTE_LANE: f32 = 40.0;
+
 /// Layout engine for diagrams
 pub struct LayoutEngine<'a, T: TextMeasure> {
     measure: &'a mut T,
     font_size: f32,
-    pub node_spacing_x: f32,
-    pub node_spacing_y: f32,
-    pub edge_label_padding: f32,
-    pub node_padding_h: f32,
-    pub node_padding_v: f32,
 }
 
 impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
     pub fn new(measure: &'a mut T, font_size: f32) -> Self {
-        Self {
-            measure,
-            font_size,
-            // Slightly larger default spacing improves readability in dense docs.
-            node_spacing_x: 64.0,
-            node_spacing_y: 72.0,
-            edge_label_padding: 8.0,
-            node_padding_h: 18.0,
-            node_padding_v: 12.0,
-        }
+        Self { measure, font_size }
     }
 
     fn measure_text_width(
@@ -111,8 +67,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
     ) -> f32 {
         let cleaned = crate::display::markdown::markie::xml::sanitize_xml_text(text);
         self.measure
-            .measure_text(&cleaned, font_size, is_code, bold, italic, None)
-            .0
+            .measure_width(&cleaned, font_size, is_code, bold, italic)
     }
 
     fn measure_multiline(
@@ -144,18 +99,12 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
     pub fn layout_flowchart(
         &mut self,
         flowchart: &Flowchart,
-    ) -> (HashMap<String, LayoutPos>, EdgeWaypoints, BBox) {
-        let positions: HashMap<String, LayoutPos> = HashMap::new();
-
-        if flowchart.nodes.is_empty() {
-            return (positions, HashMap::new(), BBox::default());
-        }
-
+    ) -> (HashMap<String, Rect>, EdgeWaypoints, Rect) {
         let nodes: Vec<String> = flowchart.nodes.iter().map(|n| n.id.clone()).collect();
-        let edges: Vec<(String, String, usize)> = flowchart
+        let edges: Vec<(String, String)> = flowchart
             .edges
             .iter()
-            .map(|e| (e.from.clone(), e.to.clone(), e.min_length.max(1)))
+            .map(|e| (e.from.clone(), e.to.clone()))
             .collect();
         let mut node_sizes: HashMap<String, (f32, f32)> = HashMap::new();
         for node in &flowchart.nodes {
@@ -172,8 +121,8 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         let line_height = self.font_size * 1.2;
         let (text_width, lines) =
             self.measure_multiline(label, self.font_size, false, false, false);
-        let pad_w = self.node_padding_h * 2.0;
-        let pad_h = self.node_padding_v * 2.0;
+        let pad_w = NODE_PADDING_H * 2.0;
+        let pad_h = NODE_PADDING_V * 2.0;
 
         let text_h = line_height * lines as f32;
         let mut width = (text_width + pad_w).max(56.0);
@@ -219,16 +168,10 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         (width, height)
     }
 
-    /// Layout a sequence diagram with measured actor and label widths.
-    pub fn layout_sequence(
-        &mut self,
-        diagram: &SequenceDiagram,
-    ) -> (HashMap<String, LayoutPos>, BBox) {
-        let mut positions: HashMap<String, LayoutPos> = HashMap::new();
-
-        if diagram.participants.is_empty() {
-            return (positions, BBox::default());
-        }
+    /// Place participants left to right. Returns their boxes and the right edge
+    /// of the diagram; the renderer owns the vertical extent of the messages.
+    pub fn layout_sequence(&mut self, diagram: &SequenceDiagram) -> (HashMap<String, Rect>, f32) {
+        let mut positions: HashMap<String, Rect> = HashMap::new();
 
         let participant_height = (self.font_size * 2.4).max(36.0);
         let start_x = 40.0;
@@ -265,9 +208,6 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         for _ in 0..3 {
             let mut changed = false;
             for (a, b, required) in &pair_requirements {
-                if *a >= *b {
-                    continue;
-                }
                 let distance = centers[*b] - centers[*a];
                 if distance + 0.5 < *required {
                     let delta = *required - distance;
@@ -287,38 +227,21 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
             let x = centers[i] - width / 2.0;
             positions.insert(
                 participant.id.clone(),
-                LayoutPos::new(x, start_y, width, participant_height),
+                Rect::new(x, start_y, width, participant_height),
             );
         }
 
-        let mut current_y = start_y + participant_height + 40.0;
-        let mut max_label_half_width = 0.0;
-        self.measure_sequence_metrics(&diagram.elements, &mut current_y, &mut max_label_half_width);
-
-        if diagram.elements.is_empty() {
-            current_y += 40.0;
-        }
-
-        let left = positions
-            .values()
-            .map(|p| p.x)
-            .fold(f32::MAX, f32::min)
-            .min(start_x);
+        let max_label_half_width = self.max_message_label_half_width(&diagram.elements);
         let right = positions
             .values()
             .map(|p| p.right())
             .fold(0.0, f32::max)
             .max(start_x + 120.0);
 
-        let bbox = BBox::new(
-            left,
-            0.0,
-            (right - left) + max_label_half_width * 2.0,
-            current_y + 20.0,
+        (
+            positions,
+            right + max_label_half_width * 2.0 + EDGE_LABEL_PADDING / 2.0,
         )
-        .with_padding(self.edge_label_padding / 2.0);
-
-        (positions, bbox)
     }
 
     fn collect_sequence_pair_requirements(
@@ -351,7 +274,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                         // intermediate pairs apart so labels have room.
                         if b - a > 1 {
                             let pill_w = label_w + 20.0;
-                            let per_pair = (pill_w / (b - a - 1).max(1) as f32 + 40.0).max(140.0);
+                            let per_pair = (pill_w / (b - a - 1) as f32 + 40.0).max(140.0);
                             for i in a..b {
                                 out.push((i, i + 1, per_pair));
                             }
@@ -371,12 +294,9 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         }
     }
 
-    fn measure_sequence_metrics(
-        &mut self,
-        elements: &[SequenceElement],
-        current_y: &mut f32,
-        max_label_half_width: &mut f32,
-    ) {
+    /// Half of the widest message label plus padding, searched through nested blocks.
+    fn max_message_label_half_width(&mut self, elements: &[SequenceElement]) -> f32 {
+        let mut max_half_width: f32 = 0.0;
         for element in elements {
             match element {
                 SequenceElement::Message(msg) => {
@@ -387,148 +307,70 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                         false,
                         false,
                     );
-                    *max_label_half_width =
-                        (*max_label_half_width).max(label_w / 2.0 + self.edge_label_padding);
-                    *current_y += 50.0;
-                }
-                SequenceElement::Activation(_) | SequenceElement::Deactivation(_) => {
-                    *current_y += 24.0;
-                }
-                SequenceElement::Note { text, .. } => {
-                    let _ =
-                        self.measure_text_width(text, self.font_size * 0.8, false, false, false);
-                    *current_y += 42.0;
+                    max_half_width = max_half_width.max(label_w / 2.0 + EDGE_LABEL_PADDING);
                 }
                 SequenceElement::Block(block) => {
-                    // 6 (pre-padding) + 22 (title + post-gap)
-                    *current_y += 34.0;
-                    self.measure_sequence_metrics(&block.messages, current_y, max_label_half_width);
-                    for (_, branch_elements) in &block.else_branches {
-                        *current_y += 30.0;
-                        self.measure_sequence_metrics(
-                            branch_elements,
-                            current_y,
-                            max_label_half_width,
-                        );
+                    let branches = std::iter::once(&block.messages)
+                        .chain(block.else_branches.iter().map(|(_, elements)| elements));
+                    for branch in branches {
+                        max_half_width =
+                            max_half_width.max(self.max_message_label_half_width(branch));
                     }
-                    *current_y += 20.0;
                 }
+                SequenceElement::Activation(_)
+                | SequenceElement::Deactivation(_)
+                | SequenceElement::Note { .. } => {}
             }
         }
+        max_half_width
     }
 
     /// Layout a class diagram.
-    pub fn layout_class(
-        &mut self,
-        diagram: &ClassDiagram,
-    ) -> (HashMap<String, LayoutPos>, EdgeWaypoints, BBox) {
-        let positions: HashMap<String, LayoutPos> = HashMap::new();
-
-        if diagram.classes.is_empty() {
-            return (positions, HashMap::new(), BBox::default());
-        }
-
+    pub fn layout_class(&mut self, diagram: &ClassDiagram) -> (HashMap<String, Rect>, Rect) {
         let mut node_sizes: HashMap<String, (f32, f32)> = HashMap::new();
         for class in &diagram.classes {
             node_sizes.insert(class.name.clone(), self.calculate_class_size(class));
         }
 
         let nodes: Vec<String> = diagram.classes.iter().map(|c| c.name.clone()).collect();
-        let edges: Vec<(String, String, usize)> = diagram
+        let edges: Vec<(String, String)> = diagram
             .relations
             .iter()
-            .map(|rel| (rel.from.clone(), rel.to.clone(), 1))
+            .map(|rel| (rel.from.clone(), rel.to.clone()))
             .collect();
 
         if edges.is_empty() {
             return self.layout_grid(&nodes, &node_sizes, 40.0, 40.0, 140.0, 110.0);
         }
 
-        self.layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::TopDown)
+        let (positions, _, bbox) =
+            self.layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::TopDown);
+        (positions, bbox)
     }
 
     fn calculate_class_size(&mut self, class: &ClassDefinition) -> (f32, f32) {
         let header_font = self.font_size;
         let member_font = self.font_size * 0.85;
-        let line_h = member_font * 1.2;
+        let line_h = self.font_size * CLASS_MEMBER_LINE_HEIGHT;
 
-        // Measure header including stereotype prefix (e.g. "<<interface>> ClassName")
-        let header_text = if class.is_interface {
-            let stereo = class.stereotype.as_deref().unwrap_or("interface");
-            format!("<<{}>> {}", stereo, class.name)
-        } else if let Some(ref stereo) = class.stereotype {
-            format!("<<{}>> {}", stereo, class.name)
-        } else {
-            class.name.clone()
-        };
+        let italic = class.is_abstract || class.is_interface;
         let mut max_width = self
-            .measure_text_width(&header_text, header_font, false, true, class.is_abstract)
+            .measure_text_width(&class.title(), header_font, false, true, italic)
             .max(120.0);
 
-        let mut attr_lines = 0usize;
-        for attr in &class.attributes {
-            let vis = match attr.member.visibility {
-                Visibility::Public => "+",
-                Visibility::Private => "-",
-                Visibility::Protected => "#",
-                Visibility::Package => "~",
-            };
-            let text = if let Some(ref t) = attr.type_annotation {
-                format!("{} {}: {}", vis, attr.member.name, t)
-            } else {
-                format!("{} {}", vis, attr.member.name)
-            };
-            max_width = max_width.max(self.measure_text_width(
-                &text,
-                member_font,
-                true,
-                false,
-                attr.member.is_abstract,
-            ));
-            attr_lines += 1;
+        let member_rows = class
+            .attributes
+            .iter()
+            .map(ClassAttribute::display)
+            .chain(class.methods.iter().map(ClassMethod::display));
+        for text in member_rows {
+            max_width =
+                max_width.max(self.measure_text_width(&text, member_font, true, false, false));
         }
+        let attr_lines = class.attributes.len();
+        let method_lines = class.methods.len();
 
-        let mut method_lines = 0usize;
-        for method in &class.methods {
-            let vis = match method.member.visibility {
-                Visibility::Public => "+",
-                Visibility::Private => "-",
-                Visibility::Protected => "#",
-                Visibility::Package => "~",
-            };
-            let params: Vec<String> = method
-                .parameters
-                .iter()
-                .map(|(name, t)| {
-                    if let Some(ty) = t {
-                        format!("{}: {}", name, ty)
-                    } else {
-                        name.clone()
-                    }
-                })
-                .collect();
-            let text = if let Some(ref ret) = method.return_type {
-                format!(
-                    "{} {}({}): {}",
-                    vis,
-                    method.member.name,
-                    params.join(", "),
-                    ret
-                )
-            } else {
-                format!("{} {}({})", vis, method.member.name, params.join(", "))
-            };
-            max_width = max_width.max(self.measure_text_width(
-                &text,
-                member_font,
-                true,
-                false,
-                method.member.is_abstract,
-            ));
-            method_lines += 1;
-        }
-
-        let width = (max_width + self.node_padding_h * 2.0).max(180.0);
+        let width = (max_width + NODE_PADDING_H * 2.0).max(180.0);
 
         let mut height = self.font_size + 16.0;
         // The render always advances by font_size + 4.0 before the first attribute,
@@ -548,118 +390,82 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
     }
 
     /// Layout a state diagram.
-    pub fn layout_state(
-        &mut self,
-        diagram: &StateDiagram,
-    ) -> (HashMap<String, LayoutPos>, EdgeWaypoints, BBox) {
-        let positions: HashMap<String, LayoutPos> = HashMap::new();
+    pub fn layout_state(&mut self, diagram: &StateDiagram) -> (HashMap<String, Rect>, Rect) {
+        let child_state_ids = diagram.nested_state_ids();
+        let states_by_id = diagram.states_by_id();
 
-        if diagram.states.is_empty() {
-            return (positions, HashMap::new(), BBox::default());
-        }
-
-        let child_state_ids: HashSet<&str> = diagram
-            .states
-            .iter()
-            .flat_map(|state| state.children.iter())
-            .filter_map(|child| match child {
-                StateElement::State(s) => Some(s.id.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        let top_level_states: Vec<&State> = diagram
+        // The implicit start state is never nested, so this is never empty.
+        let target_states: Vec<&State> = diagram
             .states
             .iter()
             .filter(|state| !child_state_ids.contains(state.id.as_str()))
             .collect();
 
-        let target_states: Vec<&State> = if top_level_states.is_empty() {
-            diagram.states.iter().collect()
-        } else {
-            top_level_states
-        };
-
         let nodes: Vec<String> = target_states.iter().map(|s| s.id.clone()).collect();
         let node_id_set: HashSet<&str> = nodes.iter().map(String::as_str).collect();
         let mut node_sizes: HashMap<String, (f32, f32)> = HashMap::new();
         for state in &target_states {
-            node_sizes.insert(state.id.clone(), self.calculate_state_size(state));
+            node_sizes.insert(state.id.clone(), self.state_size(state, &states_by_id));
         }
 
-        let edges: Vec<(String, String, usize)> = diagram
+        let edges: Vec<(String, String)> = diagram
             .transitions
             .iter()
             .filter(|t| {
                 node_id_set.contains(t.from.as_str()) && node_id_set.contains(t.to.as_str())
             })
-            .map(|t| (t.from.clone(), t.to.clone(), 1))
+            .map(|t| (t.from.clone(), t.to.clone()))
             .collect();
 
         if edges.is_empty() {
             return self.layout_grid(&nodes, &node_sizes, 40.0, 40.0, 120.0, 95.0);
         }
 
-        self.layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::TopDown)
+        let (positions, _, bbox) =
+            self.layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::TopDown);
+        (positions, bbox)
     }
 
-    fn calculate_state_size(&mut self, state: &State) -> (f32, f32) {
+    pub fn state_size(
+        &mut self,
+        state: &State,
+        states_by_id: &HashMap<&str, &State>,
+    ) -> (f32, f32) {
         if state.is_start || state.is_end {
             return (24.0, 24.0);
         }
 
         let label_w = self.measure_text_width(&state.label, self.font_size, false, false, false);
-        let base_width = (label_w + self.node_padding_h * 2.0).max(120.0);
+        let base_width = (label_w + NODE_PADDING_H * 2.0).max(120.0);
         let base_height = (self.font_size * 2.2).max(40.0);
 
         if !state.is_composite {
             return (base_width, base_height);
         }
 
-        let child_states: Vec<&State> = state
-            .children
-            .iter()
-            .filter_map(|child| match child {
-                StateElement::State(s) if s.id != state.id => Some(s),
-                _ => None,
-            })
+        let child_sizes: Vec<(f32, f32)> = state
+            .child_state_ids()
+            .map(|id| self.state_size(states_by_id[id], states_by_id))
             .collect();
 
-        if child_states.is_empty() {
+        if child_sizes.is_empty() {
             return (base_width, base_height);
         }
 
-        let child_sizes: Vec<(f32, f32)> = child_states
-            .iter()
-            .map(|s| self.calculate_state_size(s))
-            .collect();
-
-        let child_gap = 20.0;
-        let inner_pad = 16.0;
-        let route_lane = 40.0; // routing lanes on each side for transitions
         let header_h = self.font_size * 2.0 + 16.0;
 
         let max_child_w: f32 = child_sizes.iter().map(|(w, _)| *w).fold(0.0, f32::max);
         let total_child_h: f32 = child_sizes.iter().map(|(_, h)| *h).sum::<f32>()
-            + child_gap * (child_sizes.len().saturating_sub(1)) as f32;
+            + STATE_CHILD_GAP * (child_sizes.len() - 1) as f32;
 
-        let width = base_width.max(max_child_w + inner_pad * 2.0 + route_lane * 2.0);
-        let height = header_h + total_child_h + inner_pad * 2.0;
+        let width = base_width.max(max_child_w + STATE_INNER_PAD * 2.0 + STATE_ROUTE_LANE * 2.0);
+        let height = header_h + total_child_h + STATE_INNER_PAD * 2.0;
 
         (width, height)
     }
 
     /// Layout an ER diagram.
-    pub fn layout_er(
-        &mut self,
-        diagram: &ErDiagram,
-    ) -> (HashMap<String, LayoutPos>, EdgeWaypoints, BBox) {
-        let positions: HashMap<String, LayoutPos> = HashMap::new();
-
-        if diagram.entities.is_empty() {
-            return (positions, HashMap::new(), BBox::default());
-        }
-
+    pub fn layout_er(&mut self, diagram: &ErDiagram) -> (HashMap<String, Rect>, Rect) {
         let mut seen = std::collections::HashSet::new();
         let nodes: Vec<String> = diagram
             .entities
@@ -667,10 +473,10 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
             .filter(|e| seen.insert(e.name.clone()))
             .map(|e| e.name.clone())
             .collect();
-        let edges: Vec<(String, String, usize)> = diagram
+        let edges: Vec<(String, String)> = diagram
             .relationships
             .iter()
-            .map(|r| (r.from.clone(), r.to.clone(), 1))
+            .map(|r| (r.from.clone(), r.to.clone()))
             .collect();
 
         let mut node_sizes: HashMap<String, (f32, f32)> = HashMap::new();
@@ -682,25 +488,22 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
             return self.layout_grid(&nodes, &node_sizes, 40.0, 40.0, 180.0, 140.0);
         }
 
-        self.layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::LeftRight)
+        let (positions, _, bbox) =
+            self.layout_layered_graph(&nodes, &edges, &node_sizes, FlowDirection::LeftRight);
+        (positions, bbox)
     }
 
     fn calculate_er_size(&mut self, entity: &ErEntity) -> (f32, f32) {
         let title_font = self.font_size;
-        let attr_font = self.font_size * 0.85;
+        let attr_font = self.font_size * ER_ATTRIBUTE_FONT_SCALE;
 
         let mut max_w = self.measure_text_width(&entity.name, title_font, false, true, false);
         for attr in &entity.attributes {
-            let marker = if attr.is_key { "[" } else { "" };
-            let attr_name = if attr.is_key {
-                format!("{}{}]", marker, attr.name)
-            } else {
-                attr.name.clone()
-            };
-            max_w = max_w.max(self.measure_text_width(&attr_name, attr_font, false, false, false));
+            max_w =
+                max_w.max(self.measure_text_width(&attr.display(), attr_font, false, false, false));
         }
 
-        let width = (max_w + self.node_padding_h * 2.0).max(150.0);
+        let width = (max_w + NODE_PADDING_H * 2.0).max(150.0);
         let divider_space = if entity.attributes.is_empty() {
             0.0
         } else {
@@ -720,46 +523,38 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         start_y: f32,
         spacing_x: f32,
         spacing_y: f32,
-    ) -> (HashMap<String, LayoutPos>, EdgeWaypoints, BBox) {
-        let mut positions: HashMap<String, LayoutPos> = HashMap::new();
-        if nodes.is_empty() {
-            return (positions, HashMap::new(), BBox::default());
-        }
-
+    ) -> (HashMap<String, Rect>, Rect) {
+        let mut positions: HashMap<String, Rect> = HashMap::new();
         let cols = (nodes.len() as f32).sqrt().ceil() as usize;
-        let cols = cols.max(1);
 
         let mut row_heights: Vec<f32> = vec![0.0; nodes.len().div_ceil(cols)];
         for (idx, node_id) in nodes.iter().enumerate() {
             let row = idx / cols;
-            let (_, h) = node_sizes.get(node_id).copied().unwrap_or((120.0, 40.0));
+            let (_, h) = node_sizes[node_id];
             row_heights[row] = row_heights[row].max(h);
         }
 
         for (idx, node_id) in nodes.iter().enumerate() {
             let col = idx % cols;
             let row = idx / cols;
-            let (w, h) = node_sizes.get(node_id).copied().unwrap_or((120.0, 40.0));
+            let (w, h) = node_sizes[node_id];
             let y = start_y + row_heights[..row].iter().sum::<f32>() + row as f32 * spacing_y;
             let x = start_x + col as f32 * (w + spacing_x);
-            positions.insert(node_id.clone(), LayoutPos::new(x, y, w, h));
+            positions.insert(node_id.clone(), Rect::new(x, y, w, h));
         }
 
         let bbox = Self::calculate_bbox(&positions);
-        (positions, HashMap::new(), bbox)
+        (positions, bbox)
     }
 
     fn layout_layered_graph(
         &self,
         nodes: &[String],
-        edges: &[(String, String, usize)],
+        edges: &[(String, String)],
         node_sizes: &HashMap<String, (f32, f32)>,
         direction: FlowDirection,
-    ) -> (HashMap<String, LayoutPos>, EdgeWaypoints, BBox) {
-        let mut positions: HashMap<String, LayoutPos> = HashMap::new();
-        if nodes.is_empty() {
-            return (positions, HashMap::new(), BBox::default());
-        }
+    ) -> (HashMap<String, Rect>, EdgeWaypoints, Rect) {
+        let mut positions: HashMap<String, Rect> = HashMap::new();
 
         let order_index: HashMap<&str, usize> = nodes
             .iter()
@@ -767,26 +562,26 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
             .map(|(i, n)| (n.as_str(), i))
             .collect();
 
-        let mut incoming_init: HashMap<&str, Vec<(&str, usize)>> = HashMap::new();
-        let mut outgoing_init: HashMap<&str, Vec<(&str, usize)>> = HashMap::new();
+        let mut incoming_init: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut outgoing_init: HashMap<&str, Vec<&str>> = HashMap::new();
 
         for node in nodes {
             incoming_init.entry(node.as_str()).or_default();
             outgoing_init.entry(node.as_str()).or_default();
         }
 
-        for (from, to, min_len) in edges {
+        for (from, to) in edges {
             if !order_index.contains_key(from.as_str()) || !order_index.contains_key(to.as_str()) {
                 continue;
             }
             outgoing_init
                 .entry(from.as_str())
                 .or_default()
-                .push((to.as_str(), *min_len));
+                .push(to.as_str());
             incoming_init
                 .entry(to.as_str())
                 .or_default()
-                .push((from.as_str(), *min_len));
+                .push(from.as_str());
         }
 
         let mut ranks: HashMap<&str, usize> = HashMap::new();
@@ -814,13 +609,11 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         }
 
         while let Some(node) = queue.pop_front() {
-            let rank = *ranks.get(node).unwrap_or(&0);
-            if let Some(neighbors) = outgoing_init.get(node) {
-                for &(neighbor, min_len) in neighbors {
-                    if !ranks.contains_key(neighbor) {
-                        ranks.insert(neighbor, rank + min_len.max(1));
-                        queue.push_back(neighbor);
-                    }
+            let rank = ranks[node];
+            for &neighbor in &outgoing_init[node] {
+                if !ranks.contains_key(neighbor) {
+                    ranks.insert(neighbor, rank + 1);
+                    queue.push_back(neighbor);
                 }
             }
         }
@@ -833,13 +626,11 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                 queue.push_back(node.as_str());
 
                 while let Some(cur) = queue.pop_front() {
-                    let rank = *ranks.get(cur).unwrap_or(&0);
-                    if let Some(neighbors) = outgoing_init.get(cur) {
-                        for &(neighbor, min_len) in neighbors {
-                            if !ranks.contains_key(neighbor) {
-                                ranks.insert(neighbor, rank + min_len.max(1));
-                                queue.push_back(neighbor);
-                            }
+                    let rank = ranks[cur];
+                    for &neighbor in &outgoing_init[cur] {
+                        if !ranks.contains_key(neighbor) {
+                            ranks.insert(neighbor, rank + 1);
+                            queue.push_back(neighbor);
                         }
                     }
                 }
@@ -853,15 +644,15 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
             ranks.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         let mut dummy_set: HashSet<String> = HashSet::new();
         let mut edge_dummy_chains: HashMap<(String, String), Vec<String>> = HashMap::new();
-        let mut augmented_edges: Vec<(String, String, usize)> = Vec::new();
+        let mut augmented_edges: Vec<(String, String)> = Vec::new();
 
-        for (from, to, min_len) in edges {
+        for (from, to) in edges {
             if !order_index.contains_key(from.as_str()) || !order_index.contains_key(to.as_str()) {
-                augmented_edges.push((from.clone(), to.clone(), *min_len));
+                augmented_edges.push((from.clone(), to.clone()));
                 continue;
             }
-            let from_rank = ranks.get(from.as_str()).copied().unwrap_or(0);
-            let to_rank = ranks.get(to.as_str()).copied().unwrap_or(0);
+            let from_rank = ranks[from.as_str()];
+            let to_rank = ranks[to.as_str()];
 
             if to_rank > from_rank + 1 {
                 let mut chain: Vec<String> = Vec::new();
@@ -873,13 +664,13 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                     ranks_owned.insert(dummy_id.clone(), rank);
                     dummy_set.insert(dummy_id.clone());
                     chain.push(dummy_id.clone());
-                    augmented_edges.push((prev, dummy_id.clone(), 1));
+                    augmented_edges.push((prev, dummy_id.clone()));
                     prev = dummy_id;
                 }
-                augmented_edges.push((prev, to.clone(), 1));
+                augmented_edges.push((prev, to.clone()));
                 edge_dummy_chains.insert((from.clone(), to.clone()), chain);
             } else {
-                augmented_edges.push((from.clone(), to.clone(), *min_len));
+                augmented_edges.push((from.clone(), to.clone()));
             }
         }
 
@@ -891,37 +682,28 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
             .map(|(i, n)| (n.as_str(), i))
             .collect();
 
-        let mut incoming: HashMap<&str, Vec<(&str, usize)>> = HashMap::new();
-        let mut outgoing: HashMap<&str, Vec<(&str, usize)>> = HashMap::new();
+        let mut incoming: HashMap<&str, Vec<&str>> = HashMap::new();
+        let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
 
         for node in &all_node_ids {
             incoming.entry(node.as_str()).or_default();
             outgoing.entry(node.as_str()).or_default();
         }
 
-        for (from, to, min_len) in &augmented_edges {
+        for (from, to) in &augmented_edges {
             if aug_order.contains_key(from.as_str()) && aug_order.contains_key(to.as_str()) {
-                outgoing
-                    .entry(from.as_str())
-                    .or_default()
-                    .push((to.as_str(), *min_len));
-                incoming
-                    .entry(to.as_str())
-                    .or_default()
-                    .push((from.as_str(), *min_len));
+                outgoing.entry(from.as_str()).or_default().push(to.as_str());
+                incoming.entry(to.as_str()).or_default().push(from.as_str());
             }
         }
 
         let mut rank_nodes: Vec<Vec<&str>> = vec![Vec::new(); max_rank + 1];
         for node in &all_node_ids {
-            let rank = ranks_owned.get(node.as_str()).copied().unwrap_or(0);
-            if rank < rank_nodes.len() {
-                rank_nodes[rank].push(node.as_str());
-            }
+            rank_nodes[ranks_owned[node.as_str()]].push(node.as_str());
         }
 
         for rank in &mut rank_nodes {
-            rank.sort_by_key(|id| aug_order.get(id).copied().unwrap_or(usize::MAX));
+            rank.sort_by_key(|id| aug_order[id]);
         }
 
         for _ in 0..6 {
@@ -944,20 +726,10 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                         (Some(x), Some(y)) => x
                             .partial_cmp(&y)
                             .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| {
-                                aug_order
-                                    .get(a)
-                                    .copied()
-                                    .unwrap_or(usize::MAX)
-                                    .cmp(&aug_order.get(b).copied().unwrap_or(usize::MAX))
-                            }),
+                            .then_with(|| aug_order[a].cmp(&aug_order[b])),
                         (Some(_), None) => std::cmp::Ordering::Less,
                         (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => aug_order
-                            .get(a)
-                            .copied()
-                            .unwrap_or(usize::MAX)
-                            .cmp(&aug_order.get(b).copied().unwrap_or(usize::MAX)),
+                        (None, None) => aug_order[a].cmp(&aug_order[b]),
                     }
                 });
             }
@@ -981,20 +753,10 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                         (Some(x), Some(y)) => x
                             .partial_cmp(&y)
                             .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| {
-                                aug_order
-                                    .get(a)
-                                    .copied()
-                                    .unwrap_or(usize::MAX)
-                                    .cmp(&aug_order.get(b).copied().unwrap_or(usize::MAX))
-                            }),
+                            .then_with(|| aug_order[a].cmp(&aug_order[b])),
                         (Some(_), None) => std::cmp::Ordering::Less,
                         (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => aug_order
-                            .get(a)
-                            .copied()
-                            .unwrap_or(usize::MAX)
-                            .cmp(&aug_order.get(b).copied().unwrap_or(usize::MAX)),
+                        (None, None) => aug_order[a].cmp(&aug_order[b]),
                     }
                 });
             }
@@ -1011,10 +773,8 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                     if rank.is_empty() {
                         0.0
                     } else {
-                        rank.iter()
-                            .map(|id| all_sizes.get(*id).copied().unwrap_or((100.0, 40.0)).0)
-                            .sum::<f32>()
-                            + self.node_spacing_x * rank.len().saturating_sub(1) as f32
+                        rank.iter().map(|id| all_sizes[*id].0).sum::<f32>()
+                            + NODE_SPACING_X * rank.len().saturating_sub(1) as f32
                     }
                 })
                 .collect();
@@ -1027,13 +787,13 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                 let mut rank_max_h: f32 = 0.0;
 
                 for node_id in rank {
-                    let (w, h) = all_sizes.get(*node_id).copied().unwrap_or((100.0, 40.0));
-                    positions.insert((*node_id).to_string(), LayoutPos::new(x, y, w, h));
-                    x += w + self.node_spacing_x;
+                    let (w, h) = all_sizes[*node_id];
+                    positions.insert((*node_id).to_string(), Rect::new(x, y, w, h));
+                    x += w + NODE_SPACING_X;
                     rank_max_h = rank_max_h.max(h);
                 }
 
-                y += rank_max_h + self.node_spacing_y;
+                y += rank_max_h + NODE_SPACING_Y;
             }
 
             // Phase 3: Coordinate refinement
@@ -1044,15 +804,15 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                         if let Some(neighbors) = incoming.get(node_id) {
                             let mut centers: Vec<f32> = neighbors
                                 .iter()
-                                .filter_map(|(n, _)| positions.get(*n))
-                                .map(|p| p.x + p.width / 2.0)
+                                .filter_map(|n| positions.get(*n))
+                                .map(|p| p.x + p.w / 2.0)
                                 .collect();
                             if !centers.is_empty() {
                                 centers.sort_by(|a, b| {
                                     a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                                 });
                                 let median = centers[centers.len() / 2];
-                                let w = all_sizes.get(*node_id).map(|s| s.0).unwrap_or(100.0);
+                                let w = all_sizes[*node_id].0;
                                 if let Some(pos) = positions.get_mut(*node_id) {
                                     pos.x = median - w / 2.0;
                                 }
@@ -1063,8 +823,8 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                     let mut prev_right = f32::NEG_INFINITY;
                     for node_id in rank {
                         if let Some(pos) = positions.get_mut(*node_id) {
-                            pos.x = pos.x.max(prev_right + self.node_spacing_x);
-                            prev_right = pos.x + pos.width;
+                            pos.x = pos.x.max(prev_right + NODE_SPACING_X);
+                            prev_right = pos.x + pos.w;
                         }
                     }
                 }
@@ -1075,15 +835,15 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                         if let Some(neighbors) = outgoing.get(node_id) {
                             let mut centers: Vec<f32> = neighbors
                                 .iter()
-                                .filter_map(|(n, _)| positions.get(*n))
-                                .map(|p| p.x + p.width / 2.0)
+                                .filter_map(|n| positions.get(*n))
+                                .map(|p| p.x + p.w / 2.0)
                                 .collect();
                             if !centers.is_empty() {
                                 centers.sort_by(|a, b| {
                                     a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                                 });
                                 let median = centers[centers.len() / 2];
-                                let w = all_sizes.get(*node_id).map(|s| s.0).unwrap_or(100.0);
+                                let w = all_sizes[*node_id].0;
                                 if let Some(pos) = positions.get_mut(*node_id) {
                                     pos.x = median - w / 2.0;
                                 }
@@ -1093,8 +853,8 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                     let mut prev_right = f32::NEG_INFINITY;
                     for node_id in &rank_nodes[rank_idx] {
                         if let Some(pos) = positions.get_mut(*node_id) {
-                            pos.x = pos.x.max(prev_right + self.node_spacing_x);
-                            prev_right = pos.x + pos.width;
+                            pos.x = pos.x.max(prev_right + NODE_SPACING_X);
+                            prev_right = pos.x + pos.w;
                         }
                     }
                 }
@@ -1106,10 +866,8 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                     if rank.is_empty() {
                         0.0
                     } else {
-                        rank.iter()
-                            .map(|id| all_sizes.get(*id).copied().unwrap_or((100.0, 40.0)).1)
-                            .sum::<f32>()
-                            + self.node_spacing_y * rank.len().saturating_sub(1) as f32
+                        rank.iter().map(|id| all_sizes[*id].1).sum::<f32>()
+                            + NODE_SPACING_Y * rank.len().saturating_sub(1) as f32
                     }
                 })
                 .collect();
@@ -1122,13 +880,13 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                 let mut rank_max_w: f32 = 0.0;
 
                 for node_id in rank {
-                    let (w, h) = all_sizes.get(*node_id).copied().unwrap_or((100.0, 40.0));
-                    positions.insert((*node_id).to_string(), LayoutPos::new(x, y, w, h));
-                    y += h + self.node_spacing_y;
+                    let (w, h) = all_sizes[*node_id];
+                    positions.insert((*node_id).to_string(), Rect::new(x, y, w, h));
+                    y += h + NODE_SPACING_Y;
                     rank_max_w = rank_max_w.max(w);
                 }
 
-                x += rank_max_w + self.node_spacing_x;
+                x += rank_max_w + NODE_SPACING_X;
             }
 
             // Phase 3: Coordinate refinement (horizontal)
@@ -1139,15 +897,15 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                         if let Some(neighbors) = incoming.get(node_id) {
                             let mut centers: Vec<f32> = neighbors
                                 .iter()
-                                .filter_map(|(n, _)| positions.get(*n))
-                                .map(|p| p.y + p.height / 2.0)
+                                .filter_map(|n| positions.get(*n))
+                                .map(|p| p.y + p.h / 2.0)
                                 .collect();
                             if !centers.is_empty() {
                                 centers.sort_by(|a, b| {
                                     a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                                 });
                                 let median = centers[centers.len() / 2];
-                                let h = all_sizes.get(*node_id).map(|s| s.1).unwrap_or(40.0);
+                                let h = all_sizes[*node_id].1;
                                 if let Some(pos) = positions.get_mut(*node_id) {
                                     pos.y = median - h / 2.0;
                                 }
@@ -1158,8 +916,8 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                     let mut prev_bottom = f32::NEG_INFINITY;
                     for node_id in rank {
                         if let Some(pos) = positions.get_mut(*node_id) {
-                            pos.y = pos.y.max(prev_bottom + self.node_spacing_y);
-                            prev_bottom = pos.y + pos.height;
+                            pos.y = pos.y.max(prev_bottom + NODE_SPACING_Y);
+                            prev_bottom = pos.y + pos.h;
                         }
                     }
                 }
@@ -1170,15 +928,15 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                         if let Some(neighbors) = outgoing.get(node_id) {
                             let mut centers: Vec<f32> = neighbors
                                 .iter()
-                                .filter_map(|(n, _)| positions.get(*n))
-                                .map(|p| p.y + p.height / 2.0)
+                                .filter_map(|n| positions.get(*n))
+                                .map(|p| p.y + p.h / 2.0)
                                 .collect();
                             if !centers.is_empty() {
                                 centers.sort_by(|a, b| {
                                     a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                                 });
                                 let median = centers[centers.len() / 2];
-                                let h = all_sizes.get(*node_id).map(|s| s.1).unwrap_or(40.0);
+                                let h = all_sizes[*node_id].1;
                                 if let Some(pos) = positions.get_mut(*node_id) {
                                     pos.y = median - h / 2.0;
                                 }
@@ -1188,8 +946,8 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
                     let mut prev_bottom = f32::NEG_INFINITY;
                     for node_id in &rank_nodes[rank_idx] {
                         if let Some(pos) = positions.get_mut(*node_id) {
-                            pos.y = pos.y.max(prev_bottom + self.node_spacing_y);
-                            prev_bottom = pos.y + pos.height;
+                            pos.y = pos.y.max(prev_bottom + NODE_SPACING_Y);
+                            prev_bottom = pos.y + pos.h;
                         }
                     }
                 }
@@ -1223,7 +981,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         if matches!(direction, FlowDirection::BottomUp) {
             let bottom = bbox.bottom();
             for pos in positions.values_mut() {
-                pos.y = bottom - (pos.y + pos.height);
+                pos.y = bottom - (pos.y + pos.h);
             }
             for wps in edge_waypoints.values_mut() {
                 for wp in wps.iter_mut() {
@@ -1234,7 +992,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         } else if matches!(direction, FlowDirection::RightLeft) {
             let right = bbox.right();
             for pos in positions.values_mut() {
-                pos.x = right - (pos.x + pos.width);
+                pos.x = right - (pos.x + pos.w);
             }
             for wps in edge_waypoints.values_mut() {
                 for wp in wps.iter_mut() {
@@ -1248,14 +1006,11 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
     }
 
     fn normalize_positions(
-        positions: &mut HashMap<String, LayoutPos>,
+        positions: &mut HashMap<String, Rect>,
         edge_waypoints: &mut EdgeWaypoints,
         target_x: f32,
         target_y: f32,
     ) {
-        if positions.is_empty() {
-            return;
-        }
         let mut min_x = f32::MAX;
         let mut min_y = f32::MAX;
         for pos in positions.values() {
@@ -1279,11 +1034,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         }
     }
 
-    fn calculate_bbox(positions: &HashMap<String, LayoutPos>) -> BBox {
-        if positions.is_empty() {
-            return BBox::default();
-        }
-
+    fn calculate_bbox(positions: &HashMap<String, Rect>) -> Rect {
         let mut min_x = f32::MAX;
         let mut min_y = f32::MAX;
         let mut max_x = f32::MIN;
@@ -1296,14 +1047,14 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
             max_y = max_y.max(pos.bottom());
         }
 
-        BBox::new(min_x, min_y, max_x - min_x, max_y - min_y)
+        Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
     }
 }
 
-fn barycenter(neighbors: &[(&str, usize)], rank_pos: &HashMap<&str, usize>) -> Option<f32> {
+fn barycenter(neighbors: &[&str], rank_pos: &HashMap<&str, usize>) -> Option<f32> {
     let mut total = 0.0;
     let mut count = 0.0;
-    for (neighbor, _) in neighbors {
+    for neighbor in neighbors {
         if let Some(pos) = rank_pos.get(neighbor) {
             total += *pos as f32;
             count += 1.0;

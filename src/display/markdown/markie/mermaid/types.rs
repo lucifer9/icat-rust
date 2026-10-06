@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 /// Node shapes in flowcharts
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeShape {
@@ -50,7 +52,6 @@ pub struct FlowchartEdge {
     pub style: EdgeStyle,
     pub arrow_head: ArrowType,
     pub arrow_tail: ArrowType,
-    pub min_length: usize,
 }
 
 /// Direction of flowchart
@@ -74,7 +75,6 @@ pub struct Flowchart {
 /// A subgraph (grouped nodes)
 #[derive(Debug, Clone)]
 pub struct Subgraph {
-    pub id: String,
     pub title: String,
     pub nodes: Vec<String>,
 }
@@ -164,12 +164,31 @@ pub enum Visibility {
     Package,
 }
 
+impl Visibility {
+    pub fn from_symbol(symbol: char) -> Option<Self> {
+        match symbol {
+            '+' => Some(Self::Public),
+            '-' => Some(Self::Private),
+            '#' => Some(Self::Protected),
+            '~' => Some(Self::Package),
+            _ => None,
+        }
+    }
+
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            Self::Public => "+",
+            Self::Private => "-",
+            Self::Protected => "#",
+            Self::Package => "~",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClassMember {
     pub visibility: Visibility,
     pub name: String,
-    pub is_static: bool,
-    pub is_abstract: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +202,37 @@ pub struct ClassMethod {
     pub member: ClassMember,
     pub parameters: Vec<(String, Option<String>)>,
     pub return_type: Option<String>,
+}
+
+impl ClassAttribute {
+    /// Text shown for the attribute row, e.g. `+ name: String`.
+    pub fn display(&self) -> String {
+        let vis = self.member.visibility.symbol();
+        match &self.type_annotation {
+            Some(ty) => format!("{} {}: {}", vis, self.member.name, ty),
+            None => format!("{} {}", vis, self.member.name),
+        }
+    }
+}
+
+impl ClassMethod {
+    /// Text shown for the method row, e.g. `+ run(n: int): bool`.
+    pub fn display(&self) -> String {
+        let vis = self.member.visibility.symbol();
+        let params: Vec<String> = self
+            .parameters
+            .iter()
+            .map(|(name, ty)| match ty {
+                Some(ty) => format!("{}: {}", name, ty),
+                None => name.clone(),
+            })
+            .collect();
+        let params = params.join(", ");
+        match &self.return_type {
+            Some(ret) => format!("{} {}({}): {}", vis, self.member.name, params, ret),
+            None => format!("{} {}({})", vis, self.member.name, params),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -201,8 +251,6 @@ pub struct ClassRelation {
     pub to: String,
     pub relation_type: ClassRelationType,
     pub label: Option<String>,
-    pub multiplicity_from: Option<String>,
-    pub multiplicity_to: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +261,21 @@ pub struct ClassDefinition {
     pub methods: Vec<ClassMethod>,
     pub is_abstract: bool,
     pub is_interface: bool,
+}
+
+impl ClassDefinition {
+    /// Header text, prefixed with the stereotype when there is one.
+    pub fn title(&self) -> String {
+        let stereotype = match &self.stereotype {
+            Some(stereotype) => Some(stereotype.as_str()),
+            None if self.is_interface => Some("interface"),
+            None => None,
+        };
+        match stereotype {
+            Some(stereotype) => format!("<<{}>> {}", stereotype, self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -244,15 +307,42 @@ pub struct StateTransition {
 
 #[derive(Debug, Clone)]
 pub enum StateElement {
-    State(State),
+    /// Id of a nested state; the state itself lives in `StateDiagram::states`.
+    State(String),
     Transition(StateTransition),
-    Note { state: String, text: String },
+    Note {
+        state: String,
+        text: String,
+    },
+}
+
+impl State {
+    pub fn child_state_ids(&self) -> impl Iterator<Item = &str> {
+        self.children.iter().filter_map(|child| match child {
+            StateElement::State(id) => Some(id.as_str()),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct StateDiagram {
     pub states: Vec<State>,
     pub transitions: Vec<StateTransition>,
+}
+
+impl StateDiagram {
+    /// Ids of states drawn inside a composite state rather than at the top level.
+    pub fn nested_state_ids(&self) -> HashSet<&str> {
+        self.states
+            .iter()
+            .flat_map(State::child_state_ids)
+            .collect()
+    }
+
+    pub fn states_by_id(&self) -> HashMap<&str, &State> {
+        self.states.iter().map(|s| (s.id.as_str(), s)).collect()
+    }
 }
 
 // ============================================
@@ -271,7 +361,17 @@ pub enum ErCardinality {
 pub struct ErAttribute {
     pub name: String,
     pub is_key: bool,
-    pub is_composite: bool,
+}
+
+impl ErAttribute {
+    /// Text shown for the attribute row; key attributes keep Mermaid's `*` marker.
+    pub fn display(&self) -> String {
+        if self.is_key {
+            format!("*{}", self.name)
+        } else {
+            self.name.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

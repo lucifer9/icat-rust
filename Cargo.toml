@@ -44,6 +44,5 @@ tiny-skia = "0.12"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
-proptest = "1"
 temp-env = "0.3"
 tempfile = "3"

@@ -1,9 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::display::markdown::markie::TextMeasure;
 use crate::display::markdown::markie::layout::Rect;
+use crate::display::markdown::markie::xml::{escape_xml, sanitize_xml_text};
 
-use super::layout::{LayoutEngine, LayoutPos};
+use super::flowchart::SelfLoop;
+use super::layout::{
+    CLASS_MEMBER_LINE_HEIGHT, ER_ATTRIBUTE_FONT_SCALE, LayoutEngine, RectExt, STATE_CHILD_GAP,
+    STATE_INNER_PAD, STATE_ROUTE_LANE,
+};
 use super::types::*;
 use super::{MermaidDiagram, parse_mermaid};
 
@@ -38,27 +43,6 @@ impl Default for DiagramStyle {
     }
 }
 
-impl DiagramStyle {
-    pub fn from_theme(text_color: &str, background: &str, code_bg: &str) -> Self {
-        let diagram_fg = pick_higher_contrast(code_bg, text_color, background);
-        let label_fg = mix_color(code_bg, &diagram_fg, 0.60);
-        let edge_color = mix_color(code_bg, &diagram_fg, 0.30);
-        let node_fill_color = mix_color(code_bg, &diagram_fg, 0.03);
-        let node_stroke_color = mix_color(code_bg, &diagram_fg, 0.20);
-
-        Self {
-            node_fill: node_fill_color,
-            node_stroke: node_stroke_color,
-            node_text: diagram_fg,
-            edge_stroke: edge_color,
-            edge_text: label_fg,
-            background: background.to_string(),
-            font_family: "sans-serif".to_string(),
-            font_size: DEFAULT_DIAGRAM_FONT_SIZE,
-        }
-    }
-}
-
 fn parse_hex_rgb(value: &str) -> Option<(f32, f32, f32)> {
     let hex = value.trim_start_matches('#');
     if hex.len() != 6 {
@@ -71,33 +55,13 @@ fn parse_hex_rgb(value: &str) -> Option<(f32, f32, f32)> {
     Some((r, g, b))
 }
 
-fn relative_luminance(color: (f32, f32, f32)) -> f32 {
-    let linear = |v: f32| {
-        if v <= 0.03928 {
-            v / 12.92
-        } else {
-            ((v + 0.055) / 1.055).powf(2.4)
-        }
-    };
-
-    let (r, g, b) = color;
-    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
-}
-
-fn contrast_ratio(a: &str, b: &str) -> Option<f32> {
-    let l1 = relative_luminance(parse_hex_rgb(a)?);
-    let l2 = relative_luminance(parse_hex_rgb(b)?);
-    let (hi, lo) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
-    Some((hi + 0.05) / (lo + 0.05))
-}
-
 /// Mix two hex colors: result = base * (1-t) + fg * t
 fn mix_color(base: &str, fg: &str, t: f32) -> String {
     let (br, bg, bb) = parse_hex_rgb(base).unwrap_or((0.95, 0.95, 0.95));
     let (fr, fg_g, fb) = parse_hex_rgb(fg).unwrap_or((0.2, 0.2, 0.2));
-    let r = (br * (1.0 - t) + fr * t).clamp(0.0, 1.0);
-    let g = (bg * (1.0 - t) + fg_g * t).clamp(0.0, 1.0);
-    let b = (bb * (1.0 - t) + fb * t).clamp(0.0, 1.0);
+    let r = br * (1.0 - t) + fr * t;
+    let g = bg * (1.0 - t) + fg_g * t;
+    let b = bb * (1.0 - t) + fb * t;
     format!(
         "#{:02x}{:02x}{:02x}",
         (r * 255.0).round() as u8,
@@ -106,15 +70,80 @@ fn mix_color(base: &str, fg: &str, t: f32) -> String {
     )
 }
 
-fn pick_higher_contrast(base: &str, primary: &str, secondary: &str) -> String {
-    let p = contrast_ratio(base, primary).unwrap_or(0.0);
-    let s = contrast_ratio(base, secondary).unwrap_or(0.0);
+/// Arrowhead drawing style shared by every diagram type.
+pub(super) enum ArrowHead {
+    Filled,
+    Open,
+}
 
-    if s > p {
-        secondary.to_string()
-    } else {
-        primary.to_string()
+/// Arrowhead whose tip sits at `(x, y)`, pointing along `angle` (radians).
+pub(super) fn arrowhead(
+    kind: ArrowHead,
+    x: f32,
+    y: f32,
+    angle: f32,
+    style: &DiagramStyle,
+) -> String {
+    const LENGTH: f32 = 8.0;
+    const HALF_WIDTH: f32 = 4.8;
+    let (sin, cos) = angle.sin_cos();
+    let p1 = (
+        x - cos * LENGTH + sin * HALF_WIDTH,
+        y - sin * LENGTH - cos * HALF_WIDTH,
+    );
+    let p2 = (
+        x - cos * LENGTH - sin * HALF_WIDTH,
+        y - sin * LENGTH + cos * HALF_WIDTH,
+    );
+    match kind {
+        ArrowHead::Filled => format!(
+            r#"<polygon points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="{}" />"#,
+            x, y, p1.0, p1.1, p2.0, p2.1, style.edge_stroke
+        ),
+        ArrowHead::Open => format!(
+            r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75" />"#,
+            p1.0, p1.1, x, y, p2.0, p2.1, style.edge_stroke
+        ),
     }
+}
+
+const PILL_PAD_X: f32 = 5.0;
+const PILL_PAD_Y: f32 = 4.0;
+
+/// Width and height of the pill `label_pill` draws around `text`.
+fn pill_size(measure: &mut impl TextMeasure, text: &str, font_size: f32) -> (f32, f32) {
+    let text_w = measure.measure_width(&sanitize_xml_text(text), font_size, false, false, false);
+    (text_w + PILL_PAD_X * 2.0, font_size + PILL_PAD_Y * 2.0)
+}
+
+/// Edge label centered on `center` over a rounded background, so it stays
+/// readable where it crosses lines. Returns the SVG and the pill bounds.
+fn label_pill(
+    measure: &mut impl TextMeasure,
+    style: &DiagramStyle,
+    text: &str,
+    font_size: f32,
+    center: (f32, f32),
+) -> (String, Rect) {
+    let (w, h) = pill_size(measure, text, font_size);
+    let (cx, cy) = center;
+    let rect = Rect::new(cx - w / 2.0, cy - h / 2.0, w, h);
+    let svg = format!(
+        r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="3" fill="{}" stroke="{}" stroke-width="0.5" /><text x="{:.2}" y="{:.2}" dy="0.35em" font-family="{}" font-size="{:.1}" fill="{}" text-anchor="middle">{}</text>"#,
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        style.node_fill,
+        style.node_stroke,
+        cx,
+        cy,
+        style.font_family,
+        font_size,
+        style.edge_text,
+        escape_xml(text)
+    );
+    (svg, rect)
 }
 
 /// Render any mermaid diagram to SVG
@@ -125,36 +154,13 @@ pub fn render_diagram<T: TextMeasure>(
 ) -> Result<(String, f32, f32), String> {
     let diagram = parse_mermaid(source)?;
 
-    let result = match diagram {
-        MermaidDiagram::Flowchart(fc) => super::flowchart::render_flowchart(&fc, style, measure)?,
-        MermaidDiagram::Sequence(seq) => render_sequence(&seq, style, measure)?,
-        MermaidDiagram::ClassDiagram(cls) => render_class(&cls, style, measure)?,
-        MermaidDiagram::StateDiagram(st) => render_state(&st, style, measure)?,
-        MermaidDiagram::ErDiagram(er) => render_er(&er, style, measure)?,
-    };
-
-    let source_lines = source.lines().filter(|l| !l.trim().is_empty()).count();
-    if source_lines > 1 {
-        let svg = &result.0;
-        let has_content = svg.contains("<text")
-            || svg.contains("<rect")
-            || svg.contains("<circle")
-            || svg.contains("<ellipse")
-            || svg.contains("<path")
-            || svg.contains("<polygon")
-            || svg.contains("<line")
-            || svg.contains("<polyline");
-        if !has_content {
-            eprintln!("Warning: Mermaid diagram produced no visual content; check syntax");
-        }
-    }
-
-    Ok(result)
-}
-
-/// Escape XML special characters
-pub fn escape_xml(s: &str) -> String {
-    crate::display::markdown::markie::xml::escape_xml(s)
+    Ok(match diagram {
+        MermaidDiagram::Flowchart(fc) => super::flowchart::render_flowchart(&fc, style, measure),
+        MermaidDiagram::Sequence(seq) => render_sequence(&seq, style, measure),
+        MermaidDiagram::ClassDiagram(cls) => render_class(&cls, style, measure),
+        MermaidDiagram::StateDiagram(st) => render_state(&st, style, measure),
+        MermaidDiagram::ErDiagram(er) => render_er(&er, style, measure),
+    })
 }
 
 // ============================================
@@ -171,13 +177,9 @@ fn render_sequence(
     diagram: &SequenceDiagram,
     style: &DiagramStyle,
     measure: &mut impl TextMeasure,
-) -> Result<(String, f32, f32), String> {
-    if diagram.participants.is_empty() {
-        return Ok(("<g></g>".to_string(), 100.0, 50.0));
-    }
-
+) -> (String, f32, f32) {
     let mut layout = LayoutEngine::new(measure, style.font_size);
-    let (positions, bbox) = layout.layout_sequence(diagram);
+    let (positions, diagram_right) = layout.layout_sequence(diagram);
 
     let mut svg = String::new();
     let padding = 20.0;
@@ -205,19 +207,16 @@ fn render_sequence(
         if let Some(pos) = positions.get(&participant.id) {
             let display_name = participant.alias.as_ref().unwrap_or(&participant.id);
             let label = escape_xml(display_name);
-            let text_x = participant_centers
-                .get(participant.id.as_str())
-                .copied()
-                .unwrap_or(pos.x + pos.width / 2.0);
+            let (text_x, _) = pos.center();
 
             svg.push_str(&format!(
                 r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="{}" stroke="{}" stroke-width="1" rx="4" />"#,
-                pos.x, pos.y, pos.width, pos.height, style.node_fill, style.node_stroke
+                pos.x, pos.y, pos.w, pos.h, style.node_fill, style.node_stroke
             ));
             svg.push_str(&format!(
                 r#"<text x="{:.2}" y="{:.2}" dy="0.35em" font-family="{}" font-size="{:.1}" font-weight="500" fill="{}" text-anchor="middle">{}</text>"#,
                 text_x,
-                pos.y + pos.height / 2.0,
+                pos.y + pos.h / 2.0,
                 style.font_family,
                 style.font_size,
                 style.node_text,
@@ -226,12 +225,10 @@ fn render_sequence(
         }
     }
 
-    let participant_bottom = diagram
-        .participants
-        .iter()
-        .filter_map(|participant| positions.get(&participant.id))
-        .map(|pos| pos.y + pos.height)
-        .fold(bbox.y + 40.0, f32::max);
+    let participant_bottom = positions
+        .values()
+        .map(RectExt::bottom)
+        .fold(f32::MIN, f32::max);
     let lifeline_start_y = participant_bottom + 8.0;
 
     let mut message_y = participant_bottom + 34.0;
@@ -260,11 +257,7 @@ fn render_sequence(
     }
     svg.push_str(&elements_svg);
 
-    Ok((
-        svg,
-        bbox.right() + padding,
-        bbox.bottom().max(message_y + 20.0) + padding,
-    ))
+    (svg, diagram_right + padding, message_y + 20.0 + padding)
 }
 
 struct RenderSequenceContext<'a, T: TextMeasure> {
@@ -277,6 +270,13 @@ struct RenderSequenceContext<'a, T: TextMeasure> {
     left_edge: f32,
     right_edge: f32,
     activation_starts: &'a mut HashMap<String, Vec<f32>>,
+}
+
+fn sequence_arrowhead(kind: &MessageKind) -> ArrowHead {
+    match kind {
+        MessageKind::Sync => ArrowHead::Filled,
+        MessageKind::Async | MessageKind::Reply => ArrowHead::Open,
+    }
 }
 
 fn render_sequence_elements<T: TextMeasure>(ctx: &mut RenderSequenceContext<'_, T>) -> String {
@@ -324,48 +324,21 @@ fn render_sequence_elements<T: TextMeasure>(ctx: &mut RenderSequenceContext<'_, 
                         ));
 
                         // Arrowhead pointing left at return point
-                        svg.push_str(&format!(
-                            r#"<polygon points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="{}" />"#,
+                        svg.push_str(&arrowhead(
+                            sequence_arrowhead(&msg.kind),
                             cx,
                             y_bot,
-                            cx + 7.0,
-                            y_bot - 3.5,
-                            cx + 7.0,
-                            y_bot + 3.5,
-                            style.edge_stroke
+                            std::f32::consts::PI,
+                            style,
                         ));
 
-                        // Label with background pill for readability
                         if !msg.label.is_empty() {
-                            let cleaned = crate::display::markdown::markie::xml::sanitize_xml_text(
-                                &msg.label,
-                            );
                             let label_font = style.font_size * 0.82;
-                            let text_w = measure
-                                .measure_text(&cleaned, label_font, false, false, false, None)
-                                .0;
-                            let pill_pad = 4.0;
-                            let pill_w = text_w + pill_pad * 2.0;
-                            let pill_h = label_font + pill_pad * 2.0;
-                            let lx = cx + loop_w + 4.0 + text_w / 2.0;
-                            let ly = y_top + loop_h / 2.0;
-                            svg.push_str(&format!(
-                                r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="3" fill="{}" />"#,
-                                lx - pill_w / 2.0,
-                                ly - pill_h / 2.0,
-                                pill_w,
-                                pill_h,
-                                style.node_fill
-                            ));
-                            svg.push_str(&format!(
-                                r#"<text x="{:.2}" y="{:.2}" dy="0.35em" font-family="{}" font-size="{:.1}" fill="{}">{}</text>"#,
-                                lx,
-                                ly,
-                                style.font_family,
-                                label_font,
-                                style.edge_text,
-                                escape_xml(&cleaned)
-                            ));
+                            let (pill_w, _) = pill_size(measure, &msg.label, label_font);
+                            let center = (cx + loop_w + 4.0 + pill_w / 2.0, y_top + loop_h / 2.0);
+                            let (pill, _) =
+                                label_pill(measure, style, &msg.label, label_font, center);
+                            svg.push_str(&pill);
                         }
 
                         *message_y = y_bot + 20.0;
@@ -384,71 +357,21 @@ fn render_sequence_elements<T: TextMeasure>(ctx: &mut RenderSequenceContext<'_, 
                             x1, *message_y, x2, *message_y, style.edge_stroke, dash
                         ));
 
-                        let arrow_dir = if is_right { -1.0 } else { 1.0 };
-                        let arrow_x = *x2;
-                        match msg.kind {
-                            MessageKind::Async => {
-                                let p1 = (arrow_x + arrow_dir * 7.0, *message_y - 3.5);
-                                let p2 = (arrow_x + arrow_dir * 7.0, *message_y + 3.5);
-                                svg.push_str(&format!(
-                                    r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75" />"#,
-                                    p1.0, p1.1, arrow_x, *message_y, p2.0, p2.1, style.edge_stroke
-                                ));
-                            }
-                            MessageKind::Sync => {
-                                svg.push_str(&format!(
-                                    r#"<polygon points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="{}" />"#,
-                                    arrow_x,
-                                    *message_y,
-                                    arrow_x + arrow_dir * 7.0,
-                                    *message_y - 3.5,
-                                    arrow_x + arrow_dir * 7.0,
-                                    *message_y + 3.5,
-                                    style.edge_stroke
-                                ));
-                            }
-                            MessageKind::Reply => {
-                                let p1 = (arrow_x + arrow_dir * 7.0, *message_y - 3.5);
-                                let p2 = (arrow_x + arrow_dir * 7.0, *message_y + 3.5);
-                                svg.push_str(&format!(
-                                    r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75" />"#,
-                                    p1.0, p1.1, arrow_x, *message_y, p2.0, p2.1, style.edge_stroke
-                                ));
-                            }
-                        }
+                        let angle = if is_right { 0.0 } else { std::f32::consts::PI };
+                        svg.push_str(&arrowhead(
+                            sequence_arrowhead(&msg.kind),
+                            *x2,
+                            *message_y,
+                            angle,
+                            style,
+                        ));
 
                         if !msg.label.is_empty() {
-                            let cleaned = crate::display::markdown::markie::xml::sanitize_xml_text(
-                                &msg.label,
-                            );
+                            let center = ((x1 + x2) / 2.0, *message_y - 10.0);
                             let label_font = style.font_size * 0.82;
-                            let text_w = measure
-                                .measure_text(&cleaned, label_font, false, false, false, None)
-                                .0;
-                            let pill_pad = 6.0;
-                            let pill_w = text_w + pill_pad * 2.0;
-                            let pill_h = label_font + pill_pad * 2.0;
-                            let label_x = (x1 + x2) / 2.0;
-                            let label_y = *message_y - 10.0;
-
-                            svg.push_str(&format!(
-                                r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="4" fill="{}" stroke="{}" stroke-width="0.5" />"#,
-                                label_x - pill_w / 2.0,
-                                label_y - pill_h / 2.0,
-                                pill_w,
-                                pill_h,
-                                style.node_fill,
-                                style.node_stroke
-                            ));
-                            svg.push_str(&format!(
-                                r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}" text-anchor="middle">{}</text>"#,
-                                label_x,
-                                label_y + 0.35,
-                                style.font_family,
-                                label_font,
-                                style.edge_text,
-                                escape_xml(&cleaned)
-                            ));
+                            let (pill, _) =
+                                label_pill(measure, style, &msg.label, label_font, center);
+                            svg.push_str(&pill);
                         }
 
                         *message_y += 50.0;
@@ -495,11 +418,14 @@ fn render_sequence_elements<T: TextMeasure>(ctx: &mut RenderSequenceContext<'_, 
                 text,
             } => {
                 if let Some(cx) = participant_centers.get(participant.as_str()) {
-                    let cleaned = crate::display::markdown::markie::xml::sanitize_xml_text(text);
-                    let note_width = (measure
-                        .measure_text(&cleaned, style.font_size * 0.8, false, false, false, None)
-                        .0
-                        + 20.0)
+                    let cleaned = sanitize_xml_text(text);
+                    let note_width = (measure.measure_width(
+                        &cleaned,
+                        style.font_size * 0.8,
+                        false,
+                        false,
+                        false,
+                    ) + 20.0)
                         .clamp(80.0, 220.0);
                     let x = match position.as_str() {
                         "left" => cx - note_width - 12.0,
@@ -522,7 +448,7 @@ fn render_sequence_elements<T: TextMeasure>(ctx: &mut RenderSequenceContext<'_, 
                         style.font_family,
                         style.font_size * 0.8,
                         style.node_text,
-                        escape_xml(text)
+                        escape_xml(&cleaned)
                     ));
                 }
                 *message_y += 42.0;
@@ -547,11 +473,8 @@ fn render_sequence_elements<T: TextMeasure>(ctx: &mut RenderSequenceContext<'_, 
                 };
 
                 let title_font = style.font_size * 0.8;
-                let cleaned_title =
-                    crate::display::markdown::markie::xml::sanitize_xml_text(&title);
-                let title_w = measure
-                    .measure_text(&cleaned_title, title_font, false, true, false, None)
-                    .0;
+                let cleaned_title = sanitize_xml_text(&title);
+                let title_w = measure.measure_width(&cleaned_title, title_font, false, true, false);
                 let np_pad_x = 6.0;
                 let np_pad_y = 3.0;
                 let np_w = title_w + np_pad_x * 2.0;
@@ -644,13 +567,9 @@ fn render_class(
     diagram: &ClassDiagram,
     style: &DiagramStyle,
     measure: &mut impl TextMeasure,
-) -> Result<(String, f32, f32), String> {
-    if diagram.classes.is_empty() {
-        return Ok(("<g></g>".to_string(), 100.0, 50.0));
-    }
-
+) -> (String, f32, f32) {
     let mut layout = LayoutEngine::new(measure, style.font_size);
-    let (positions, _edge_waypoints, bbox) = layout.layout_class(diagram);
+    let (positions, bbox) = layout.layout_class(diagram);
 
     let mut svg = String::new();
     let padding = 20.0;
@@ -675,39 +594,22 @@ fn render_class(
     let total_width = bbox.right() + padding;
     let total_height = bbox.bottom() + padding;
 
-    Ok((svg, total_width, total_height))
+    (svg, total_width, total_height)
 }
 
-fn render_class_box(class: &ClassDefinition, pos: &LayoutPos, style: &DiagramStyle) -> String {
+fn render_class_box(class: &ClassDefinition, pos: &Rect, style: &DiagramStyle) -> String {
     let mut svg = String::new();
 
     // Main box
     svg.push_str(&format!(
         r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="{}" stroke="{}" stroke-width="1" />"#,
-        pos.x, pos.y, pos.width, pos.height,
+        pos.x, pos.y, pos.w, pos.h,
         style.node_fill, style.node_stroke
     ));
 
     let mut y = pos.y + style.font_size + 8.0;
 
-    // Class name
-    let effective_stereotype = if class.is_interface {
-        class
-            .stereotype
-            .clone()
-            .or_else(|| Some("interface".to_string()))
-    } else {
-        class.stereotype.clone()
-    };
-    let name_text = if let Some(stereo) = effective_stereotype {
-        format!(
-            "&lt;&lt;{}&gt;&gt; {}",
-            escape_xml(&stereo),
-            escape_xml(&class.name)
-        )
-    } else {
-        escape_xml(&class.name)
-    };
+    let name_text = escape_xml(&class.title());
     let name_style = if class.is_abstract || class.is_interface {
         " font-style=\"italic\""
     } else {
@@ -721,14 +623,14 @@ fn render_class_box(class: &ClassDefinition, pos: &LayoutPos, style: &DiagramSty
         r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="{}" />"#,
         pos.x + 0.5,
         pos.y + 0.5,
-        pos.width - 1.0,
+        pos.w - 1.0,
         header_h,
         header_fill
     ));
 
     svg.push_str(&format!(
         r#"<text x="{:.2}" y="{:.2}" dy="0.35em" font-family="{}" font-size="{:.1}" fill="{}" text-anchor="middle" font-weight="bold"{}>{}</text>"#,
-        pos.x + pos.width / 2.0,
+        pos.x + pos.w / 2.0,
         pos.y + header_h / 2.0,
         style.font_family,
         style.font_size,
@@ -743,7 +645,7 @@ fn render_class_box(class: &ClassDefinition, pos: &LayoutPos, style: &DiagramSty
         r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="0.75" />"#,
         pos.x,
         y,
-        pos.x + pos.width,
+        pos.x + pos.w,
         y,
         style.node_stroke
     ));
@@ -751,37 +653,8 @@ fn render_class_box(class: &ClassDefinition, pos: &LayoutPos, style: &DiagramSty
     // Attributes
     y += style.font_size + 4.0;
     for attr in &class.attributes {
-        let vis = match attr.member.visibility {
-            Visibility::Public => "+",
-            Visibility::Private => "-",
-            Visibility::Protected => "#",
-            Visibility::Package => "~",
-        };
-        let attr_text = if let Some(ref t) = attr.type_annotation {
-            format!("{} {}: {}", vis, attr.member.name, t)
-        } else {
-            format!("{} {}", vis, attr.member.name)
-        };
-
-        svg.push_str(&format!(
-            r#"<text x="{:.2}" y="{:.2}" font-family="monospace" font-size="{:.1}" fill="{}"{}{}>{}</text>"#,
-            pos.x + 8.0,
-            y,
-            style.font_size * 0.85,
-            style.node_text,
-            if attr.member.is_static {
-                " text-decoration=\"underline\""
-            } else {
-                ""
-            },
-            if attr.member.is_abstract {
-                " font-style=\"italic\""
-            } else {
-                ""
-            },
-            escape_xml(&attr_text)
-        ));
-        y += style.font_size * 0.9;
+        svg.push_str(&class_member_text(&attr.display(), pos.x + 8.0, y, style));
+        y += style.font_size * CLASS_MEMBER_LINE_HEIGHT;
     }
 
     // Divider line before methods
@@ -791,7 +664,7 @@ fn render_class_box(class: &ClassDefinition, pos: &LayoutPos, style: &DiagramSty
             r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="1" />"#,
             pos.x,
             y,
-            pos.x + pos.width,
+            pos.x + pos.w,
             y,
             style.node_stroke
         ));
@@ -800,65 +673,28 @@ fn render_class_box(class: &ClassDefinition, pos: &LayoutPos, style: &DiagramSty
 
     // Methods
     for method in &class.methods {
-        let vis = match method.member.visibility {
-            Visibility::Public => "+",
-            Visibility::Private => "-",
-            Visibility::Protected => "#",
-            Visibility::Package => "~",
-        };
-
-        let params: Vec<String> = method
-            .parameters
-            .iter()
-            .map(|(name, t)| {
-                if let Some(ty) = t {
-                    format!("{}: {}", name, ty)
-                } else {
-                    name.clone()
-                }
-            })
-            .collect();
-
-        let method_text = if let Some(ref ret) = method.return_type {
-            format!(
-                "{} {}({}): {}",
-                vis,
-                method.member.name,
-                params.join(", "),
-                ret
-            )
-        } else {
-            format!("{} {}({})", vis, method.member.name, params.join(", "))
-        };
-
-        svg.push_str(&format!(
-            r#"<text x="{:.2}" y="{:.2}" font-family="monospace" font-size="{:.1}" fill="{}"{}{}>{}</text>"#,
-            pos.x + 8.0,
-            y,
-            style.font_size * 0.85,
-            style.node_text,
-            if method.member.is_static {
-                " text-decoration=\"underline\""
-            } else {
-                ""
-            },
-            if method.member.is_abstract {
-                " font-style=\"italic\""
-            } else {
-                ""
-            },
-            escape_xml(&method_text)
-        ));
-        y += style.font_size * 0.9;
+        svg.push_str(&class_member_text(&method.display(), pos.x + 8.0, y, style));
+        y += style.font_size * CLASS_MEMBER_LINE_HEIGHT;
     }
 
     svg
 }
 
+fn class_member_text(text: &str, x: f32, y: f32, style: &DiagramStyle) -> String {
+    format!(
+        r#"<text x="{:.2}" y="{:.2}" font-family="monospace" font-size="{:.1}" fill="{}">{}</text>"#,
+        x,
+        y,
+        style.font_size * 0.85,
+        style.node_text,
+        escape_xml(text)
+    )
+}
+
 fn render_class_relation(
     relation: &ClassRelation,
-    from: &LayoutPos,
-    to: &LayoutPos,
+    from: &Rect,
+    to: &Rect,
     style: &DiagramStyle,
     measure: &mut impl TextMeasure,
 ) -> String {
@@ -883,108 +719,43 @@ fn render_class_relation(
         x1, y1, x2, y2, style.edge_stroke, line_style
     ));
 
-    let (from_marker, to_marker) = match relation.relation_type {
-        ClassRelationType::Inheritance => (Some("hollow_triangle"), None),
-        ClassRelationType::Composition => (Some("filled_diamond"), None),
-        ClassRelationType::Aggregation => (Some("hollow_diamond"), None),
-        ClassRelationType::Association => (None, Some("arrow")),
-        ClassRelationType::Dependency => (Some("arrow"), None),
-        ClassRelationType::Realization => (Some("hollow_triangle"), None),
-    };
-
-    if let Some(marker) = to_marker {
-        let angle = (y2 - y1).atan2(x2 - x1);
-        svg.push_str(&draw_marker(marker, x2, y2, angle, style));
+    // Association points at the target; every other marker sits on the source end.
+    if relation.relation_type == ClassRelationType::Association {
+        svg.push_str(&draw_marker(&relation.relation_type, x2, y2, angle, style));
+    } else {
+        let back = angle + std::f32::consts::PI;
+        svg.push_str(&draw_marker(&relation.relation_type, x1, y1, back, style));
     }
-
-    if let Some(marker) = from_marker {
-        let angle = (y1 - y2).atan2(x1 - x2);
-        svg.push_str(&draw_marker(marker, x1, y1, angle, style));
-    }
-
-    let angle = (y2 - y1).atan2(x2 - x1);
-    let unit_x = angle.cos();
-    let unit_y = angle.sin();
-    let normal_x = -unit_y;
-    let normal_y = unit_x;
 
     if let Some(label) = &relation.label {
-        let mx = (x1 + x2) / 2.0;
-        let my = (y1 + y2) / 2.0;
-        let cleaned = crate::display::markdown::markie::xml::sanitize_xml_text(label);
-        let label_font = style.font_size * 0.8;
+        // Offset the label to one side of the line, along its normal.
         let label_offset = 18.0;
-        let label_x = mx + normal_x * label_offset;
-        let label_y = my + normal_y * label_offset;
-        let text_w = measure
-            .measure_text(&cleaned, label_font, false, false, false, None)
-            .0;
-        let pill_pad = 5.0;
-        let pill_w = text_w + pill_pad * 2.0;
-        let pill_h = label_font + pill_pad * 1.6;
-
-        svg.push_str(&format!(
-            r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="4" fill="{}" stroke="{}" stroke-width="0.5" />"#,
-            label_x - pill_w / 2.0,
-            label_y - pill_h / 2.0,
-            pill_w,
-            pill_h,
-            style.node_fill,
-            style.node_stroke
-        ));
-
-        svg.push_str(&format!(
-            r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}" text-anchor="middle">{}</text>"#,
-            label_x,
-            label_y + 0.35,
-            style.font_family,
-            label_font,
-            style.edge_text,
-            escape_xml(&cleaned)
-        ));
-    }
-
-    if let Some(m) = &relation.multiplicity_from {
-        svg.push_str(&format!(
-            r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}">{}</text>"#,
-            x1 + unit_x * 12.0 + normal_x * 8.0,
-            y1 + unit_y * 12.0 + normal_y * 8.0,
-            style.font_family,
-            style.font_size * 0.75,
-            style.edge_text,
-            escape_xml(m)
-        ));
-    }
-
-    if let Some(m) = &relation.multiplicity_to {
-        svg.push_str(&format!(
-            r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}" text-anchor="end">{}</text>"#,
-            x2 - unit_x * 12.0 + normal_x * 8.0,
-            y2 - unit_y * 12.0 + normal_y * 8.0,
-            style.font_family,
-            style.font_size * 0.75,
-            style.edge_text,
-            escape_xml(m)
-        ));
+        let center = (
+            (x1 + x2) / 2.0 - angle.sin() * label_offset,
+            (y1 + y2) / 2.0 + angle.cos() * label_offset,
+        );
+        let (pill, _) = label_pill(measure, style, label, style.font_size * 0.8, center);
+        svg.push_str(&pill);
     }
 
     svg
 }
 
-fn draw_marker(marker_type: &str, x: f32, y: f32, angle: f32, style: &DiagramStyle) -> String {
+fn draw_marker(
+    relation_type: &ClassRelationType,
+    x: f32,
+    y: f32,
+    angle: f32,
+    style: &DiagramStyle,
+) -> String {
     let cos = angle.cos();
     let sin = angle.sin();
 
-    match marker_type {
-        "arrow" => {
-            let p1 = (x - cos * 12.0 + sin * 5.0, y - sin * 12.0 - cos * 5.0);
-            let p2 = (x - cos * 12.0 - sin * 5.0, y - sin * 12.0 + cos * 5.0);
-            format!(
-                r#"<polygon points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="{}" />"#,
-                x, y, p1.0, p1.1, p2.0, p2.1, style.edge_stroke
-            )
+    match relation_type {
+        ClassRelationType::Association | ClassRelationType::Dependency => {
+            arrowhead(ArrowHead::Filled, x, y, angle, style)
         }
-        "hollow_triangle" => {
+        ClassRelationType::Inheritance | ClassRelationType::Realization => {
             let p1 = (x - cos * 14.0 + sin * 7.0, y - sin * 14.0 - cos * 7.0);
             let p2 = (x - cos * 14.0 - sin * 7.0, y - sin * 14.0 + cos * 7.0);
             format!(
@@ -992,7 +763,7 @@ fn draw_marker(marker_type: &str, x: f32, y: f32, angle: f32, style: &DiagramSty
                 x, y, p1.0, p1.1, p2.0, p2.1, style.node_fill, style.edge_stroke
             )
         }
-        "filled_diamond" => {
+        ClassRelationType::Composition => {
             let p1 = (x - cos * 16.0 + sin * 6.0, y - sin * 16.0 - cos * 6.0);
             let p2 = (x - cos * 16.0 - sin * 6.0, y - sin * 16.0 + cos * 6.0);
             let back = (x - cos * 24.0, y - sin * 24.0);
@@ -1001,7 +772,7 @@ fn draw_marker(marker_type: &str, x: f32, y: f32, angle: f32, style: &DiagramSty
                 x, y, p1.0, p1.1, back.0, back.1, p2.0, p2.1, style.edge_stroke
             )
         }
-        "hollow_diamond" => {
+        ClassRelationType::Aggregation => {
             let p1 = (x - cos * 16.0 + sin * 6.0, y - sin * 16.0 - cos * 6.0);
             let p2 = (x - cos * 16.0 - sin * 6.0, y - sin * 16.0 + cos * 6.0);
             let back = (x - cos * 24.0, y - sin * 24.0);
@@ -1010,22 +781,12 @@ fn draw_marker(marker_type: &str, x: f32, y: f32, angle: f32, style: &DiagramSty
                 x, y, p1.0, p1.1, back.0, back.1, p2.0, p2.1, style.node_fill, style.edge_stroke
             )
         }
-        _ => String::new(),
     }
 }
 
 // ============================================
 // STATE DIAGRAM RENDERING
 // ============================================
-
-fn rect_from_pos(pos: &LayoutPos, pad: f32) -> Rect {
-    Rect {
-        x: pos.x - pad,
-        y: pos.y - pad,
-        w: pos.width + 2.0 * pad,
-        h: pos.height + 2.0 * pad,
-    }
-}
 
 fn vseg_hits_rect(x: f32, y1: f32, y2: f32, r: &Rect) -> bool {
     let (ya, yb) = if y1 <= y2 { (y1, y2) } else { (y2, y1) };
@@ -1107,25 +868,15 @@ fn render_state(
     diagram: &StateDiagram,
     style: &DiagramStyle,
     measure: &mut impl TextMeasure,
-) -> Result<(String, f32, f32), String> {
-    if diagram.states.is_empty() {
-        return Ok(("<g></g>".to_string(), 100.0, 50.0));
-    }
-
+) -> (String, f32, f32) {
     let mut layout = LayoutEngine::new(measure, style.font_size);
-    let (positions, _edge_waypoints, bbox) = layout.layout_state(diagram);
+    let (positions, bbox) = layout.layout_state(diagram);
 
     let mut svg = String::new();
     let padding = 20.0;
 
-    let mut child_state_ids: HashSet<&str> = HashSet::new();
-    for state in &diagram.states {
-        for child in &state.children {
-            if let StateElement::State(child_state) = child {
-                child_state_ids.insert(child_state.id.as_str());
-            }
-        }
-    }
+    let child_state_ids = diagram.nested_state_ids();
+    let states_by_id = diagram.states_by_id();
 
     // Draw transitions first (behind states)
     let visible_transitions: Vec<&StateTransition> = diagram
@@ -1144,7 +895,7 @@ fn render_state(
             .or_insert(0) += 1;
     }
 
-    let state_obstacles: Vec<Rect> = positions.values().map(|p| rect_from_pos(p, 8.0)).collect();
+    let state_obstacles: Vec<Rect> = positions.values().map(|p| p.expanded(8.0)).collect();
 
     let mut transition_min_x = f32::MAX;
     let mut transition_max_x = f32::MIN;
@@ -1189,9 +940,9 @@ fn render_state(
         if let Some(pos) = positions.get(&state.id) {
             svg.push_str(&render_state_node(
                 state,
-                &state.children,
                 pos,
                 style,
+                &states_by_id,
                 &positions,
                 measure,
             ));
@@ -1212,7 +963,7 @@ fn render_state(
             {
                 let note_width = 180.0_f32;
                 let note_height = 26.0_f32;
-                let nx = pos.x + pos.width + 28.0;
+                let nx = pos.x + pos.w + 28.0;
                 let ny = pos.y + 4.0;
                 total_width = total_width.max(nx + note_width + padding);
                 total_height = total_height.max(ny + note_height + padding);
@@ -1233,18 +984,18 @@ fn render_state(
         let shift = -transition_min_x + padding;
         let shifted_svg = format!(r#"<g transform="translate({:.2},0)">{}</g>"#, shift, svg);
         total_width += shift;
-        return Ok((shifted_svg, total_width, total_height));
+        return (shifted_svg, total_width, total_height);
     }
 
-    Ok((svg, total_width, total_height))
+    (svg, total_width, total_height)
 }
 
 fn render_state_node(
     state: &State,
-    children: &[StateElement],
-    pos: &LayoutPos,
+    pos: &Rect,
     style: &DiagramStyle,
-    positions: &HashMap<String, LayoutPos>,
+    states_by_id: &HashMap<&str, &State>,
+    positions: &HashMap<String, Rect>,
     measure: &mut impl TextMeasure,
 ) -> String {
     let mut svg = String::new();
@@ -1253,39 +1004,39 @@ fn render_state_node(
         // Start state (filled circle)
         svg.push_str(&format!(
             r#"<circle cx="{:.2}" cy="{:.2}" r="{:.2}" fill="{}" />"#,
-            pos.x + pos.width / 2.0,
-            pos.y + pos.height / 2.0,
-            pos.width / 2.0,
+            pos.x + pos.w / 2.0,
+            pos.y + pos.h / 2.0,
+            pos.w / 2.0,
             style.node_stroke
         ));
     } else if state.is_end {
         // End state (circle with ring)
-        let cx = pos.x + pos.width / 2.0;
-        let cy = pos.y + pos.height / 2.0;
+        let cx = pos.x + pos.w / 2.0;
+        let cy = pos.y + pos.h / 2.0;
         svg.push_str(&format!(
             r#"<circle cx="{:.2}" cy="{:.2}" r="{:.2}" fill="{}" stroke="{}" stroke-width="2" />"#,
             cx,
             cy,
-            pos.width / 2.0 - 3.0,
+            pos.w / 2.0 - 3.0,
             style.node_stroke,
             style.node_stroke
         ));
         svg.push_str(&format!(
             r#"<circle cx="{:.2}" cy="{:.2}" r="{:.2}" fill="none" stroke="{}" stroke-width="2" />"#,
-            cx, cy, pos.width / 2.0, style.node_stroke
+            cx, cy, pos.w / 2.0, style.node_stroke
         ));
     } else {
         svg.push_str(&format!(
             r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="{:.2}" fill="{}" stroke="{}" stroke-width="1" />"#,
-            pos.x, pos.y, pos.width, pos.height,
+            pos.x, pos.y, pos.w, pos.h,
             10.0, style.node_fill, style.node_stroke
         ));
 
-        let text_x = pos.x + pos.width / 2.0;
+        let text_x = pos.x + pos.w / 2.0;
         let text_y = if state.is_composite {
             pos.y + style.font_size + 8.0
         } else {
-            pos.y + pos.height / 2.0 + style.font_size / 3.0
+            pos.y + pos.h / 2.0 + style.font_size / 3.0
         };
         svg.push_str(&format!(
             r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}" text-anchor="middle">{}</text>"#,
@@ -1294,19 +1045,19 @@ fn render_state_node(
 
         if state.is_composite {
             svg.push_str(&render_composite_state_contents(
-                state, children, pos, style, positions, measure,
+                state,
+                pos,
+                style,
+                states_by_id,
+                positions,
+                measure,
             ));
-        } else {
-            for child in children {
-                if let StateElement::Note {
-                    state: note_state,
-                    text,
-                } = child
-                    && note_state == &state.id
-                    && !text.is_empty()
-                {
-                    svg.push_str(&render_state_note(note_state, text, pos, style, measure));
-                }
+        }
+        for child in &state.children {
+            if let StateElement::Note { text, .. } = child
+                && !text.is_empty()
+            {
+                svg.push_str(&render_state_note(text, pos, style, measure));
             }
         }
     }
@@ -1314,126 +1065,52 @@ fn render_state_node(
     svg
 }
 
-fn calculate_child_state_size(
+fn render_composite_state_contents(
     state: &State,
+    parent_pos: &Rect,
     style: &DiagramStyle,
+    states_by_id: &HashMap<&str, &State>,
+    positions: &HashMap<String, Rect>,
     measure: &mut impl TextMeasure,
-) -> (f32, f32) {
-    if state.is_start || state.is_end {
-        return (24.0, 24.0);
+) -> String {
+    let mut svg = String::new();
+    let child_states: Vec<&State> = state.child_state_ids().map(|id| states_by_id[id]).collect();
+    if child_states.is_empty() {
+        return svg;
     }
 
-    let node_padding = 12.0;
-    let label_w = measure
-        .measure_text(&state.label, style.font_size, false, false, false, None)
-        .0;
-    let base_width = (label_w + node_padding * 2.0).max(120.0);
-    let base_height = (style.font_size * 2.2).max(40.0);
-
-    if !state.is_composite {
-        return (base_width, base_height);
-    }
-
-    let child_states: Vec<&State> = state
+    let child_transitions: Vec<&StateTransition> = state
         .children
         .iter()
         .filter_map(|child| match child {
-            StateElement::State(s) if s.id != state.id => Some(s),
+            StateElement::Transition(transition) => Some(transition),
             _ => None,
         })
         .collect();
 
-    if child_states.is_empty() {
-        return (base_width, base_height);
-    }
-
-    let child_sizes: Vec<(f32, f32)> = child_states
-        .iter()
-        .map(|s| calculate_child_state_size(s, style, measure))
-        .collect();
-
-    let child_gap = 20.0;
-    let inner_pad = 16.0;
+    let mut child_positions: HashMap<String, Rect> = HashMap::new();
     let header_h = style.font_size * 2.0 + 16.0;
-
-    let max_child_w: f32 = child_sizes.iter().map(|(w, _)| *w).fold(0.0, f32::max);
-    let total_child_h: f32 = child_sizes.iter().map(|(_, h)| *h).sum::<f32>()
-        + child_gap * (child_sizes.len().saturating_sub(1)) as f32;
-
-    let width = base_width.max(max_child_w + inner_pad * 2.0);
-    let height = header_h + total_child_h + inner_pad * 2.0;
-
-    (width, height)
-}
-
-fn render_composite_state_contents(
-    state: &State,
-    children: &[StateElement],
-    parent_pos: &LayoutPos,
-    style: &DiagramStyle,
-    positions: &HashMap<String, LayoutPos>,
-    measure: &mut impl TextMeasure,
-) -> String {
-    let mut svg = String::new();
-    let mut child_states: Vec<&State> = Vec::new();
-    let mut child_transitions: Vec<&StateTransition> = Vec::new();
-    let mut child_notes: Vec<(&str, &str)> = Vec::new();
-
-    for child in children {
-        match child {
-            StateElement::State(child_state) => child_states.push(child_state),
-            StateElement::Transition(transition) => child_transitions.push(transition),
-            StateElement::Note { state, text } if !text.is_empty() => {
-                child_notes.push((state.as_str(), text.as_str()))
-            }
-            StateElement::Note { .. } => {}
-        }
-    }
-
-    if child_states.is_empty() {
-        return svg;
-    }
-
-    let child_state_nodes: Vec<&State> = child_states
-        .into_iter()
-        .filter(|child_state| child_state.id != state.id)
-        .collect();
-
-    if child_state_nodes.is_empty() {
-        return svg;
-    }
-
-    let mut child_positions: HashMap<String, LayoutPos> = HashMap::new();
-    let header_h = style.font_size * 2.0 + 16.0;
-    let inner_pad = 16.0;
-    let route_lane = 40.0; // extra space on each side for transition routing
-    let child_gap = 20.0;
-    let inner_top = parent_pos.y + header_h + inner_pad;
-    let content_left = parent_pos.x + inner_pad + route_lane;
-    let content_width = parent_pos.width - inner_pad * 2.0 - route_lane * 2.0;
+    let inner_top = parent_pos.y + header_h + STATE_INNER_PAD;
+    let content_left = parent_pos.x + STATE_INNER_PAD + STATE_ROUTE_LANE;
+    let content_width = parent_pos.w - STATE_INNER_PAD * 2.0 - STATE_ROUTE_LANE * 2.0;
 
     let mut y_cursor = inner_top;
-    for child_state in &child_state_nodes {
-        let (child_w, child_h) = calculate_child_state_size(child_state, style, measure);
-        let child_width = content_width.max(child_w);
-        let child_x = content_left;
-        let child_y = y_cursor;
-
-        child_positions.insert(
-            child_state.id.clone(),
-            LayoutPos::new(child_x, child_y, child_width, child_h),
-        );
+    for child_state in child_states {
+        let (child_w, child_h) =
+            LayoutEngine::new(measure, style.font_size).state_size(child_state, states_by_id);
+        let child_pos = Rect::new(content_left, y_cursor, content_width.max(child_w), child_h);
+        child_positions.insert(child_state.id.clone(), child_pos);
 
         svg.push_str(&render_state_node(
             child_state,
-            &child_state.children,
-            &LayoutPos::new(child_x, child_y, child_width, child_h),
+            &child_pos,
             style,
+            states_by_id,
             positions,
             measure,
         ));
 
-        y_cursor += child_h + child_gap;
+        y_cursor += child_h + STATE_CHILD_GAP;
     }
 
     let mut pair_totals: HashMap<(String, String), usize> = HashMap::new();
@@ -1443,20 +1120,14 @@ fn render_composite_state_contents(
             .or_insert(0) += 1;
     }
 
-    let parent_rect = rect_from_pos(parent_pos, 0.0);
-    let mut child_obstacles: Vec<Rect> = child_positions
-        .values()
-        .map(|p| rect_from_pos(p, 3.0))
-        .collect();
+    let mut child_obstacles: Vec<Rect> =
+        child_positions.values().map(|p| p.expanded(3.0)).collect();
     // Include global positions but exclude the parent composite (we're routing inside it)
     child_obstacles.extend(
         positions
             .values()
-            .filter(|p| {
-                let r = rect_from_pos(p, 0.0);
-                !r.overlaps(&parent_rect) || r.w < parent_rect.w * 0.5
-            })
-            .map(|p| rect_from_pos(p, 3.0)),
+            .filter(|p| !p.overlaps(parent_pos) || p.w < parent_pos.w * 0.5)
+            .map(|p| p.expanded(3.0)),
     );
 
     let mut pair_seen: HashMap<(String, String), usize> = HashMap::new();
@@ -1489,37 +1160,25 @@ fn render_composite_state_contents(
         }
     }
 
-    for (note_state, text) in child_notes {
-        if let Some(target) = child_positions
-            .get(note_state)
-            .or_else(|| positions.get(note_state))
-        {
-            svg.push_str(&render_state_note(note_state, text, target, style, measure));
-        }
-    }
-
     svg
 }
 
 fn render_state_note(
-    _state_id: &str,
     text: &str,
-    state_pos: &LayoutPos,
+    state_pos: &Rect,
     style: &DiagramStyle,
     measure: &mut impl TextMeasure,
 ) -> String {
-    let cleaned = crate::display::markdown::markie::xml::sanitize_xml_text(text);
-    let note_width = (measure
-        .measure_text(&cleaned, style.font_size * 0.8, false, false, false, None)
-        .0
+    let cleaned = sanitize_xml_text(text);
+    let note_width = (measure.measure_width(&cleaned, style.font_size * 0.8, false, false, false)
         + 16.0)
         .clamp(72.0, 180.0);
     let note_height = 26.0;
-    let x = state_pos.x + state_pos.width + 28.0;
+    let x = state_pos.x + state_pos.w + 28.0;
     let y = state_pos.y + 4.0;
 
     let y_mid = y + note_height / 2.0;
-    let line_x1 = state_pos.x + state_pos.width;
+    let line_x1 = state_pos.x + state_pos.w;
     let line_x2 = x;
 
     format!(
@@ -1540,14 +1199,14 @@ fn render_state_note(
         style.font_family,
         style.font_size * 0.8,
         style.edge_text,
-        escape_xml(text)
+        escape_xml(&cleaned)
     )
 }
 
 struct StateTransitionContext<'a, T: TextMeasure> {
     transition: &'a StateTransition,
-    from: &'a LayoutPos,
-    to: &'a LayoutPos,
+    from: &'a Rect,
+    to: &'a Rect,
     style: &'a DiagramStyle,
     measure: &'a mut T,
     route_index: usize,
@@ -1569,6 +1228,10 @@ fn render_state_transition<T: TextMeasure>(
     let occupied_labels = &mut *ctx.occupied_labels;
     let obstacles = ctx.obstacles;
 
+    if transition.from == transition.to {
+        return render_state_self_transition(transition, from, style, measure, occupied_labels);
+    }
+
     let mut svg = String::new();
     let mut ext_min_x = f32::MAX;
     let mut ext_min_y = f32::MAX;
@@ -1588,19 +1251,19 @@ fn render_state_transition<T: TextMeasure>(
     let (to_cx, to_cy) = to.center();
     let center_angle = (to_cy - from_cy).atan2(to_cx - from_cx);
 
-    let (px1, py1) = if from.width == from.height && from.width < 30.0 {
+    let (px1, py1) = if from.w == from.h && from.w < 30.0 {
         (
-            from_cx + center_angle.cos() * (from.width / 2.0),
-            from_cy + center_angle.sin() * (from.width / 2.0),
+            from_cx + center_angle.cos() * (from.w / 2.0),
+            from_cy + center_angle.sin() * (from.w / 2.0),
         )
     } else {
         rect_boundary_point(from, center_angle)
     };
 
-    let (px2, py2) = if to.width == to.height && to.width < 30.0 {
+    let (px2, py2) = if to.w == to.h && to.w < 30.0 {
         (
-            to_cx + (center_angle + std::f32::consts::PI).cos() * (to.width / 2.0),
-            to_cy + (center_angle + std::f32::consts::PI).sin() * (to.width / 2.0),
+            to_cx + (center_angle + std::f32::consts::PI).cos() * (to.w / 2.0),
+            to_cy + (center_angle + std::f32::consts::PI).sin() * (to.w / 2.0),
         )
     } else {
         rect_boundary_point(to, center_angle + std::f32::consts::PI)
@@ -1633,7 +1296,7 @@ fn render_state_transition<T: TextMeasure>(
         }
     };
     let verticalish =
-        (from_cx - to_cx).abs() < (from.width.min(to.width)) / 2.0 && (py2 - py1).abs() > 30.0;
+        (from_cx - to_cx).abs() < (from.w.min(to.w)) / 2.0 && (py2 - py1).abs() > 30.0;
 
     let label_anchor_x;
     let label_anchor_y;
@@ -1700,7 +1363,7 @@ fn render_state_transition<T: TextMeasure>(
             arrow_y = y2;
         } else {
             // Non-adjacent: use orthogonal routing (out → down → in)
-            let max_half_width = (from.width / 2.0).max(to.width / 2.0);
+            let max_half_width = (from.w / 2.0).max(to.w / 2.0);
             let exit_y = from_cy;
             let enter_y = to_cy;
             let is_endpoint = |r: &Rect| -> bool {
@@ -1720,11 +1383,11 @@ fn render_state_transition<T: TextMeasure>(
             for &try_side in &[route_side, -route_side] {
                 let base = from_cx + try_side * (max_half_width + 30.0 + lane.abs() * 14.0);
                 let fex = if base >= from_cx {
-                    from.x + from.width
+                    from.x + from.w
                 } else {
                     from.x
                 };
-                let tex = if base >= to_cx { to.x + to.width } else { to.x };
+                let tex = if base >= to_cx { to.x + to.w } else { to.x };
                 for i in 0..max_steps {
                     let candidate = base + try_side * (i as f32) * step;
                     let clear = obstacles.iter().all(|r| {
@@ -1746,15 +1409,11 @@ fn render_state_transition<T: TextMeasure>(
 
             let lane_x = best_lane_x;
             let from_exit_x = if lane_x >= from_cx {
-                from.x + from.width
+                from.x + from.w
             } else {
                 from.x
             };
-            let to_enter_x = if lane_x >= to_cx {
-                to.x + to.width
-            } else {
-                to.x
-            };
+            let to_enter_x = if lane_x >= to_cx { to.x + to.w } else { to.x };
 
             svg.push_str(&format!(
                 r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75" />"#,
@@ -1808,12 +1467,8 @@ fn render_state_transition<T: TextMeasure>(
 
             // Strategy 1: Simple Z-route (exit from side, horizontal midline, enter from side)
             let going_right = to_cx > from_cx;
-            let simple_from_exit_x = if going_right {
-                from.x + from.width
-            } else {
-                from.x
-            };
-            let simple_to_enter_x = if going_right { to.x } else { to.x + to.width };
+            let simple_from_exit_x = if going_right { from.x + from.w } else { from.x };
+            let simple_to_enter_x = if going_right { to.x } else { to.x + to.w };
             let mid_y = (from_cy + to_cy) / 2.0;
             let simple_clear = obstacles.iter().all(|r| {
                 if is_endpoint(r) {
@@ -1885,7 +1540,7 @@ fn render_state_transition<T: TextMeasure>(
 
                 // Strategy 3: Side-exit L-route (exit from side, vertical lane, enter from side)
                 // Same approach as the verticalish non-adjacent routing.
-                let max_half_width = (from.width / 2.0).max(to.width / 2.0);
+                let max_half_width = (from.w / 2.0).max(to.w / 2.0);
                 let exit_y = from_cy;
                 let enter_y = to_cy;
                 let mut best_side_lane_x = f32::NAN;
@@ -1894,15 +1549,11 @@ fn render_state_transition<T: TextMeasure>(
                 for &try_side in &[route_side, -route_side] {
                     let base_x = from_cx + try_side * (max_half_width + 30.0 + lane.abs() * 14.0);
                     let fex = if base_x >= from_cx {
-                        from.x + from.width
+                        from.x + from.w
                     } else {
                         from.x
                     };
-                    let tex = if base_x >= to_cx {
-                        to.x + to.width
-                    } else {
-                        to.x
-                    };
+                    let tex = if base_x >= to_cx { to.x + to.w } else { to.x };
                     for i in 0..max_steps {
                         let candidate = base_x + try_side * (i as f32) * step;
                         let clear = obstacles.iter().all(|r| {
@@ -1956,15 +1607,11 @@ fn render_state_transition<T: TextMeasure>(
                 } else if !best_side_lane_x.is_nan() {
                     let lane_x = best_side_lane_x;
                     let from_exit_x = if lane_x >= from_cx {
-                        from.x + from.width
+                        from.x + from.w
                     } else {
                         from.x
                     };
-                    let to_enter_x = if lane_x >= to_cx {
-                        to.x + to.width
-                    } else {
-                        to.x
-                    };
+                    let to_enter_x = if lane_x >= to_cx { to.x + to.w } else { to.x };
 
                     svg.push_str(&format!(
                         r#"<polyline points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="none" stroke="{}" stroke-width="0.75" />"#,
@@ -2016,31 +1663,19 @@ fn render_state_transition<T: TextMeasure>(
         }
     }
 
-    // Arrow
-    let ax = arrow_x;
-    let ay = arrow_y;
-    let p1 = (
-        ax + arrow_angle.cos() * 10.0 - arrow_angle.sin() * 5.0,
-        ay + arrow_angle.sin() * 10.0 + arrow_angle.cos() * 5.0,
-    );
-    let p2 = (
-        ax + arrow_angle.cos() * 10.0 + arrow_angle.sin() * 5.0,
-        ay + arrow_angle.sin() * 10.0 - arrow_angle.cos() * 5.0,
-    );
-
-    svg.push_str(&format!(
-        r#"<polygon points="{:.2},{:.2} {:.2},{:.2} {:.2},{:.2}" fill="{}" />"#,
-        ax, ay, p1.0, p1.1, p2.0, p2.1, style.edge_stroke
+    // `arrow_angle` points back along the edge, away from the target.
+    svg.push_str(&arrowhead(
+        ArrowHead::Filled,
+        arrow_x,
+        arrow_y,
+        arrow_angle + std::f32::consts::PI,
+        style,
     ));
 
     // Label
     if let Some(ref label) = transition.label {
-        let cleaned = crate::display::markdown::markie::xml::sanitize_xml_text(label);
-        let label_width = measure
-            .measure_text(&cleaned, style.font_size * 0.85, false, false, false, None)
-            .0
-            + 8.0;
-        let label_height = style.font_size * 0.8 + 6.0;
+        let label_font = style.font_size * 0.85;
+        let (label_width, label_height) = pill_size(measure, label, label_font);
         let dx = px2 - px1;
         let dy = py2 - py1;
         let len = (dx * dx + dy * dy).sqrt().max(1.0);
@@ -2050,11 +1685,13 @@ fn render_state_transition<T: TextMeasure>(
         let perp_y = tx;
         let tangent_offset = lane_offset + global_offset;
 
-        let rect_for = |lx: f32, ly: f32| Rect {
-            x: lx - label_width / 2.0,
-            y: ly - label_height + 2.0,
-            w: label_width,
-            h: label_height,
+        let rect_for = |lx: f32, ly: f32| {
+            Rect::new(
+                lx - label_width / 2.0,
+                ly - label_height / 2.0,
+                label_width,
+                label_height,
+            )
         };
 
         let score = |r: &Rect| -> f32 {
@@ -2089,7 +1726,6 @@ fn render_state_transition<T: TextMeasure>(
         let base_score = score(&base_rect);
         let mut best_x = base_x;
         let mut best_y = base_y;
-        let mut best_rect = base_rect;
         let mut best_move =
             ((base_x - label_anchor_x).powi(2) + (base_y - label_anchor_y).powi(2)).sqrt();
         let mut best_cost = base_score + best_move * movement_weight;
@@ -2112,7 +1748,6 @@ fn render_state_transition<T: TextMeasure>(
                         best_move = mv;
                         best_x = lx;
                         best_y = ly;
-                        best_rect = r;
                     }
                 }
             }
@@ -2135,35 +1770,16 @@ fn render_state_transition<T: TextMeasure>(
                         best_move = mv;
                         best_x = lx;
                         best_y = ly;
-                        best_rect = r;
                     }
                 }
             }
         }
 
-        occupied_labels.push(best_rect);
-        track_point!(best_rect.x, best_rect.y);
-        track_point!(best_rect.x + best_rect.w, best_rect.y + best_rect.h);
-
-        svg.push_str(&format!(
-            r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="3" fill="{}" stroke="{}" stroke-width="0.5" />"#,
-            best_rect.x,
-            best_rect.y,
-            best_rect.w,
-            best_rect.h,
-            style.node_fill,
-            style.node_stroke
-        ));
-
-        svg.push_str(&format!(
-            r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}" text-anchor="middle">{}</text>"#,
-            best_x,
-            best_y,
-            style.font_family,
-            style.font_size * 0.85,
-            style.edge_text,
-            escape_xml(&cleaned)
-        ));
+        let (pill, rect) = label_pill(measure, style, label, label_font, (best_x, best_y));
+        svg.push_str(&pill);
+        occupied_labels.push(rect);
+        track_point!(rect.x, rect.y);
+        track_point!(rect.right(), rect.bottom());
     }
 
     let extent = Rect {
@@ -2173,6 +1789,70 @@ fn render_state_transition<T: TextMeasure>(
         h: (ext_max_y - ext_min_y.min(0.0)).max(0.0),
     };
     (svg, extent)
+}
+
+fn render_state_self_transition(
+    transition: &StateTransition,
+    pos: &Rect,
+    style: &DiagramStyle,
+    measure: &mut impl TextMeasure,
+    occupied_labels: &mut Vec<Rect>,
+) -> (String, Rect) {
+    let self_loop = SelfLoop::new(pos, FlowDirection::TopDown);
+    let mut svg = format!(
+        r#"<path d="{}" fill="none" stroke="{}" stroke-width="0.75" />"#,
+        self_loop.path_data(),
+        style.edge_stroke
+    );
+    let (ax, ay) = self_loop.end;
+    svg.push_str(&arrowhead(
+        ArrowHead::Filled,
+        ax,
+        ay,
+        self_loop.end_angle(),
+        style,
+    ));
+
+    // The curve stays inside the hull of its control points.
+    let points = [
+        self_loop.start,
+        self_loop.control1,
+        self_loop.control2,
+        self_loop.end,
+    ];
+    let mut extent = bounding_rect(&points);
+
+    if let Some(label) = &transition.label {
+        let font_size = style.font_size * 0.85;
+        let (label_w, _) = pill_size(measure, label, font_size);
+        let center = (
+            self_loop.control1.0 + 4.0 + label_w / 2.0,
+            self_loop.control1.1,
+        );
+        let (pill, rect) = label_pill(measure, style, label, font_size, center);
+        svg.push_str(&pill);
+        occupied_labels.push(rect);
+        extent = bounding_rect(&[
+            (extent.x, extent.y),
+            (extent.right(), extent.bottom()),
+            (rect.x, rect.y),
+            (rect.right(), rect.bottom()),
+        ]);
+    }
+
+    (svg, extent)
+}
+
+fn bounding_rect(points: &[(f32, f32)]) -> Rect {
+    let (mut min_x, mut min_y) = (f32::MAX, f32::MAX);
+    let (mut max_x, mut max_y) = (f32::MIN, f32::MIN);
+    for &(x, y) in points {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    Rect::new(min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
 fn state_pair_key(from: &str, to: &str) -> (String, String) {
@@ -2191,13 +1871,9 @@ fn render_er(
     diagram: &ErDiagram,
     style: &DiagramStyle,
     measure: &mut impl TextMeasure,
-) -> Result<(String, f32, f32), String> {
-    if diagram.entities.is_empty() {
-        return Ok(("<g></g>".to_string(), 100.0, 50.0));
-    }
-
+) -> (String, f32, f32) {
     let mut layout = LayoutEngine::new(measure, style.font_size);
-    let (positions, _edge_waypoints, bbox) = layout.layout_er(diagram);
+    let (positions, bbox) = layout.layout_er(diagram);
 
     let mut svg = String::new();
     let padding = 20.0;
@@ -2230,16 +1906,16 @@ fn render_er(
     let total_width = bbox.right() + padding;
     let total_height = bbox.bottom() + padding;
 
-    Ok((svg, total_width, total_height))
+    (svg, total_width, total_height)
 }
 
-fn render_er_entity(entity: &ErEntity, pos: &LayoutPos, style: &DiagramStyle) -> String {
+fn render_er_entity(entity: &ErEntity, pos: &Rect, style: &DiagramStyle) -> String {
     let mut svg = String::new();
 
     // Entity box
     svg.push_str(&format!(
         r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" fill="{}" stroke="{}" stroke-width="1" />"#,
-        pos.x, pos.y, pos.width, pos.height,
+        pos.x, pos.y, pos.w, pos.h,
         style.node_fill, style.node_stroke
     ));
 
@@ -2248,7 +1924,7 @@ fn render_er_entity(entity: &ErEntity, pos: &LayoutPos, style: &DiagramStyle) ->
     // Entity name (bold)
     svg.push_str(&format!(
         r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}" text-anchor="middle" font-weight="bold">{}</text>"#,
-        pos.x + pos.width / 2.0, y, style.font_family, style.font_size, style.node_text, escape_xml(&entity.name)
+        pos.x + pos.w / 2.0, y, style.font_family, style.font_size, style.node_text, escape_xml(&entity.name)
     ));
 
     // Divider line between name and attributes
@@ -2256,7 +1932,7 @@ fn render_er_entity(entity: &ErEntity, pos: &LayoutPos, style: &DiagramStyle) ->
         y += 4.0;
         svg.push_str(&format!(
             r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="0.75" />"#,
-            pos.x, y, pos.x + pos.width, y, style.node_stroke
+            pos.x, y, pos.x + pos.w, y, style.node_stroke
         ));
         y += style.font_size * 0.5;
     }
@@ -2264,22 +1940,14 @@ fn render_er_entity(entity: &ErEntity, pos: &LayoutPos, style: &DiagramStyle) ->
     // Attributes
     y += style.font_size;
     for attr in &entity.attributes {
-        let marker = if attr.is_key { "*" } else { "" };
-        let attr_name = if attr.is_composite {
-            format!("[{}]", attr.name)
-        } else {
-            attr.name.clone()
-        };
-        let attr_text = format!("{}{}", marker, attr_name);
-
         svg.push_str(&format!(
             r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}">{}</text>"#,
             pos.x + 8.0,
             y,
             style.font_family,
-            style.font_size * 0.9,
+            style.font_size * ER_ATTRIBUTE_FONT_SCALE,
             style.node_text,
-            escape_xml(&attr_text)
+            escape_xml(&attr.display())
         ));
         y += style.font_size * 1.3;
     }
@@ -2289,8 +1957,8 @@ fn render_er_entity(entity: &ErEntity, pos: &LayoutPos, style: &DiagramStyle) ->
 
 fn render_er_relationship(
     relation: &ErRelationship,
-    from: &LayoutPos,
-    to: &LayoutPos,
+    from: &Rect,
+    to: &Rect,
     style: &DiagramStyle,
     measure: &mut impl TextMeasure,
     occupied_labels: &mut Vec<Rect>,
@@ -2325,96 +1993,29 @@ fn render_er_relationship(
     ));
 
     if let Some(label) = &relation.label {
-        let cleaned = crate::display::markdown::markie::xml::sanitize_xml_text(label);
         let dx = x2 - x1;
         let dy = y2 - y1;
         let len = (dx * dx + dy * dy).sqrt().max(1.0);
-        let nx = -dy / len;
-        let ny = dx / len;
+        let (tx, ty) = (dx / len, dy / len);
+        let (nx, ny) = (-ty, tx);
         let mx = (x1 + x2) / 2.0;
         let my = (y1 + y2) / 2.0;
-        let label_w = measure
-            .measure_text(&cleaned, style.font_size * 0.8, false, false, false, None)
-            .0
-            + 8.0;
-        let label_h = style.font_size * 0.75 + 6.0;
+        let label_font = style.font_size * 0.8;
+        let (label_w, label_h) = pill_size(measure, label, label_font);
+        let rect_for =
+            |lx: f32, ly: f32| Rect::new(lx - label_w / 2.0, ly - label_h / 2.0, label_w, label_h);
+        let from_r = from.expanded(3.0);
+        let to_r = to.expanded(3.0);
 
-        let pad = 3.0;
-        let from_x = from.x - pad;
-        let from_y = from.y - pad;
-        let from_w = from.width + pad * 2.0;
-        let from_h = from.height + pad * 2.0;
-        let to_x = to.x - pad;
-        let to_y = to.y - pad;
-        let to_w = to.width + pad * 2.0;
-        let to_h = to.height + pad * 2.0;
-
-        // Choose the normal direction that avoids overlapping endpoints.
-        let rect_for = |lx: f32, ly: f32| Rect {
-            x: lx - label_w / 2.0,
-            y: ly - label_h + 2.0,
-            w: label_w,
-            h: label_h,
-        };
-
-        let mut best_dir = (nx, ny);
-        let mut best_penalty = i32::MAX;
-        for (cx, cy) in [(nx, ny), (-nx, -ny)] {
-            let off = 22.0;
-            let lx = mx + cx * off;
-            let ly = my + cy * off;
-            let r = rect_for(lx, ly);
-            let mut penalty = 0;
-            if r.overlaps(&Rect {
-                x: from_x,
-                y: from_y,
-                w: from_w,
-                h: from_h,
-            }) {
-                penalty += 1;
-            }
-            if r.overlaps(&Rect {
-                x: to_x,
-                y: to_y,
-                w: to_w,
-                h: to_h,
-            }) {
-                penalty += 1;
-            }
-            if penalty < best_penalty {
-                best_penalty = penalty;
-                best_dir = (cx, cy);
-            }
-            if penalty == 0 {
-                break;
-            }
-        }
-
-        let from_r = Rect {
-            x: from_x,
-            y: from_y,
-            w: from_w,
-            h: from_h,
-        };
-        let to_r = Rect {
-            x: to_x,
-            y: to_y,
-            w: to_w,
-            h: to_h,
-        };
-
-        let mut label_x = mx;
-        let mut label_y = my;
-        let mut best_rect = rect_for(label_x, label_y);
+        // Search outward from the line on both sides; the first spot clear of
+        // both entities and earlier labels wins.
+        let mut best = (mx, my);
         let mut best_score = i32::MAX;
-
-        let tx = dx / len;
-        let ty = dy / len;
-        for off in [22.0_f32, 32.0, 44.0, 56.0, 68.0, 80.0] {
+        'search: for off in [22.0_f32, 32.0, 44.0, 56.0, 68.0, 80.0] {
             for tangent in [-28.0_f32, -14.0, 0.0, 14.0, 28.0] {
-                for (sx, sy) in [(best_dir.0, best_dir.1), (-best_dir.0, -best_dir.1)] {
-                    let lx = mx + sx * off + tx * tangent;
-                    let ly = my + sy * off + ty * tangent;
+                for side in [1.0_f32, -1.0] {
+                    let lx = mx + side * nx * off + tx * tangent;
+                    let ly = my + side * ny * off + ty * tangent;
                     let r = rect_for(lx, ly);
                     let mut sc = 0;
                     if r.overlaps(&from_r) {
@@ -2430,55 +2031,29 @@ fn render_er_relationship(
                     }
                     if sc < best_score {
                         best_score = sc;
-                        label_x = lx;
-                        label_y = ly;
-                        best_rect = r;
+                        best = (lx, ly);
                         if best_score == 0 {
-                            break;
+                            break 'search;
                         }
                     }
                 }
-                if best_score == 0 {
-                    break;
-                }
-            }
-            if best_score == 0 {
-                break;
             }
         }
 
-        occupied_labels.push(best_rect);
-
-        svg.push_str(&format!(
-            r#"<rect x="{:.2}" y="{:.2}" width="{:.2}" height="{:.2}" rx="3" fill="{}" stroke="{}" stroke-width="0.5" />"#,
-            best_rect.x,
-            best_rect.y,
-            best_rect.w,
-            best_rect.h,
-            style.node_fill,
-            style.node_stroke
-        ));
-
-        svg.push_str(&format!(
-            r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.1}" fill="{}" text-anchor="middle">{}</text>"#,
-            label_x,
-            label_y,
-            style.font_family,
-            style.font_size * 0.8,
-            style.edge_text,
-            escape_xml(&cleaned)
-        ));
+        let (pill, rect) = label_pill(measure, style, label, label_font, best);
+        svg.push_str(&pill);
+        occupied_labels.push(rect);
     }
 
     svg
 }
 
-fn rect_boundary_point(rect: &LayoutPos, angle: f32) -> (f32, f32) {
+fn rect_boundary_point(rect: &Rect, angle: f32) -> (f32, f32) {
     let (cx, cy) = rect.center();
     let dx = angle.cos();
     let dy = angle.sin();
-    let half_w = rect.width / 2.0;
-    let half_h = rect.height / 2.0;
+    let half_w = rect.w / 2.0;
+    let half_h = rect.h / 2.0;
 
     let tx = if dx.abs() > 1e-5 {
         half_w / dx.abs()
@@ -2578,10 +2153,94 @@ fn render_er_cardinality_marker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display::markdown::markie::MockMeasure;
+    use image::{Rgba, RgbaImage};
+    use quick_xml::{Reader, events::Event};
+
+    fn test_style() -> DiagramStyle {
+        DiagramStyle {
+            node_fill: "#ff0000".into(),
+            node_stroke: "#00ff00".into(),
+            edge_stroke: "#0000ff".into(),
+            ..DiagramStyle::default()
+        }
+    }
+
+    fn render_svg(source: &str) -> String {
+        let (content, width, height) =
+            render_diagram(source, &test_style(), &mut MockMeasure).unwrap();
+        // Leave a margin around the reported size so drawing that overflows it
+        // stays measurable instead of being clipped away.
+        let (width, height) = (width + 40.0, height + 40.0);
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">{content}</svg>"#
+        )
+    }
+
+    fn visible_text(svg: &str) -> Vec<String> {
+        let mut reader = Reader::from_str(svg);
+        let mut text = Vec::new();
+        loop {
+            match reader.read_event().unwrap() {
+                Event::Text(t) => text.push(t.xml10_content().into_owned()),
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        text
+    }
+
+    fn rasterize(svg: &str) -> RgbaImage {
+        crate::display::markdown::markie::svg_to_image(svg)
+            .unwrap()
+            .to_rgba8()
+    }
+
+    fn is_node_fill(p: &Rgba<u8>) -> bool {
+        p[3] > 32 && p[0] > 180 && p[1] < 60 && p[2] < 60
+    }
+
+    fn is_edge(p: &Rgba<u8>) -> bool {
+        p[3] > 32 && p[2] > 180 && p[0] < 60 && p[1] < 60
+    }
+
+    /// Inclusive pixel bounds `(left, top, right, bottom)` of matching pixels.
+    fn bounds(image: &RgbaImage, pred: impl Fn(&Rgba<u8>) -> bool) -> (u32, u32, u32, u32) {
+        let mut found = None;
+        for (x, y, p) in image.enumerate_pixels() {
+            if pred(p) {
+                let (l, t, r, b) = found.unwrap_or((x, y, x, y));
+                found = Some((l.min(x), t.min(y), r.max(x), b.max(y)));
+            }
+        }
+        found.expect("no matching pixels")
+    }
+
+    fn assert_renders_visible(name: &str, source: &str, labels: &[&str]) -> Vec<String> {
+        let svg = render_svg(source);
+        let text = visible_text(&svg);
+        for label in labels {
+            assert!(
+                text.iter().any(|t| t.contains(label)),
+                "{name}: missing visible label {label}, got {text:?}"
+            );
+        }
+        let image = rasterize(&svg);
+        let node_pixels = image.pixels().filter(|p| is_node_fill(p)).count();
+        let edge_pixels = image.pixels().filter(|p| is_edge(p)).count();
+        assert!(
+            node_pixels > 100,
+            "{name}: nodes must be visible after rasterization, got {node_pixels}"
+        );
+        assert!(
+            edge_pixels > 20,
+            "{name}: edges must be visible after rasterization, got {edge_pixels}"
+        );
+        text
+    }
 
     #[test]
     fn complex_diagrams_render_labels_and_visible_nodes_and_edges() {
-        use quick_xml::{Reader, events::Event};
         let cases: &[(&str, &str, &[&str])] = &[
             (
                 "flowchart",
@@ -2600,6 +2259,11 @@ end"#,
                     "Workers", "Start", "Routine", "Store", "Decision", "Input", "Output", "Batch",
                     "Tail", "Done",
                 ],
+            ),
+            (
+                "cyclic flowchart",
+                "flowchart TD\n    A[Alpha] --> B[Beta]\n    B --> C[Gamma]\n    C --> A",
+                &["Alpha", "Beta", "Gamma"],
             ),
             (
                 "sequence",
@@ -2623,83 +2287,8 @@ end"#,
                 ],
             ),
             (
-                "state",
-                r#"stateDiagram
-state Parent {
-    state Child
-    Child --> Child: loop
-}
-Note right of Child: child note"#,
-                &["Parent", "Child", "loop", "child note"],
-            ),
-        ];
-        let style = DiagramStyle {
-            node_fill: "#ff0000".into(),
-            edge_stroke: "#0000ff".into(),
-            ..DiagramStyle::default()
-        };
-        for (name, source, labels) in cases {
-            let (content, width, height) =
-                render_diagram(source, &style, &mut MockMeasure).unwrap();
-            let svg = format!(
-                r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">{content}</svg>"#
-            );
-            let mut reader = Reader::from_str(&svg);
-            let mut visible_text = Vec::new();
-            loop {
-                match reader.read_event().unwrap() {
-                    Event::Text(text) => visible_text.push(text.xml10_content().into_owned()),
-                    Event::Eof => break,
-                    _ => {}
-                }
-            }
-            for label in *labels {
-                assert!(
-                    visible_text.iter().any(|text| text.contains(label)),
-                    "{name}: missing visible label {label}"
-                );
-            }
-            let image = crate::display::markdown::markie::svg_to_image(&svg)
-                .unwrap()
-                .to_rgba8();
-            let node_pixels = image
-                .pixels()
-                .filter(|p| p[3] > 32 && p[0] > 180 && p[1] < 60 && p[2] < 60)
-                .count();
-            let edge_pixels = image
-                .pixels()
-                .filter(|p| p[3] > 32 && p[2] > 180 && p[0] < 60 && p[1] < 60)
-                .count();
-            assert!(
-                node_pixels > 100,
-                "{name}: nodes must be visible after rasterization, got {node_pixels}"
-            );
-            assert!(
-                edge_pixels > 20,
-                "{name}: edges must be visible after rasterization, got {edge_pixels}"
-            );
-        }
-    }
-
-    struct MockMeasure;
-
-    impl TextMeasure for MockMeasure {
-        fn measure_text(
-            &mut self,
-            text: &str,
-            font_size: f32,
-            _is_code: bool,
-            _is_bold: bool,
-            _is_italic: bool,
-            _max_width: Option<f32>,
-        ) -> (f32, f32) {
-            (text.chars().count() as f32 * font_size * 0.6, font_size)
-        }
-    }
-
-    #[test]
-    fn render_class_includes_relations_and_labels() {
-        let src = r#"classDiagram
+                "class",
+                r#"classDiagram
   class User {
     +String id
   }
@@ -2710,70 +2299,154 @@ Note right of Child: child note"#,
     +record(event: String): void
   }
   User --> Session : creates
-  User ..> AuditLog : writes
-"#;
-        let style = DiagramStyle::default();
-        let mut measure = MockMeasure;
-
-        let (svg, _w, _h) = render_diagram(src, &style, &mut measure).unwrap();
-        assert!(svg.contains("creates"));
-        assert!(svg.contains("writes"));
+  User ..> AuditLog : writes"#,
+                &[
+                    "User",
+                    "+ String id",
+                    "+ record(event: String): void",
+                    "creates",
+                    "writes",
+                ],
+            ),
+            (
+                "state",
+                r#"stateDiagram
+state Parent {
+    state Child
+    Child --> Child: loop
+}
+Note right of Child: child note"#,
+                &["Parent", "Child", "loop", "child note"],
+            ),
+            (
+                "er",
+                "erDiagram\n    CUSTOMER ||--o{ ORDER : places\n    CUSTOMER {\n        *int id\n    }",
+                &["CUSTOMER", "ORDER", "places", "*int id"],
+            ),
+        ];
+        for (name, source, labels) in cases {
+            assert_renders_visible(name, source, labels);
+        }
     }
 
     #[test]
-    fn from_theme_produces_color_hierarchy() {
-        let style = DiagramStyle::from_theme("#586e75", "#fdf6e3", "#073642");
-        // edge_text should be a 60% mix of code_bg toward fg (not raw fg)
-        assert_ne!(style.edge_text, style.node_text);
-        // node_fill should be very close to code_bg (3% fg mix)
-        assert_ne!(style.node_fill, "#073642");
-        // node_stroke should be lighter than node_text (20% vs 100% fg)
-        assert_ne!(style.node_stroke, style.node_text);
-    }
-
-    #[test]
-    fn inheritance_marker_is_simple_triangle() {
-        let src = r#"classDiagram
-  class A
-  class B
-  A <|-- B
-"#;
-        let style = DiagramStyle::default();
-        let mut measure = MockMeasure;
-        let (svg, _w, _h) = render_diagram(src, &style, &mut measure).unwrap();
-
-        let marker = "<polygon points=\"";
-        let idx = svg.find(marker).expect("expected class marker polygon");
-        let rest = &svg[idx + marker.len()..];
-        let end = rest.find('"').expect("expected points terminator");
-        let points = &rest[..end];
-        let pair_count = points.split_whitespace().count();
-        assert_eq!(
-            pair_count, 3,
-            "inheritance triangle should have exactly 3 points"
+    fn sequence_renders_participants_implied_by_messages() {
+        assert_renders_visible(
+            "implicit participants",
+            "sequenceDiagram\n    Alice->>John: Hi",
+            &["Alice", "John", "Hi"],
         );
     }
 
     #[test]
-    fn test_unknown_diagram_type_renders_without_panic() {
-        let style = DiagramStyle::default();
-        let mut measure = MockMeasure;
-        let result = render_diagram("pie title Pets\n  \"Dogs\" : 50", &style, &mut measure);
+    fn sequence_activation_shorthand_renders_message_to_target() {
+        let text = assert_renders_visible(
+            "activation shorthand",
+            "sequenceDiagram\n    participant A\n    participant B\n    A->>+B: Hello\n    B-->>-A: Hi",
+            &["Hello", "Hi"],
+        );
         assert!(
-            result.is_ok(),
-            "Unknown diagram type should render without error"
+            !text.iter().any(|t| t.contains("+B") || t.contains("-A")),
+            "activation markers must not become participants: {text:?}"
         );
     }
 
     #[test]
-    fn test_syntax_error_renders_without_panic() {
-        let style = DiagramStyle::default();
-        let mut measure = MockMeasure;
-        let result = render_diagram(
-            "flowchart LR\n  ??? invalid syntax ???",
-            &style,
-            &mut measure,
+    fn class_diagram_with_only_relations_renders_classes() {
+        assert_renders_visible(
+            "relations only",
+            "classDiagram\n    Animal <|-- Duck\n    Animal <|-- Fish",
+            &["Animal", "Duck", "Fish"],
         );
-        assert!(result.is_ok(), "Syntax errors should not cause panic");
+    }
+
+    #[test]
+    fn inheritance_marker_is_hollow_triangle() {
+        let svg = render_svg("classDiagram\n  class A\n  class B\n  A <|-- B\n");
+        let style = test_style();
+        let mut reader = Reader::from_str(&svg);
+        let mut polygons = Vec::new();
+        loop {
+            match reader.read_event().unwrap() {
+                Event::Empty(e) if e.name().as_ref() == "polygon" => {
+                    let attr = |name: &str| {
+                        e.try_get_attribute(name)
+                            .unwrap()
+                            .map(|a| a.value.into_owned())
+                    };
+                    polygons.push((attr("points").unwrap(), attr("fill")));
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(polygons.len(), 1, "expected one marker, got {polygons:?}");
+        let (points, fill) = &polygons[0];
+        assert_eq!(points.split_whitespace().count(), 3, "{points}");
+        assert_eq!(fill.as_deref(), Some(style.node_fill.as_str()));
+    }
+
+    #[test]
+    fn state_self_transition_draws_loop_outside_state_box() {
+        let image = rasterize(&render_svg("stateDiagram\n    A --> A"));
+        let (left, top, right, bottom) = bounds(&image, is_node_fill);
+        let outside = image
+            .enumerate_pixels()
+            .filter(|(x, y, p)| {
+                is_edge(p) && (*x + 1 < left || *x > right + 1 || *y + 1 < top || *y > bottom + 1)
+            })
+            .count();
+        assert!(
+            outside > 20,
+            "self-transition must be drawn outside the state box, got {outside} pixels"
+        );
+    }
+
+    #[test]
+    fn mutually_nested_states_render_without_recursing_forever() {
+        let source = "stateDiagram\n    state A {\n        B --> X\n    }\n    state B {\n        A --> Y\n    }";
+        assert_renders_visible("nesting cycle", source, &["A", "B", "X"]);
+    }
+
+    #[test]
+    fn subgraph_box_keeps_equal_padding_when_clamped_at_top() {
+        let image = rasterize(&render_svg(
+            "flowchart TD\n    subgraph Group\n        A[Alpha] --> B[Beta]\n    end",
+        ));
+        let (_, _, nodes_right, nodes_bottom) = bounds(&image, |p| is_node_fill(p) && p[3] == 255);
+        let (_, _, box_right, box_bottom) = bounds(&image, |p| p[3] > 20);
+        let side_gap = box_right as i64 - nodes_right as i64;
+        let bottom_gap = box_bottom as i64 - nodes_bottom as i64;
+        assert!(
+            (side_gap - bottom_gap).abs() <= 2,
+            "subgraph padding differs: side {side_gap}, bottom {bottom_gap}"
+        );
+    }
+
+    #[test]
+    fn subgraph_title_pill_fits_cjk_title() {
+        let image = rasterize(&render_svg(
+            "flowchart TD\n    subgraph 数据流\n        A[Alpha]\n    end",
+        ));
+        // The title pill is the only node-colored fill drawn at 90% opacity.
+        let (left, _, right, _) =
+            bounds(&image, |p| is_node_fill(p) && (225..=250).contains(&p[3]));
+        let width = right - left + 1;
+        // MockMeasure: 3 chars * 0.6 * 11.7px + 12px padding ≈ 33px.
+        assert!(
+            (28..=40).contains(&width),
+            "title pill should fit three CJK characters, got {width}px"
+        );
+    }
+
+    #[test]
+    fn unsupported_and_empty_diagrams_return_err() {
+        for source in [
+            "pie title Pets\n  \"Dogs\" : 50",
+            "flowchart LR\n  ??? invalid syntax ???",
+        ] {
+            let result = render_diagram(source, &DiagramStyle::default(), &mut MockMeasure);
+            assert!(result.is_err(), "{source:?} should be rejected");
+        }
     }
 }
