@@ -4,6 +4,7 @@ use latex2mathml::{DisplayStyle, latex_to_mathml};
 use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event as XmlEvent};
 use quick_xml::reader::Reader as XmlReader;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 enum MathNode {
@@ -80,7 +81,12 @@ pub fn render_math<T: TextMeasure>(
         latex_to_mathml(&latex, style).map_err(|e| format!("LaTeX parse error: {:?}", e))?;
 
     let root = parse_mathml(&mathml)?;
-    let mbox = layout_node(&root, font_size, text_color, measure, 0.0, 0.0);
+    let mbox = MathLayout {
+        measure,
+        color: text_color,
+        extents: HashMap::new(),
+    }
+    .layout(&root, font_size, 0.0, 0.0);
 
     Ok(MathResult {
         width: mbox.width,
@@ -366,11 +372,6 @@ fn extract_text(children: &[MathNode]) -> String {
 const ASCENT_RATIO: f32 = 0.75;
 const DESCENT_RATIO: f32 = 0.25;
 
-fn measure_token<T: TextMeasure>(text: &str, font_size: f32, italic: bool, measure: &mut T) -> f32 {
-    let cleaned = sanitize_xml_text(text);
-    measure.measure_width(&cleaned, font_size, false, false, italic)
-}
-
 #[derive(Clone, Copy)]
 enum MathFont {
     Serif,
@@ -378,513 +379,635 @@ enum MathFont {
     SansSerif,
 }
 
-/// Lays out one text run on the baseline with the default ascent and descent.
-fn text_box<T: TextMeasure>(
-    text: &str,
-    font: MathFont,
-    font_size: f32,
-    color: &str,
-    measure: &mut T,
-    x: f32,
-    baseline_y: f32,
-) -> MathBox {
-    let (family, style) = match font {
-        MathFont::Serif => ("serif", ""),
-        MathFont::SerifItalic => ("serif", " font-style=\"italic\""),
-        MathFont::SansSerif => ("sans-serif", ""),
-    };
-    let italic = matches!(font, MathFont::SerifItalic);
-    let width = measure_token(text, font_size, italic, measure);
-    let svg = format!(
-        r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.2}" fill="{}"{}>{}</text>"#,
-        x,
-        baseline_y,
-        family,
-        font_size,
-        color,
-        style,
-        escape_xml(text)
-    );
-    MathBox {
-        width,
-        ascent: font_size * ASCENT_RATIO,
-        descent: font_size * DESCENT_RATIO,
-        svg,
-    }
+/// Width and vertical extent of a node laid out at the origin.
+#[derive(Clone, Copy)]
+struct Extent {
+    width: f32,
+    ascent: f32,
+    descent: f32,
 }
 
-fn layout_node<T: TextMeasure>(
-    node: &MathNode,
-    font_size: f32,
-    color: &str,
-    measure: &mut T,
-    x: f32,
-    baseline_y: f32,
-) -> MathBox {
-    match node {
-        MathNode::Ident(text) => {
-            let italic = text.len() == 1 && text.chars().next().is_some_and(|c| c.is_alphabetic());
-            let font = if italic {
-                MathFont::SerifItalic
-            } else {
-                MathFont::Serif
-            };
-            text_box(text, font, font_size, color, measure, x, baseline_y)
-        }
-        MathNode::Number(text) => text_box(
-            text,
-            MathFont::Serif,
-            font_size,
-            color,
-            measure,
-            x,
-            baseline_y,
-        ),
-        MathNode::Operator(text) => {
-            let is_large = is_large_operator(text);
-            let effective_size = if is_large { font_size * 1.4 } else { font_size };
-            let spacing = font_size * 0.15;
-            let y_offset = if is_large {
-                baseline_y + (effective_size - font_size) * 0.2
-            } else {
-                baseline_y
-            };
-            let mut op_box = text_box(
-                text,
-                MathFont::Serif,
-                effective_size,
-                color,
-                measure,
-                x + spacing,
-                y_offset,
-            );
-            op_box.width += spacing * 2.0;
-            if is_large {
-                op_box.ascent = effective_size * 0.8;
-                op_box.descent = effective_size * 0.3;
-            }
-            op_box
-        }
-        MathNode::Text(text) => text_box(
-            text,
-            MathFont::SansSerif,
-            font_size,
-            color,
-            measure,
-            x,
-            baseline_y,
-        ),
-        MathNode::Space(em) => MathBox {
-            width: font_size * em,
-            ascent: 0.0,
-            descent: 0.0,
-            svg: String::new(),
-        },
-        MathNode::Row(children) => layout_row(children, font_size, color, measure, x, baseline_y),
-        MathNode::Sup { base, sup } => {
-            let base_box = layout_node(base, font_size, color, measure, x, baseline_y);
-
-            let sup_size = font_size * 0.7;
-            let sup_y = baseline_y - base_box.ascent * 0.55;
-            let sup_box = layout_node(sup, sup_size, color, measure, x + base_box.width, sup_y);
-
-            let total_width = base_box.width + sup_box.width;
-            let ascent = base_box.ascent.max(sup_box.ascent + base_box.ascent * 0.55);
-            let descent = base_box.descent;
-
-            MathBox {
-                width: total_width,
-                ascent,
-                descent,
-                svg: format!("{}{}", base_box.svg, sup_box.svg),
-            }
-        }
-        MathNode::Sub { base, sub } => {
-            let base_box = layout_node(base, font_size, color, measure, x, baseline_y);
-
-            let sub_size = font_size * 0.7;
-            let sub_y = baseline_y + base_box.descent + sub_size * 0.35;
-            let sub_box = layout_node(sub, sub_size, color, measure, x + base_box.width, sub_y);
-
-            let total_width = base_box.width + sub_box.width;
-            let ascent = base_box.ascent;
-            let descent =
-                (base_box.descent + sub_size * 0.35 + sub_box.descent).max(base_box.descent);
-
-            MathBox {
-                width: total_width,
-                ascent,
-                descent,
-                svg: format!("{}{}", base_box.svg, sub_box.svg),
-            }
-        }
-        MathNode::SubSup { base, sub, sup } => {
-            let base_box = layout_node(base, font_size, color, measure, x, baseline_y);
-
-            let script_size = font_size * 0.7;
-
-            let sup_y = baseline_y - base_box.ascent * 0.55;
-            let sup_box = layout_node(sup, script_size, color, measure, x + base_box.width, sup_y);
-
-            let sub_y = baseline_y + base_box.descent + script_size * 0.35;
-            let sub_box = layout_node(sub, script_size, color, measure, x + base_box.width, sub_y);
-
-            let script_width = sup_box.width.max(sub_box.width);
-            let total_width = base_box.width + script_width;
-            let ascent = base_box.ascent.max(sup_box.ascent + base_box.ascent * 0.55);
-            let descent =
-                (base_box.descent + script_size * 0.35 + sub_box.descent).max(base_box.descent);
-
-            MathBox {
-                width: total_width,
-                ascent,
-                descent,
-                svg: format!("{}{}{}", base_box.svg, sup_box.svg, sub_box.svg),
-            }
-        }
-        MathNode::UnderOver { base, under, over } => layout_underover(
-            base,
-            under.as_deref(),
-            over.as_deref(),
-            &mut UnderoverContext {
-                font_size,
-                color,
-                measure,
-                x,
-                baseline_y,
-            },
-        ),
-        MathNode::Frac { num, den, has_rule } => {
-            let frac_size = font_size * 0.85;
-
-            let num_box = layout_node(num, frac_size, color, measure, 0.0, 0.0);
-            let den_box = layout_node(den, frac_size, color, measure, 0.0, 0.0);
-
-            let max_width = num_box.width.max(den_box.width);
-            let padding = font_size * 0.2;
-            let frac_width = max_width + padding * 2.0;
-
-            let rule_y = baseline_y - font_size * 0.3;
-            let gap = font_size * 0.15;
-
-            let num_baseline = rule_y - gap - num_box.descent;
-            let den_baseline = rule_y + gap + den_box.ascent;
-
-            let num_x = x + (frac_width - num_box.width) / 2.0;
-            let den_x = x + (frac_width - den_box.width) / 2.0;
-
-            let num_rendered = layout_node(num, frac_size, color, measure, num_x, num_baseline);
-            let den_rendered = layout_node(den, frac_size, color, measure, den_x, den_baseline);
-
-            let rule_svg = if *has_rule {
-                format!(
-                    r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="1" />"#,
-                    x,
-                    rule_y,
-                    x + frac_width,
-                    rule_y,
-                    color
-                )
-            } else {
-                String::new()
-            };
-
-            let ascent =
-                (baseline_y - num_baseline + num_rendered.ascent).max(font_size * ASCENT_RATIO);
-            let descent =
-                (den_baseline - baseline_y + den_rendered.descent).max(font_size * DESCENT_RATIO);
-
-            MathBox {
-                width: frac_width,
-                ascent,
-                descent,
-                svg: format!("{}{}{}", num_rendered.svg, rule_svg, den_rendered.svg),
-            }
-        }
-        MathNode::Sqrt { radicand } => {
-            let inner = layout_node(radicand, font_size, color, measure, 0.0, 0.0);
-
-            let radical_width = font_size * 0.6;
-            let padding = font_size * 0.1;
-            let overbar_gap = font_size * 0.15;
-            let total_width = radical_width + inner.width + padding;
-
-            let inner_box = layout_node(
-                radicand,
-                font_size,
-                color,
-                measure,
-                x + radical_width,
-                baseline_y,
-            );
-
-            let top_y = baseline_y - inner_box.ascent - overbar_gap;
-            let bottom_y = baseline_y + inner_box.descent;
-
-            let radical_svg = format!(
-                r#"<path d="M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}" stroke="{}" stroke-width="1.2" fill="none" />"#,
-                x,
-                baseline_y - font_size * 0.15,
-                x + radical_width * 0.35,
-                baseline_y,
-                x + radical_width * 0.6,
-                top_y,
-                x + radical_width + inner_box.width + padding,
-                top_y,
-                color
-            );
-
-            let ascent = (baseline_y - top_y).max(inner_box.ascent + overbar_gap);
-            let descent = inner_box.descent.max(bottom_y - baseline_y);
-
-            MathBox {
-                width: total_width,
-                ascent,
-                descent,
-                svg: format!("{}{}", radical_svg, inner_box.svg),
-            }
-        }
-        MathNode::Root { radicand, index } => {
-            let inner = layout_node(radicand, font_size, color, measure, 0.0, 0.0);
-            let index_size = font_size * 0.6;
-
-            let radical_width = font_size * 0.6;
-            let index_width = font_size * 0.5;
-            let padding = font_size * 0.1;
-            let overbar_gap = font_size * 0.15;
-            let total_width = index_width + radical_width + inner.width + padding;
-
-            let inner_box = layout_node(
-                radicand,
-                font_size,
-                color,
-                measure,
-                x + index_width + radical_width,
-                baseline_y,
-            );
-
-            let top_y = baseline_y - inner_box.ascent - overbar_gap;
-            let bottom_y = baseline_y + inner_box.descent;
-
-            // Render the index (nth root degree) in the notch
-            let index_baseline = baseline_y - inner_box.ascent * 0.3;
-            let index_box = layout_node(index, index_size, color, measure, x, index_baseline);
-
-            // Radical symbol with notch for index
-            let radical_svg = format!(
-                r#"<path d="M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}" stroke="{}" stroke-width="1.2" fill="none" />"#,
-                x + index_width,
-                baseline_y - font_size * 0.15,
-                x + index_width + radical_width * 0.35,
-                baseline_y,
-                x + index_width + radical_width * 0.6,
-                top_y,
-                x + index_width + radical_width + inner_box.width + padding,
-                top_y,
-                x + index_width + radical_width + inner_box.width + padding - font_size * 0.1,
-                top_y - font_size * 0.05,
-                color
-            );
-
-            let ascent = (baseline_y - top_y).max(inner_box.ascent + overbar_gap);
-            let descent = inner_box.descent.max(bottom_y - baseline_y);
-
-            MathBox {
-                width: total_width,
-                ascent,
-                descent,
-                svg: format!("{}{}{}", index_box.svg, radical_svg, inner_box.svg),
-            }
-        }
-        MathNode::Table { rows } => layout_table(rows, font_size, color, measure, x, baseline_y),
-        MathNode::StretchyOp { op, form } => {
-            layout_regular_stretchy_operator(op, form, font_size, color, measure, x, baseline_y)
-        }
-    }
-}
-
-fn layout_row<T: TextMeasure>(
-    children: &[MathNode],
-    font_size: f32,
-    color: &str,
-    measure: &mut T,
-    start_x: f32,
-    baseline_y: f32,
-) -> MathBox {
-    let mut target_ascent: f32 = font_size * ASCENT_RATIO;
-    let mut target_descent: f32 = font_size * DESCENT_RATIO;
-
-    for child in children {
-        if matches!(child, MathNode::StretchyOp { .. }) {
-            continue;
-        }
-        let child_box = layout_node(child, font_size, color, measure, 0.0, 0.0);
-        target_ascent = target_ascent.max(child_box.ascent);
-        target_descent = target_descent.max(child_box.descent);
-    }
-
-    let mut cx = start_x;
-    let mut svg = String::new();
-    let mut max_ascent: f32 = font_size * ASCENT_RATIO;
-    let mut max_descent: f32 = font_size * DESCENT_RATIO;
-
-    for child in children {
-        let child_box = match child {
-            MathNode::StretchyOp { op, form } => {
-                let layout = StretchedDelimiterLayout {
-                    font_size,
-                    color,
-                    x: cx,
-                    baseline_y,
-                    target_ascent,
-                    target_descent,
-                };
-                layout_stretched_delimiter(op, form, layout, measure)
-            }
-            _ => layout_node(child, font_size, color, measure, cx, baseline_y),
-        };
-        max_ascent = max_ascent.max(child_box.ascent);
-        max_descent = max_descent.max(child_box.descent);
-        cx += child_box.width;
-        svg.push_str(&child_box.svg);
-    }
-
-    MathBox {
-        width: cx - start_x,
-        ascent: max_ascent,
-        descent: max_descent,
-        svg,
-    }
-}
-
-struct StretchedDelimiterLayout<'a> {
-    font_size: f32,
+/// Lays out one formula. Parents size children by laying them out at the
+/// origin before placing them; `extents` caches those measurements so nested
+/// fractions, rows, and tables cost O(n·depth) instead of O(2^depth).
+struct MathLayout<'a, T: TextMeasure> {
+    measure: &'a mut T,
     color: &'a str,
+    // Keyed by node address: the tree stays borrowed and unmoved for the render.
+    extents: HashMap<(*const MathNode, u32), Extent>,
+}
+
+impl<T: TextMeasure> MathLayout<'_, T> {
+    fn extent(&mut self, node: &MathNode, font_size: f32) -> Extent {
+        let key = (node as *const MathNode, font_size.to_bits());
+        if let Some(&extent) = self.extents.get(&key) {
+            return extent;
+        }
+        let mbox = self.layout(node, font_size, 0.0, 0.0);
+        let extent = Extent {
+            width: mbox.width,
+            ascent: mbox.ascent,
+            descent: mbox.descent,
+        };
+        self.extents.insert(key, extent);
+        extent
+    }
+
+    fn layout(&mut self, node: &MathNode, font_size: f32, x: f32, baseline_y: f32) -> MathBox {
+        match node {
+            MathNode::Ident(text) => {
+                let italic =
+                    text.len() == 1 && text.chars().next().is_some_and(|c| c.is_alphabetic());
+                let font = if italic {
+                    MathFont::SerifItalic
+                } else {
+                    MathFont::Serif
+                };
+                self.text_box(text, font, font_size, x, baseline_y)
+            }
+            MathNode::Number(text) => {
+                self.text_box(text, MathFont::Serif, font_size, x, baseline_y)
+            }
+            MathNode::Operator(text) => {
+                let is_large = is_large_operator(text);
+                let effective_size = if is_large { font_size * 1.4 } else { font_size };
+                let spacing = font_size * 0.15;
+                let y_offset = if is_large {
+                    baseline_y + (effective_size - font_size) * 0.2
+                } else {
+                    baseline_y
+                };
+                let mut op_box =
+                    self.text_box(text, MathFont::Serif, effective_size, x + spacing, y_offset);
+                op_box.width += spacing * 2.0;
+                if is_large {
+                    op_box.ascent = effective_size * 0.8;
+                    op_box.descent = effective_size * 0.3;
+                }
+                op_box
+            }
+            MathNode::Text(text) => {
+                self.text_box(text, MathFont::SansSerif, font_size, x, baseline_y)
+            }
+            MathNode::Space(em) => MathBox {
+                width: font_size * em,
+                ascent: 0.0,
+                descent: 0.0,
+                svg: String::new(),
+            },
+            MathNode::Row(children) => self.row(children, font_size, x, baseline_y),
+            MathNode::Sup { base, sup } => {
+                let base_box = self.layout(base, font_size, x, baseline_y);
+
+                let sup_size = font_size * 0.7;
+                let sup_y = baseline_y - base_box.ascent * 0.55;
+                let sup_box = self.layout(sup, sup_size, x + base_box.width, sup_y);
+
+                let total_width = base_box.width + sup_box.width;
+                let ascent = base_box.ascent.max(sup_box.ascent + base_box.ascent * 0.55);
+                let descent = base_box.descent;
+
+                MathBox {
+                    width: total_width,
+                    ascent,
+                    descent,
+                    svg: format!("{}{}", base_box.svg, sup_box.svg),
+                }
+            }
+            MathNode::Sub { base, sub } => {
+                let base_box = self.layout(base, font_size, x, baseline_y);
+
+                let sub_size = font_size * 0.7;
+                let sub_y = baseline_y + base_box.descent + sub_size * 0.35;
+                let sub_box = self.layout(sub, sub_size, x + base_box.width, sub_y);
+
+                let total_width = base_box.width + sub_box.width;
+                let ascent = base_box.ascent;
+                let descent =
+                    (base_box.descent + sub_size * 0.35 + sub_box.descent).max(base_box.descent);
+
+                MathBox {
+                    width: total_width,
+                    ascent,
+                    descent,
+                    svg: format!("{}{}", base_box.svg, sub_box.svg),
+                }
+            }
+            MathNode::SubSup { base, sub, sup } => {
+                let base_box = self.layout(base, font_size, x, baseline_y);
+
+                let script_size = font_size * 0.7;
+
+                let sup_y = baseline_y - base_box.ascent * 0.55;
+                let sup_box = self.layout(sup, script_size, x + base_box.width, sup_y);
+
+                let sub_y = baseline_y + base_box.descent + script_size * 0.35;
+                let sub_box = self.layout(sub, script_size, x + base_box.width, sub_y);
+
+                let script_width = sup_box.width.max(sub_box.width);
+                let total_width = base_box.width + script_width;
+                let ascent = base_box.ascent.max(sup_box.ascent + base_box.ascent * 0.55);
+                let descent =
+                    (base_box.descent + script_size * 0.35 + sub_box.descent).max(base_box.descent);
+
+                MathBox {
+                    width: total_width,
+                    ascent,
+                    descent,
+                    svg: format!("{}{}{}", base_box.svg, sup_box.svg, sub_box.svg),
+                }
+            }
+            MathNode::UnderOver { base, under, over } => self.underover(
+                base,
+                under.as_deref(),
+                over.as_deref(),
+                font_size,
+                x,
+                baseline_y,
+            ),
+            MathNode::Frac { num, den, has_rule } => {
+                let frac_size = font_size * 0.85;
+
+                let num_extent = self.extent(num, frac_size);
+                let den_extent = self.extent(den, frac_size);
+
+                let max_width = num_extent.width.max(den_extent.width);
+                let padding = font_size * 0.2;
+                let frac_width = max_width + padding * 2.0;
+
+                let rule_y = baseline_y - font_size * 0.3;
+                let gap = font_size * 0.15;
+
+                let num_baseline = rule_y - gap - num_extent.descent;
+                let den_baseline = rule_y + gap + den_extent.ascent;
+
+                let num_x = x + (frac_width - num_extent.width) / 2.0;
+                let den_x = x + (frac_width - den_extent.width) / 2.0;
+
+                let num_rendered = self.layout(num, frac_size, num_x, num_baseline);
+                let den_rendered = self.layout(den, frac_size, den_x, den_baseline);
+
+                let rule_svg = if *has_rule {
+                    format!(
+                        r#"<line x1="{:.2}" y1="{:.2}" x2="{:.2}" y2="{:.2}" stroke="{}" stroke-width="1" />"#,
+                        x,
+                        rule_y,
+                        x + frac_width,
+                        rule_y,
+                        self.color
+                    )
+                } else {
+                    String::new()
+                };
+
+                let ascent =
+                    (baseline_y - num_baseline + num_rendered.ascent).max(font_size * ASCENT_RATIO);
+                let descent = (den_baseline - baseline_y + den_rendered.descent)
+                    .max(font_size * DESCENT_RATIO);
+
+                MathBox {
+                    width: frac_width,
+                    ascent,
+                    descent,
+                    svg: format!("{}{}{}", num_rendered.svg, rule_svg, den_rendered.svg),
+                }
+            }
+            MathNode::Sqrt { radicand } => {
+                let inner = self.extent(radicand, font_size);
+
+                let radical_width = font_size * 0.6;
+                let padding = font_size * 0.1;
+                let overbar_gap = font_size * 0.15;
+                let total_width = radical_width + inner.width + padding;
+
+                let inner_box = self.layout(radicand, font_size, x + radical_width, baseline_y);
+
+                let top_y = baseline_y - inner_box.ascent - overbar_gap;
+                let bottom_y = baseline_y + inner_box.descent;
+
+                let radical_svg = format!(
+                    r#"<path d="M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}" stroke="{}" stroke-width="1.2" fill="none" />"#,
+                    x,
+                    baseline_y - font_size * 0.15,
+                    x + radical_width * 0.35,
+                    baseline_y,
+                    x + radical_width * 0.6,
+                    top_y,
+                    x + radical_width + inner_box.width + padding,
+                    top_y,
+                    self.color
+                );
+
+                let ascent = (baseline_y - top_y).max(inner_box.ascent + overbar_gap);
+                let descent = inner_box.descent.max(bottom_y - baseline_y);
+
+                MathBox {
+                    width: total_width,
+                    ascent,
+                    descent,
+                    svg: format!("{}{}", radical_svg, inner_box.svg),
+                }
+            }
+            MathNode::Root { radicand, index } => {
+                let inner = self.extent(radicand, font_size);
+                let index_size = font_size * 0.6;
+
+                let radical_width = font_size * 0.6;
+                let index_width = font_size * 0.5;
+                let padding = font_size * 0.1;
+                let overbar_gap = font_size * 0.15;
+                let total_width = index_width + radical_width + inner.width + padding;
+
+                let inner_box = self.layout(
+                    radicand,
+                    font_size,
+                    x + index_width + radical_width,
+                    baseline_y,
+                );
+
+                let top_y = baseline_y - inner_box.ascent - overbar_gap;
+                let bottom_y = baseline_y + inner_box.descent;
+
+                // Render the index (nth root degree) in the notch
+                let index_baseline = baseline_y - inner_box.ascent * 0.3;
+                let index_box = self.layout(index, index_size, x, index_baseline);
+
+                // Radical symbol with notch for index
+                let radical_svg = format!(
+                    r#"<path d="M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}" stroke="{}" stroke-width="1.2" fill="none" />"#,
+                    x + index_width,
+                    baseline_y - font_size * 0.15,
+                    x + index_width + radical_width * 0.35,
+                    baseline_y,
+                    x + index_width + radical_width * 0.6,
+                    top_y,
+                    x + index_width + radical_width + inner_box.width + padding,
+                    top_y,
+                    x + index_width + radical_width + inner_box.width + padding - font_size * 0.1,
+                    top_y - font_size * 0.05,
+                    self.color
+                );
+
+                let ascent = (baseline_y - top_y).max(inner_box.ascent + overbar_gap);
+                let descent = inner_box.descent.max(bottom_y - baseline_y);
+
+                MathBox {
+                    width: total_width,
+                    ascent,
+                    descent,
+                    svg: format!("{}{}{}", index_box.svg, radical_svg, inner_box.svg),
+                }
+            }
+            MathNode::Table { rows } => self.table(rows, font_size, x, baseline_y),
+            MathNode::StretchyOp { op, form } => {
+                self.regular_stretchy_operator(op, form, font_size, x, baseline_y)
+            }
+        }
+    }
+
+    /// Lays out one text run on the baseline with the default ascent and descent.
+    fn text_box(
+        &mut self,
+        text: &str,
+        font: MathFont,
+        font_size: f32,
+        x: f32,
+        baseline_y: f32,
+    ) -> MathBox {
+        let (family, style) = match font {
+            MathFont::Serif => ("serif", ""),
+            MathFont::SerifItalic => ("serif", " font-style=\"italic\""),
+            MathFont::SansSerif => ("sans-serif", ""),
+        };
+        let italic = matches!(font, MathFont::SerifItalic);
+        let width =
+            self.measure
+                .measure_width(&sanitize_xml_text(text), font_size, false, false, italic);
+        let svg = format!(
+            r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.2}" fill="{}"{}>{}</text>"#,
+            x,
+            baseline_y,
+            family,
+            font_size,
+            self.color,
+            style,
+            escape_xml(text)
+        );
+        MathBox {
+            width,
+            ascent: font_size * ASCENT_RATIO,
+            descent: font_size * DESCENT_RATIO,
+            svg,
+        }
+    }
+
+    fn row(
+        &mut self,
+        children: &[MathNode],
+        font_size: f32,
+        start_x: f32,
+        baseline_y: f32,
+    ) -> MathBox {
+        let mut target_ascent: f32 = font_size * ASCENT_RATIO;
+        let mut target_descent: f32 = font_size * DESCENT_RATIO;
+
+        for child in children {
+            if matches!(child, MathNode::StretchyOp { .. }) {
+                continue;
+            }
+            let child_extent = self.extent(child, font_size);
+            target_ascent = target_ascent.max(child_extent.ascent);
+            target_descent = target_descent.max(child_extent.descent);
+        }
+
+        let mut cx = start_x;
+        let mut svg = String::new();
+        let mut max_ascent: f32 = font_size * ASCENT_RATIO;
+        let mut max_descent: f32 = font_size * DESCENT_RATIO;
+
+        for child in children {
+            let child_box = match child {
+                MathNode::StretchyOp { op, form } => {
+                    let layout = StretchedDelimiterLayout {
+                        font_size,
+                        x: cx,
+                        baseline_y,
+                        target_ascent,
+                        target_descent,
+                    };
+                    self.stretched_delimiter(op, form, layout)
+                }
+                _ => self.layout(child, font_size, cx, baseline_y),
+            };
+            max_ascent = max_ascent.max(child_box.ascent);
+            max_descent = max_descent.max(child_box.descent);
+            cx += child_box.width;
+            svg.push_str(&child_box.svg);
+        }
+
+        MathBox {
+            width: cx - start_x,
+            ascent: max_ascent,
+            descent: max_descent,
+            svg,
+        }
+    }
+
+    fn stretched_delimiter(
+        &mut self,
+        op: &str,
+        form: &str,
+        layout: StretchedDelimiterLayout,
+    ) -> MathBox {
+        let StretchedDelimiterLayout {
+            font_size,
+            x,
+            baseline_y,
+            target_ascent,
+            target_descent,
+        } = layout;
+
+        if op == "." {
+            return MathBox {
+                width: 0.0,
+                ascent: 0.0,
+                descent: 0.0,
+                svg: String::new(),
+            };
+        }
+
+        let height = target_ascent + target_descent;
+        if height <= font_size * 1.35 || !is_supported_stretched_delimiter(op) {
+            return self.regular_stretchy_operator(op, form, font_size, x, baseline_y);
+        }
+
+        let width = stretched_delimiter_width(op, font_size);
+        let stroke_width = (font_size * 0.075).clamp(1.0, 2.0);
+        let top = baseline_y - target_ascent;
+        let bottom = baseline_y + target_descent;
+        let mid = baseline_y + (target_descent - target_ascent) * 0.08;
+        let left = x + stroke_width;
+        let right = x + width - stroke_width;
+        let d = match op {
+            "[" => format!(
+                "M {right:.2} {top:.2} L {left:.2} {top:.2} L {left:.2} {bottom:.2} L {right:.2} {bottom:.2}"
+            ),
+            "]" => format!(
+                "M {left:.2} {top:.2} L {right:.2} {top:.2} L {right:.2} {bottom:.2} L {left:.2} {bottom:.2}"
+            ),
+            "(" => format!(
+                "M {right:.2} {top:.2} C {left:.2} {:.2} {left:.2} {:.2} {right:.2} {bottom:.2}",
+                top + height * 0.24,
+                bottom - height * 0.24
+            ),
+            ")" => format!(
+                "M {left:.2} {top:.2} C {right:.2} {:.2} {right:.2} {:.2} {left:.2} {bottom:.2}",
+                top + height * 0.24,
+                bottom - height * 0.24
+            ),
+            "{" => format!(
+                "M {right:.2} {top:.2} C {left:.2} {top:.2} {left:.2} {:.2} {:.2} {:.2} C {:.2} {:.2} {left:.2} {:.2} {right:.2} {bottom:.2}",
+                mid - height * 0.16,
+                x + width * 0.48,
+                mid,
+                x + width * 0.48,
+                mid,
+                mid + height * 0.16
+            ),
+            "}" => format!(
+                "M {left:.2} {top:.2} C {right:.2} {top:.2} {right:.2} {:.2} {:.2} {:.2} C {:.2} {:.2} {right:.2} {:.2} {left:.2} {bottom:.2}",
+                mid - height * 0.16,
+                x + width * 0.52,
+                mid,
+                x + width * 0.52,
+                mid,
+                mid + height * 0.16
+            ),
+            "|" | "‖" => format!(
+                "M {:.2} {top:.2} L {:.2} {bottom:.2}",
+                x + width / 2.0,
+                x + width / 2.0
+            ),
+            _ => {
+                return self.regular_stretchy_operator(op, form, font_size, x, baseline_y);
+            }
+        };
+
+        MathBox {
+            width,
+            ascent: target_ascent,
+            descent: target_descent,
+            svg: format!(
+                r#"<path d="{}" stroke="{}" stroke-width="{:.2}" stroke-linecap="round" stroke-linejoin="round" fill="none" />"#,
+                d, self.color, stroke_width
+            ),
+        }
+    }
+
+    fn regular_stretchy_operator(
+        &mut self,
+        op: &str,
+        form: &str,
+        font_size: f32,
+        x: f32,
+        baseline_y: f32,
+    ) -> MathBox {
+        let offset = match form {
+            "prefix" => font_size * 0.08,
+            "postfix" => -font_size * 0.08,
+            _ => 0.0,
+        };
+        self.text_box(op, MathFont::Serif, font_size, x + offset, baseline_y)
+    }
+
+    fn underover(
+        &mut self,
+        base: &MathNode,
+        under: Option<&MathNode>,
+        over: Option<&MathNode>,
+        font_size: f32,
+        x: f32,
+        baseline_y: f32,
+    ) -> MathBox {
+        let base_extent = self.extent(base, font_size);
+        let script_size = font_size * 0.65;
+        let gap = font_size * 0.15;
+
+        let over = over.map(|node| (node, self.extent(node, script_size)));
+        let under = under.map(|node| (node, self.extent(node, script_size)));
+
+        let max_width = [
+            base_extent.width,
+            over.map_or(0.0, |(_, e)| e.width),
+            under.map_or(0.0, |(_, e)| e.width),
+        ]
+        .into_iter()
+        .fold(0.0f32, f32::max);
+
+        let mut svg = String::new();
+        let mut total_ascent = base_extent.ascent;
+        let mut total_descent = base_extent.descent;
+
+        let base_x = x + (max_width - base_extent.width) / 2.0;
+        let base_rendered = self.layout(base, font_size, base_x, baseline_y);
+        svg.push_str(&base_rendered.svg);
+
+        if let Some((over_node, ob)) = over {
+            let over_baseline = baseline_y - base_extent.ascent - gap - ob.descent;
+            let over_x = x + (max_width - ob.width) / 2.0;
+            let over_rendered = self.layout(over_node, script_size, over_x, over_baseline);
+            svg.push_str(&over_rendered.svg);
+            total_ascent = base_extent.ascent + gap + ob.ascent + ob.descent;
+        }
+
+        if let Some((under_node, ub)) = under {
+            let under_baseline = baseline_y + base_extent.descent + gap + ub.ascent;
+            let under_x = x + (max_width - ub.width) / 2.0;
+            let under_rendered = self.layout(under_node, script_size, under_x, under_baseline);
+            svg.push_str(&under_rendered.svg);
+            total_descent = base_extent.descent + gap + ub.ascent + ub.descent;
+        }
+
+        MathBox {
+            width: max_width,
+            ascent: total_ascent,
+            descent: total_descent,
+            svg,
+        }
+    }
+
+    fn table(
+        &mut self,
+        rows: &[Vec<MathNode>],
+        font_size: f32,
+        x: f32,
+        baseline_y: f32,
+    ) -> MathBox {
+        if rows.is_empty() {
+            return MathBox {
+                width: 0.0,
+                ascent: font_size * ASCENT_RATIO,
+                descent: font_size * DESCENT_RATIO,
+                svg: String::new(),
+            };
+        }
+
+        let cell_size = font_size * 0.9;
+        let row_gap = font_size * 0.3;
+        let col_gap = font_size * 0.4;
+
+        // First pass: measure all cells to determine column widths and row heights
+        let mut col_widths: Vec<f32> = Vec::new();
+        let mut row_heights: Vec<(f32, f32)> = Vec::new(); // (ascent, descent) per row
+
+        for row in rows {
+            let mut row_ascent = cell_size * ASCENT_RATIO;
+            let mut row_descent = cell_size * DESCENT_RATIO;
+
+            for (col_idx, cell) in row.iter().enumerate() {
+                let cell_extent = self.extent(cell, cell_size);
+
+                // Expand column width if needed
+                while col_widths.len() <= col_idx {
+                    col_widths.push(0.0);
+                }
+                col_widths[col_idx] = col_widths[col_idx].max(cell_extent.width);
+
+                row_ascent = row_ascent.max(cell_extent.ascent);
+                row_descent = row_descent.max(cell_extent.descent);
+            }
+            row_heights.push((row_ascent, row_descent));
+        }
+
+        // Calculate total table dimensions
+        let total_width: f32 =
+            col_widths.iter().sum::<f32>() + col_gap * (col_widths.len().max(1) - 1) as f32;
+        let total_height: f32 =
+            row_heights.iter().map(|(a, d)| a + d).sum::<f32>() + row_gap * (rows.len() - 1) as f32;
+
+        // Center the table vertically around baseline
+        let table_top = baseline_y - total_height / 2.0;
+
+        // Second pass: render all cells
+        let mut svg = String::new();
+        let mut current_y = table_top;
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            let (row_ascent, row_descent) = row_heights[row_idx];
+            let row_baseline = current_y + row_ascent;
+            let mut current_x = x;
+
+            for (col_idx, cell) in row.iter().enumerate() {
+                let col_width = col_widths.get(col_idx).copied().unwrap_or(0.0);
+                let cell_width = self.extent(cell, cell_size).width;
+
+                // Center cell in column
+                let cell_x = current_x + (col_width - cell_width) / 2.0;
+
+                let rendered = self.layout(cell, cell_size, cell_x, row_baseline);
+                svg.push_str(&rendered.svg);
+
+                current_x += col_width + col_gap;
+            }
+
+            current_y += row_ascent + row_descent + row_gap;
+        }
+
+        MathBox {
+            width: total_width,
+            ascent: total_height / 2.0,
+            descent: total_height / 2.0,
+            svg,
+        }
+    }
+}
+
+struct StretchedDelimiterLayout {
+    font_size: f32,
     x: f32,
     baseline_y: f32,
     target_ascent: f32,
     target_descent: f32,
-}
-
-fn layout_stretched_delimiter<T: TextMeasure>(
-    op: &str,
-    form: &str,
-    layout: StretchedDelimiterLayout<'_>,
-    measure: &mut T,
-) -> MathBox {
-    let StretchedDelimiterLayout {
-        font_size,
-        color,
-        x,
-        baseline_y,
-        target_ascent,
-        target_descent,
-    } = layout;
-
-    if op == "." {
-        return MathBox {
-            width: 0.0,
-            ascent: 0.0,
-            descent: 0.0,
-            svg: String::new(),
-        };
-    }
-
-    let height = target_ascent + target_descent;
-    if height <= font_size * 1.35 || !is_supported_stretched_delimiter(op) {
-        return layout_regular_stretchy_operator(
-            op, form, font_size, color, measure, x, baseline_y,
-        );
-    }
-
-    let width = stretched_delimiter_width(op, font_size);
-    let stroke_width = (font_size * 0.075).clamp(1.0, 2.0);
-    let top = baseline_y - target_ascent;
-    let bottom = baseline_y + target_descent;
-    let mid = baseline_y + (target_descent - target_ascent) * 0.08;
-    let left = x + stroke_width;
-    let right = x + width - stroke_width;
-    let d = match op {
-        "[" => format!(
-            "M {right:.2} {top:.2} L {left:.2} {top:.2} L {left:.2} {bottom:.2} L {right:.2} {bottom:.2}"
-        ),
-        "]" => format!(
-            "M {left:.2} {top:.2} L {right:.2} {top:.2} L {right:.2} {bottom:.2} L {left:.2} {bottom:.2}"
-        ),
-        "(" => format!(
-            "M {right:.2} {top:.2} C {left:.2} {:.2} {left:.2} {:.2} {right:.2} {bottom:.2}",
-            top + height * 0.24,
-            bottom - height * 0.24
-        ),
-        ")" => format!(
-            "M {left:.2} {top:.2} C {right:.2} {:.2} {right:.2} {:.2} {left:.2} {bottom:.2}",
-            top + height * 0.24,
-            bottom - height * 0.24
-        ),
-        "{" => format!(
-            "M {right:.2} {top:.2} C {left:.2} {top:.2} {left:.2} {:.2} {:.2} {:.2} C {:.2} {:.2} {left:.2} {:.2} {right:.2} {bottom:.2}",
-            mid - height * 0.16,
-            x + width * 0.48,
-            mid,
-            x + width * 0.48,
-            mid,
-            mid + height * 0.16
-        ),
-        "}" => format!(
-            "M {left:.2} {top:.2} C {right:.2} {top:.2} {right:.2} {:.2} {:.2} {:.2} C {:.2} {:.2} {right:.2} {:.2} {left:.2} {bottom:.2}",
-            mid - height * 0.16,
-            x + width * 0.52,
-            mid,
-            x + width * 0.52,
-            mid,
-            mid + height * 0.16
-        ),
-        "|" | "‖" => format!(
-            "M {:.2} {top:.2} L {:.2} {bottom:.2}",
-            x + width / 2.0,
-            x + width / 2.0
-        ),
-        _ => {
-            return layout_regular_stretchy_operator(
-                op, form, font_size, color, measure, x, baseline_y,
-            );
-        }
-    };
-
-    MathBox {
-        width,
-        ascent: target_ascent,
-        descent: target_descent,
-        svg: format!(
-            r#"<path d="{}" stroke="{}" stroke-width="{:.2}" stroke-linecap="round" stroke-linejoin="round" fill="none" />"#,
-            d, color, stroke_width
-        ),
-    }
-}
-
-fn layout_regular_stretchy_operator<T: TextMeasure>(
-    op: &str,
-    form: &str,
-    font_size: f32,
-    color: &str,
-    measure: &mut T,
-    x: f32,
-    baseline_y: f32,
-) -> MathBox {
-    let offset = match form {
-        "prefix" => font_size * 0.08,
-        "postfix" => -font_size * 0.08,
-        _ => 0.0,
-    };
-    text_box(
-        op,
-        MathFont::Serif,
-        font_size,
-        color,
-        measure,
-        x + offset,
-        baseline_y,
-    )
 }
 
 fn is_supported_stretched_delimiter(op: &str) -> bool {
@@ -897,173 +1020,6 @@ fn stretched_delimiter_width(op: &str, font_size: f32) -> f32 {
         "(" | ")" => font_size * 0.48,
         "[" | "]" | "|" | "‖" => font_size * 0.42,
         _ => font_size * 0.45,
-    }
-}
-
-struct UnderoverContext<'a, T: TextMeasure> {
-    font_size: f32,
-    color: &'a str,
-    measure: &'a mut T,
-    x: f32,
-    baseline_y: f32,
-}
-
-fn layout_underover<T: TextMeasure>(
-    base: &MathNode,
-    under: Option<&MathNode>,
-    over: Option<&MathNode>,
-    ctx: &mut UnderoverContext<'_, T>,
-) -> MathBox {
-    let font_size = ctx.font_size;
-    let color = ctx.color;
-    let measure = &mut *ctx.measure;
-    let x = ctx.x;
-    let baseline_y = ctx.baseline_y;
-
-    let base_box = layout_node(base, font_size, color, measure, 0.0, 0.0);
-    let script_size = font_size * 0.65;
-    let gap = font_size * 0.15;
-
-    let over_box = over.map(|o| layout_node(o, script_size, color, measure, 0.0, 0.0));
-    let under_box = under.map(|u| layout_node(u, script_size, color, measure, 0.0, 0.0));
-
-    let max_width = [
-        base_box.width,
-        over_box.as_ref().map_or(0.0, |b| b.width),
-        under_box.as_ref().map_or(0.0, |b| b.width),
-    ]
-    .into_iter()
-    .fold(0.0f32, f32::max);
-
-    let mut svg = String::new();
-    let mut total_ascent = base_box.ascent;
-    let mut total_descent = base_box.descent;
-
-    let base_x = x + (max_width - base_box.width) / 2.0;
-    let base_rendered = layout_node(base, font_size, color, measure, base_x, baseline_y);
-    svg.push_str(&base_rendered.svg);
-
-    if let (Some(over_node), Some(ob)) = (over, &over_box) {
-        let over_baseline = baseline_y - base_box.ascent - gap - ob.descent;
-        let over_x = x + (max_width - ob.width) / 2.0;
-        let over_rendered = layout_node(
-            over_node,
-            script_size,
-            color,
-            measure,
-            over_x,
-            over_baseline,
-        );
-        svg.push_str(&over_rendered.svg);
-        total_ascent = base_box.ascent + gap + ob.ascent + ob.descent;
-    }
-
-    if let (Some(under_node), Some(ub)) = (under, &under_box) {
-        let under_baseline = baseline_y + base_box.descent + gap + ub.ascent;
-        let under_x = x + (max_width - ub.width) / 2.0;
-        let under_rendered = layout_node(
-            under_node,
-            script_size,
-            color,
-            measure,
-            under_x,
-            under_baseline,
-        );
-        svg.push_str(&under_rendered.svg);
-        total_descent = base_box.descent + gap + ub.ascent + ub.descent;
-    }
-
-    MathBox {
-        width: max_width,
-        ascent: total_ascent,
-        descent: total_descent,
-        svg,
-    }
-}
-
-fn layout_table<T: TextMeasure>(
-    rows: &[Vec<MathNode>],
-    font_size: f32,
-    color: &str,
-    measure: &mut T,
-    x: f32,
-    baseline_y: f32,
-) -> MathBox {
-    if rows.is_empty() {
-        return MathBox {
-            width: 0.0,
-            ascent: font_size * ASCENT_RATIO,
-            descent: font_size * DESCENT_RATIO,
-            svg: String::new(),
-        };
-    }
-
-    let cell_size = font_size * 0.9;
-    let row_gap = font_size * 0.3;
-    let col_gap = font_size * 0.4;
-
-    // First pass: measure all cells to determine column widths and row heights
-    let mut col_widths: Vec<f32> = Vec::new();
-    let mut row_heights: Vec<(f32, f32)> = Vec::new(); // (ascent, descent) per row
-
-    for row in rows {
-        let mut row_ascent = cell_size * ASCENT_RATIO;
-        let mut row_descent = cell_size * DESCENT_RATIO;
-
-        for (col_idx, cell) in row.iter().enumerate() {
-            let cell_box = layout_node(cell, cell_size, color, measure, 0.0, 0.0);
-
-            // Expand column width if needed
-            while col_widths.len() <= col_idx {
-                col_widths.push(0.0);
-            }
-            col_widths[col_idx] = col_widths[col_idx].max(cell_box.width);
-
-            row_ascent = row_ascent.max(cell_box.ascent);
-            row_descent = row_descent.max(cell_box.descent);
-        }
-        row_heights.push((row_ascent, row_descent));
-    }
-
-    // Calculate total table dimensions
-    let total_width: f32 =
-        col_widths.iter().sum::<f32>() + col_gap * (col_widths.len().max(1) - 1) as f32;
-    let total_height: f32 =
-        row_heights.iter().map(|(a, d)| a + d).sum::<f32>() + row_gap * (rows.len() - 1) as f32;
-
-    // Center the table vertically around baseline
-    let table_top = baseline_y - total_height / 2.0;
-
-    // Second pass: render all cells
-    let mut svg = String::new();
-    let mut current_y = table_top;
-
-    for (row_idx, row) in rows.iter().enumerate() {
-        let (row_ascent, row_descent) = row_heights[row_idx];
-        let row_baseline = current_y + row_ascent;
-        let mut current_x = x;
-
-        for (col_idx, cell) in row.iter().enumerate() {
-            let col_width = col_widths.get(col_idx).copied().unwrap_or(0.0);
-            let cell_box = layout_node(cell, cell_size, color, measure, 0.0, 0.0);
-
-            // Center cell in column
-            let cell_x = current_x + (col_width - cell_box.width) / 2.0;
-
-            let rendered = layout_node(cell, cell_size, color, measure, cell_x, row_baseline);
-            svg.push_str(&rendered.svg);
-
-            current_x += col_width + col_gap;
-        }
-
-        current_y += row_ascent + row_descent + row_gap;
-    }
-
-    MathBox {
-        width: total_width,
-        ascent: total_height / 2.0,
-        descent: total_height / 2.0,
-        svg,
     }
 }
 
