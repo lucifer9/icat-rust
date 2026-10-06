@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use cosmic_text::{
-    Attrs, Buffer, Color, Family, FontSystem, LayoutRun, Metrics, PhysicalGlyph, Renderer, Shaping,
-    Style, SwashCache, UnderlineStyle, Weight, render_decoration,
+    Attrs, Buffer, Color, Family, FontSystem, Metrics, PhysicalGlyph, Renderer, Shaping, Style,
+    SwashCache, UnderlineStyle, Weight, render_decoration,
 };
 use image::{DynamicImage, ImageBuffer, Rgba, imageops};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -27,6 +27,53 @@ pub const DEFAULT_MARKDOWN_FONT_PT: f64 = 24.0;
 pub const MIN_MARKDOWN_WIDTH: u32 = 480;
 const MARKDOWN_CHUNK_HEIGHT: u32 = 8192;
 const CODE_PADDING: u32 = 10;
+
+// Text sizes as multiples of the body font size. HEADING_SCALE is indexed by
+// heading level 1..=5; deeper levels reuse the last entry.
+const HEADING_SCALE: [f64; 5] = [1.9, 1.6, 1.4, 1.25, 1.15];
+const CODE_FONT_EM: f64 = 0.95;
+const LINE_HEIGHT_EM: f32 = 1.4;
+// Baseline offset of a text run within an inline line.
+const INLINE_BASELINE_EM: f32 = 0.9;
+
+// Vertical spacing between blocks, in multiples of the body font size.
+const HEADING_SPACE_ABOVE_EM: f64 = 0.75;
+const HEADING_SPACE_BELOW_EM: f64 = 0.5;
+const IMAGE_GAP_EM: f64 = 0.6;
+const PARAGRAPH_GAP_EM: f64 = 0.9;
+const LIST_ITEM_GAP_TIGHT_EM: f64 = 0.6;
+const LIST_ITEM_GAP_LOOSE_EM: f64 = 0.9;
+const LIST_GAP_EM: f64 = 0.7;
+const QUOTE_GAP_EM: f64 = 0.9;
+const TABLE_GAP_EM: f64 = 0.5;
+const TABLE_PADDING_EM: f64 = 0.6;
+const TABLE_MIN_PADDING: f64 = 8.0;
+
+// Fixed pixel geometry.
+const LIST_MARKER_WIDTH: u32 = 32;
+const LIST_INDENT: u32 = 40;
+// Added to the font size to get the minimum height of a list item.
+const LIST_ITEM_MIN_EXTRA: u32 = 8;
+const QUOTE_INDENT: u32 = 48;
+const QUOTE_BAR_WIDTH: u32 = 4;
+const EMPTY_QUOTE_ADVANCE: u32 = 4;
+const RULE_OFFSET: u32 = 4;
+const RULE_ADVANCE: u32 = 12;
+const RULE_THICKNESS: u32 = 2;
+// Extra background below the bottom code padding.
+const CODE_BOTTOM_EXTRA: u32 = 6;
+const CODE_BLOCK_GAP: u32 = 6;
+const TABLE_BORDER: u32 = 1;
+const TABLE_MIN_COL_WIDTH: u32 = 60;
+// Minimum document height below the top margin.
+const MIN_BODY_HEIGHT: u32 = 50;
+
+const QUOTE_BAR_COLOR: Rgba<u8> = Rgba([180, 180, 180, 255]);
+const TABLE_BORDER_COLOR: Rgba<u8> = Rgba([200, 200, 200, 255]);
+const TABLE_HEADER_BG: Rgba<u8> = Rgba([240, 240, 240, 255]);
+const CODE_BG: [u8; 4] = [245, 245, 245, 255];
+const RULE_COLOR: [u8; 4] = [220, 220, 220, 255];
+const CODE_TEXT_COLOR: Color = Color::rgb(50, 50, 50);
 
 // Cached syntax highlighting sets (loaded once, reused across calls)
 static SYNTAX_SET: OnceLock<syntect::parsing::SyntaxSet> = OnceLock::new();
@@ -76,7 +123,7 @@ fn markdown_from_bytes_impl(
 
     // Layout runs once over the whole document to learn its height; pages are
     // then drawn on demand into page-sized pixmaps.
-    let mut layout = with_fonts(|font_system, _| {
+    let layout = with_fonts(|font_system, _| {
         layout_document(&blocks, &base_dir, font_system, width, opts.font_size_pt)
     })?;
 
@@ -85,7 +132,7 @@ fn markdown_from_bytes_impl(
     let mut current = opts.page.unwrap_or(1).clamp(1, total_pages);
     loop {
         let image = with_fonts(|font_system, swash| {
-            render_page(&mut layout, font_system, swash, current, page_height)
+            render_page(&layout, font_system, swash, current, page_height)
         })?;
         send_rendered_markdown(&image, size, tmux)?;
         if !interactive {
@@ -691,367 +738,385 @@ fn layout_document(
     width: u32,
     font_size: f64,
 ) -> Result<MarkdownLayout, Box<dyn std::error::Error>> {
-    let mut image_cache = HashMap::new();
-    let mut y = DEFAULT_MARKDOWN_MARGIN;
-    let mut rendered_blocks: Vec<RenderBlock> = Vec::new();
-    let content_width = width.saturating_sub(DEFAULT_MARKDOWN_MARGIN * 2);
-    let bold = InlineStyle {
-        bold: true,
-        ..InlineStyle::default()
+    let mut doc = DocBuilder {
+        font_system,
+        base_dir,
+        image_cache: HashMap::new(),
+        font_size,
+        content_width: width.saturating_sub(DEFAULT_MARKDOWN_MARGIN * 2),
+        y: DEFAULT_MARKDOWN_MARGIN,
+        blocks: Vec::new(),
     };
-
     for block in blocks {
         match block {
-            Block::Heading { level, tokens } => {
-                let size = match level {
-                    1 => font_size * 1.9,
-                    2 => font_size * 1.6,
-                    3 => font_size * 1.4,
-                    4 => font_size * 1.25,
-                    _ => font_size * 1.15,
-                } as f32;
-                let text = flatten_tokens(tokens);
-                let layout = layout_text(font_system, &text, content_width, size, bold);
-                y += (font_size * 0.75) as u32;
-                rendered_blocks.push(RenderBlock::Text {
-                    layout,
-                    x: DEFAULT_MARKDOWN_MARGIN,
-                    y,
-                });
-                y += rendered_blocks.last().unwrap().height() + (font_size * 0.5) as u32;
-            }
-            Block::Paragraph(tokens) => {
-                let non_empty: Vec<_> = tokens
-                    .iter()
-                    .filter(|t| !matches!(t, InlineToken::SoftBreak | InlineToken::HardBreak))
-                    .collect();
-                match non_empty.as_slice() {
-                    // Solo image paragraph: render the image centered
-                    [InlineToken::Image { path }] => {
-                        let resolved = resolve_image_path(base_dir, path);
-                        if let Some(img) = load_inline_image(&resolved, &mut image_cache)? {
-                            let img = scale_markdown_image_to_width(&img, content_width);
-                            let x = DEFAULT_MARKDOWN_MARGIN
-                                + content_width.saturating_sub(img.width()) / 2;
-                            rendered_blocks.push(RenderBlock::Image { image: img, x, y });
-                            y +=
-                                rendered_blocks.last().unwrap().height() + (font_size * 0.6) as u32;
-                        }
-                    }
-                    [InlineToken::Math { text, display }] => {
-                        let rendered =
-                            math::render_math(text, font_system, font_size as f32, *display)
-                                .map_err(|err| format!("failed to render math: {err}"))?;
-                        let image = scale_markdown_image_to_width(&rendered.image, content_width);
-                        let x = DEFAULT_MARKDOWN_MARGIN
-                            + content_width.saturating_sub(image.width()) / 2;
-                        rendered_blocks.push(RenderBlock::Image { image, x, y });
-                        y += rendered_blocks.last().unwrap().height() + (font_size * 0.6) as u32;
-                    }
-                    _ if !flatten_tokens(tokens).trim().is_empty()
-                        || tokens
-                            .iter()
-                            .any(|t| matches!(t, InlineToken::Image { .. })) =>
-                    {
-                        let layout = layout_inline_tokens(
-                            font_system,
-                            tokens,
-                            content_width,
-                            font_size as f32,
-                            false,
-                            base_dir,
-                            &mut image_cache,
-                        )?;
-                        rendered_blocks.push(RenderBlock::Inline {
-                            layout,
-                            x: DEFAULT_MARKDOWN_MARGIN,
-                            y,
-                        });
-                        y += rendered_blocks.last().unwrap().height() + (font_size * 0.9) as u32;
-                    }
-                    _ => {}
-                }
-            }
+            Block::Heading { level, tokens } => doc.heading(*level, tokens),
+            Block::Paragraph(tokens) => doc.paragraph(tokens)?,
             Block::List {
                 items,
                 ordered,
                 tight,
-            } => {
-                for (item_idx, item) in items.iter().enumerate() {
-                    let prefix = if *ordered {
-                        format!("{}.", item_idx + 1)
-                    } else {
-                        "•".to_string()
-                    };
-                    let marker = layout_text(
-                        font_system,
-                        &prefix,
-                        32,
-                        font_size as f32,
-                        InlineStyle::default(),
-                    );
-                    let content = layout_inline_tokens(
-                        font_system,
-                        item,
-                        content_width.saturating_sub(40),
-                        font_size as f32,
-                        false,
-                        base_dir,
-                        &mut image_cache,
-                    )?;
-                    rendered_blocks.push(RenderBlock::Text {
-                        layout: marker,
-                        x: DEFAULT_MARKDOWN_MARGIN,
-                        y,
-                    });
-                    let content_height = content.height;
-                    rendered_blocks.push(RenderBlock::Inline {
-                        layout: content,
-                        x: DEFAULT_MARKDOWN_MARGIN + 40,
-                        y,
-                    });
-                    y += content_height.max(font_size as u32 + 8);
-                    if item_idx + 1 < items.len() {
-                        y += if *tight {
-                            (font_size * 0.6) as u32
-                        } else {
-                            (font_size * 0.9) as u32
-                        };
-                    }
-                }
-                y += (font_size * 0.7) as u32;
-            }
-            Block::BlockQuote(children) => {
-                let content_text = flatten_blocks_to_text(children);
-                let trimmed = content_text.trim();
-                if !trimmed.is_empty() {
-                    let layout = layout_text(
-                        font_system,
-                        trimmed,
-                        content_width.saturating_sub(48),
-                        font_size as f32,
-                        InlineStyle::default(),
-                    );
-                    let h = layout.height;
-                    // 4px vertical bar on the left
-                    rendered_blocks.push(RenderBlock::Rect {
-                        x: DEFAULT_MARKDOWN_MARGIN,
-                        y,
-                        width: 4,
-                        height: h.max(font_size as u32),
-                        color: Rgba([180, 180, 180, 255]),
-                    });
-                    rendered_blocks.push(RenderBlock::Text {
-                        layout,
-                        x: DEFAULT_MARKDOWN_MARGIN + 48,
-                        y,
-                    });
-                    y += h + (font_size * 0.9) as u32;
-                } else {
-                    y += 4;
-                }
-            }
-            Block::Code { lang, text } => {
-                if lang.trim().eq_ignore_ascii_case("mermaid") {
-                    match mermaid::render_mermaid(
-                        text,
-                        font_system,
-                        content_width,
-                        font_size as f32,
-                    ) {
-                        Ok(image) => {
-                            let x = DEFAULT_MARKDOWN_MARGIN
-                                + content_width.saturating_sub(image.width()) / 2;
-                            rendered_blocks.push(RenderBlock::Image { image, x, y });
-                            y +=
-                                rendered_blocks.last().unwrap().height() + (font_size * 0.6) as u32;
-                            continue;
-                        }
-                        // Show the diagram source as a code block instead of
-                        // dropping the rest of the document.
-                        Err(err) => eprintln!(
-                            "Warning: failed to render Mermaid diagram: {}",
-                            crate::cli::sanitize_control_chars(&err)
-                        ),
-                    }
-                }
-                let code_size = (font_size * 0.95) as f32;
-                let code_inner = content_width.saturating_sub(CODE_PADDING * 2);
-                let spans = highlight_code_spans(lang, text);
+            } => doc.list(items, *ordered, *tight)?,
+            Block::BlockQuote(children) => doc.block_quote(children),
+            Block::Code { lang, text } => doc.code(lang, text),
+            Block::Math(text) => doc.math(text, true)?,
+            Block::Rule => doc.rule(),
+            Block::Table { header, rows } => doc.table(header, rows)?,
+        }
+    }
+    Ok(doc.finish(width))
+}
 
-                let mut buffer = Buffer::new(font_system, Metrics::new(code_size, code_size * 1.4));
-                buffer.set_size(Some(code_inner as f32), None);
-                {
-                    let rich: Vec<(&str, Attrs)> = spans
-                        .iter()
-                        .flat_map(|(style, s)| {
-                            let fg = style.foreground;
-                            let mut a = Attrs::new()
-                                .family(Family::Monospace)
-                                .color(Color::rgb(fg.r, fg.g, fg.b));
-                            if style.font_style.contains(FontStyle::BOLD) {
-                                a = a.weight(Weight::BOLD);
-                            }
-                            route_monospace_cjk(s, &a)
-                        })
-                        .collect();
-                    let default_attrs = Attrs::new().family(Family::Monospace);
-                    buffer.set_rich_text(rich, &default_attrs, Shaping::Advanced, None);
+// Positions blocks top to bottom; `y` is where the next block starts.
+struct DocBuilder<'a> {
+    font_system: &'a mut FontSystem,
+    base_dir: &'a Path,
+    image_cache: HashMap<PathBuf, DynamicImage>,
+    font_size: f64,
+    content_width: u32,
+    y: u32,
+    blocks: Vec<RenderBlock>,
+}
+
+impl DocBuilder<'_> {
+    fn heading(&mut self, level: u32, tokens: &[InlineToken]) {
+        let scale = HEADING_SCALE[level.clamp(1, 5) as usize - 1];
+        let size = (self.font_size * scale) as f32;
+        let bold = InlineStyle {
+            bold: true,
+            ..InlineStyle::default()
+        };
+        let text = flatten_tokens(tokens);
+        let layout = layout_text(self.font_system, &text, self.content_width, size, bold);
+        self.y += self.em(HEADING_SPACE_ABOVE_EM);
+        let block = RenderBlock::Text {
+            layout,
+            x: DEFAULT_MARKDOWN_MARGIN,
+            y: self.y,
+        };
+        self.push_advance(block, self.em(HEADING_SPACE_BELOW_EM));
+    }
+
+    fn paragraph(&mut self, tokens: &[InlineToken]) -> Result<(), Box<dyn std::error::Error>> {
+        let non_empty: Vec<_> = tokens
+            .iter()
+            .filter(|t| !matches!(t, InlineToken::SoftBreak | InlineToken::HardBreak))
+            .collect();
+        match non_empty.as_slice() {
+            // Solo image paragraph: render the image centered
+            [InlineToken::Image { path }] => {
+                let resolved = resolve_image_path(self.base_dir, path);
+                if let Some(image) = load_inline_image(&resolved, &mut self.image_cache)? {
+                    self.push_centered_image(scale_markdown_image_to_width(
+                        &image,
+                        self.content_width,
+                    ));
                 }
-                buffer.shape_until_scroll(font_system, false);
-                let layout = text_layout_from_buffer(buffer, Color::rgb(50, 50, 50));
-                rendered_blocks.push(RenderBlock::Code {
+            }
+            [InlineToken::Math { text, display }] => self.math(text, *display)?,
+            _ if !flatten_tokens(tokens).trim().is_empty()
+                || tokens
+                    .iter()
+                    .any(|t| matches!(t, InlineToken::Image { .. })) =>
+            {
+                let layout = self.layout_inline(tokens, self.content_width, false)?;
+                let block = RenderBlock::Inline {
                     layout,
                     x: DEFAULT_MARKDOWN_MARGIN,
-                    y,
-                    width: content_width,
-                });
-                y += rendered_blocks.last().unwrap().height() + 6;
+                    y: self.y,
+                };
+                self.push_advance(block, self.em(PARAGRAPH_GAP_EM));
             }
-            Block::Math(text) => {
-                let rendered = math::render_math(text, font_system, font_size as f32, true)
-                    .map_err(|err| format!("failed to render math: {err}"))?;
-                let image = scale_markdown_image_to_width(&rendered.image, content_width);
-                let x = DEFAULT_MARKDOWN_MARGIN + content_width.saturating_sub(image.width()) / 2;
-                rendered_blocks.push(RenderBlock::Image { image, x, y });
-                y += rendered_blocks.last().unwrap().height() + (font_size * 0.6) as u32;
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn list(
+        &mut self,
+        items: &[Vec<InlineToken>],
+        ordered: bool,
+        tight: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let item_gap = self.em(if tight {
+            LIST_ITEM_GAP_TIGHT_EM
+        } else {
+            LIST_ITEM_GAP_LOOSE_EM
+        });
+        for (item_idx, item) in items.iter().enumerate() {
+            let prefix = if ordered {
+                format!("{}.", item_idx + 1)
+            } else {
+                "•".to_string()
+            };
+            let marker = layout_text(
+                self.font_system,
+                &prefix,
+                LIST_MARKER_WIDTH,
+                self.font_size as f32,
+                InlineStyle::default(),
+            );
+            let content =
+                self.layout_inline(item, self.content_width.saturating_sub(LIST_INDENT), false)?;
+            let content_height = content.height;
+            self.blocks.push(RenderBlock::Text {
+                layout: marker,
+                x: DEFAULT_MARKDOWN_MARGIN,
+                y: self.y,
+            });
+            self.blocks.push(RenderBlock::Inline {
+                layout: content,
+                x: DEFAULT_MARKDOWN_MARGIN + LIST_INDENT,
+                y: self.y,
+            });
+            self.y += content_height.max(self.font_size as u32 + LIST_ITEM_MIN_EXTRA);
+            if item_idx + 1 < items.len() {
+                self.y += item_gap;
             }
-            Block::Rule => {
-                rendered_blocks.push(RenderBlock::Rule {
-                    x: DEFAULT_MARKDOWN_MARGIN,
-                    y: y + 4,
-                    width: content_width,
-                });
-                y += 12;
+        }
+        self.y += self.em(LIST_GAP_EM);
+        Ok(())
+    }
+
+    fn block_quote(&mut self, children: &[Block]) {
+        let content_text = flatten_blocks_to_text(children);
+        let trimmed = content_text.trim();
+        if trimmed.is_empty() {
+            self.y += EMPTY_QUOTE_ADVANCE;
+            return;
+        }
+        let layout = layout_text(
+            self.font_system,
+            trimmed,
+            self.content_width.saturating_sub(QUOTE_INDENT),
+            self.font_size as f32,
+            InlineStyle::default(),
+        );
+        self.blocks.push(RenderBlock::Rect {
+            x: DEFAULT_MARKDOWN_MARGIN,
+            y: self.y,
+            width: QUOTE_BAR_WIDTH,
+            height: layout.height.max(self.font_size as u32),
+            color: QUOTE_BAR_COLOR,
+        });
+        let block = RenderBlock::Text {
+            layout,
+            x: DEFAULT_MARKDOWN_MARGIN + QUOTE_INDENT,
+            y: self.y,
+        };
+        self.push_advance(block, self.em(QUOTE_GAP_EM));
+    }
+
+    fn code(&mut self, lang: &str, text: &str) {
+        if lang.trim().eq_ignore_ascii_case("mermaid") {
+            match mermaid::render_mermaid(
+                text,
+                self.font_system,
+                self.content_width,
+                self.font_size as f32,
+            ) {
+                // render_mermaid sizes the diagram for content_width itself.
+                Ok(image) => return self.push_centered_image(image),
+                // Show the diagram source as a code block instead of
+                // dropping the rest of the document.
+                Err(err) => eprintln!(
+                    "Warning: failed to render Mermaid diagram: {}",
+                    crate::cli::sanitize_control_chars(&err)
+                ),
             }
-            Block::Table { header, rows } => {
-                let n_cols = header
-                    .len()
-                    .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
-                if n_cols == 0 {
-                    continue;
-                }
+        }
+        let layout = layout_code(
+            self.font_system,
+            lang,
+            text,
+            self.content_width.saturating_sub(CODE_PADDING * 2),
+            (self.font_size * CODE_FONT_EM) as f32,
+        );
+        let block = RenderBlock::Code {
+            layout,
+            x: DEFAULT_MARKDOWN_MARGIN,
+            y: self.y,
+            width: self.content_width,
+        };
+        self.push_advance(block, CODE_BLOCK_GAP);
+    }
 
-                let border = 1_u32;
-                let padding = (font_size * 0.6).max(8.0) as u32;
-                let total_borders = border * (n_cols as u32 + 1);
-                let col_width =
-                    ((content_width.saturating_sub(total_borders)) / n_cols as u32).max(60);
-                let cell_inner = col_width.saturating_sub(padding * 2);
-                let table_w = col_width * n_cols as u32 + total_borders;
+    fn math(&mut self, text: &str, display: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let rendered = math::render_math(text, self.font_system, self.font_size as f32, display)
+            .map_err(|err| format!("failed to render math: {err}"))?;
+        self.push_centered_image(scale_markdown_image_to_width(
+            &rendered.image,
+            self.content_width,
+        ));
+        Ok(())
+    }
 
-                // Layout each row, determine heights
-                let mut all_row_data: Vec<(Vec<InlineLayout>, u32, bool)> = Vec::new();
-                let row_pairs: Vec<(&Vec<Vec<InlineToken>>, bool)> =
-                    std::iter::once((header as &Vec<Vec<InlineToken>>, true))
-                        .chain(rows.iter().map(|r| (r as &Vec<Vec<InlineToken>>, false)))
-                        .collect();
+    fn rule(&mut self) {
+        self.blocks.push(RenderBlock::Rule {
+            x: DEFAULT_MARKDOWN_MARGIN,
+            y: self.y + RULE_OFFSET,
+            width: self.content_width,
+        });
+        self.y += RULE_ADVANCE;
+    }
 
-                for (row_tokens, is_header) in &row_pairs {
-                    let mut cell_layouts = Vec::new();
-                    let mut max_h = 0_u32;
-                    for cell_toks in row_tokens.iter().take(n_cols) {
-                        let layout = layout_inline_tokens(
-                            font_system,
-                            cell_toks,
-                            cell_inner,
-                            font_size as f32,
-                            *is_header,
-                            base_dir,
-                            &mut image_cache,
-                        )?;
-                        max_h = max_h.max(layout.height);
-                        cell_layouts.push(layout);
-                    }
-                    // Pad missing cells
-                    while cell_layouts.len() < n_cols {
-                        cell_layouts.push(layout_inline_tokens(
-                            font_system,
-                            &[],
-                            cell_inner,
-                            font_size as f32,
-                            false,
-                            base_dir,
-                            &mut image_cache,
-                        )?);
-                    }
-                    all_row_data.push((cell_layouts, max_h + padding * 2, *is_header));
-                }
-
-                // Emit RenderBlocks for each row
-                for (cell_layouts, row_h, is_header) in all_row_data {
-                    // Top row border
-                    rendered_blocks.push(RenderBlock::Rect {
-                        x: DEFAULT_MARKDOWN_MARGIN,
-                        y,
-                        width: table_w,
-                        height: border,
-                        color: Rgba([200, 200, 200, 255]),
-                    });
-                    // Header shading
-                    if is_header {
-                        rendered_blocks.push(RenderBlock::Rect {
-                            x: DEFAULT_MARKDOWN_MARGIN + border,
-                            y: y + border,
-                            width: table_w.saturating_sub(2 * border),
-                            height: row_h,
-                            color: Rgba([240, 240, 240, 255]),
-                        });
-                    }
-                    // Cells
-                    let mut cx = DEFAULT_MARKDOWN_MARGIN;
-                    for layout in cell_layouts {
-                        // Left cell border
-                        rendered_blocks.push(RenderBlock::Rect {
-                            x: cx,
-                            y,
-                            width: border,
-                            height: row_h + border,
-                            color: Rgba([200, 200, 200, 255]),
-                        });
-                        cx += border;
-                        rendered_blocks.push(RenderBlock::Inline {
-                            layout,
-                            x: cx + padding,
-                            y: y + border + padding,
-                        });
-                        cx += col_width;
-                    }
-                    // Right border
-                    rendered_blocks.push(RenderBlock::Rect {
-                        x: cx,
-                        y,
-                        width: border,
-                        height: row_h + border,
-                        color: Rgba([200, 200, 200, 255]),
-                    });
-                    y += border + row_h;
-                }
-                // Bottom border
-                rendered_blocks.push(RenderBlock::Rect {
-                    x: DEFAULT_MARKDOWN_MARGIN,
-                    y,
-                    width: table_w,
-                    height: border,
-                    color: Rgba([200, 200, 200, 255]),
-                });
-                y += border + (font_size * 0.5) as u32;
+    fn table(
+        &mut self,
+        header: &[Vec<InlineToken>],
+        rows: &[Vec<Vec<InlineToken>>],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let n_cols = header
+            .len()
+            .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+        if n_cols == 0 {
+            return Ok(());
+        }
+        let geometry = table_geometry(n_cols, self.content_width, self.font_size);
+        let all_rows =
+            std::iter::once((header, true)).chain(rows.iter().map(|row| (row.as_slice(), false)));
+        for (row, is_header) in all_rows {
+            let mut cells = Vec::with_capacity(n_cols);
+            for cell in row.iter().take(n_cols) {
+                cells.push(self.layout_inline(cell, geometry.cell_inner, is_header)?);
             }
+            // Padding cells added for short rows do not count toward the row height.
+            let content_height = cells.iter().map(|cell| cell.height).max().unwrap_or(0);
+            while cells.len() < n_cols {
+                cells.push(self.layout_inline(&[], geometry.cell_inner, false)?);
+            }
+            let row_height = content_height + geometry.padding * 2;
+            self.table_row(cells, row_height, is_header, &geometry);
+        }
+        self.blocks.push(RenderBlock::Rect {
+            x: DEFAULT_MARKDOWN_MARGIN,
+            y: self.y,
+            width: geometry.width,
+            height: TABLE_BORDER,
+            color: TABLE_BORDER_COLOR,
+        });
+        self.y += TABLE_BORDER + self.em(TABLE_GAP_EM);
+        Ok(())
+    }
+
+    // Emits one row's top border, optional header shading, cells, and left and
+    // right borders; the table's bottom border is emitted once by `table`.
+    fn table_row(
+        &mut self,
+        cells: Vec<InlineLayout>,
+        row_height: u32,
+        is_header: bool,
+        geometry: &TableGeometry,
+    ) {
+        let y = self.y;
+        let border = |x: u32| RenderBlock::Rect {
+            x,
+            y,
+            width: TABLE_BORDER,
+            height: row_height + TABLE_BORDER,
+            color: TABLE_BORDER_COLOR,
+        };
+        self.blocks.push(RenderBlock::Rect {
+            x: DEFAULT_MARKDOWN_MARGIN,
+            y,
+            width: geometry.width,
+            height: TABLE_BORDER,
+            color: TABLE_BORDER_COLOR,
+        });
+        if is_header {
+            self.blocks.push(RenderBlock::Rect {
+                x: DEFAULT_MARKDOWN_MARGIN + TABLE_BORDER,
+                y: y + TABLE_BORDER,
+                width: geometry.width.saturating_sub(2 * TABLE_BORDER),
+                height: row_height,
+                color: TABLE_HEADER_BG,
+            });
+        }
+        let mut x = DEFAULT_MARKDOWN_MARGIN;
+        for layout in cells {
+            self.blocks.push(border(x));
+            x += TABLE_BORDER;
+            self.blocks.push(RenderBlock::Inline {
+                layout,
+                x: x + geometry.padding,
+                y: y + TABLE_BORDER + geometry.padding,
+            });
+            x += geometry.col_width;
+        }
+        self.blocks.push(border(x));
+        self.y += TABLE_BORDER + row_height;
+    }
+
+    fn finish(self, width: u32) -> MarkdownLayout {
+        MarkdownLayout {
+            blocks: self.blocks,
+            width,
+            height: (self.y + DEFAULT_MARKDOWN_MARGIN)
+                .max(DEFAULT_MARKDOWN_MARGIN + MIN_BODY_HEIGHT),
         }
     }
 
-    let height = (y + DEFAULT_MARKDOWN_MARGIN).max(DEFAULT_MARKDOWN_MARGIN + 50);
-    Ok(MarkdownLayout {
-        blocks: rendered_blocks,
-        width,
-        height,
-    })
+    // `k` ems in whole pixels, truncated like every other block spacing.
+    fn em(&self, k: f64) -> u32 {
+        (self.font_size * k) as u32
+    }
+
+    fn layout_inline(
+        &mut self,
+        tokens: &[InlineToken],
+        width: u32,
+        bold: bool,
+    ) -> Result<InlineLayout, Box<dyn std::error::Error>> {
+        layout_inline_tokens(
+            self.font_system,
+            tokens,
+            width,
+            self.font_size as f32,
+            bold,
+            self.base_dir,
+            &mut self.image_cache,
+        )
+    }
+
+    fn push_advance(&mut self, block: RenderBlock, gap: u32) {
+        self.y += block.height() + gap;
+        self.blocks.push(block);
+    }
+
+    fn push_centered_image(&mut self, image: DynamicImage) {
+        let x = DEFAULT_MARKDOWN_MARGIN + self.content_width.saturating_sub(image.width()) / 2;
+        let block = RenderBlock::Image {
+            image,
+            x,
+            y: self.y,
+        };
+        self.push_advance(block, self.em(IMAGE_GAP_EM));
+    }
+}
+
+struct TableGeometry {
+    col_width: u32,
+    // Width available to cell content inside the padding.
+    cell_inner: u32,
+    padding: u32,
+    width: u32,
+}
+
+fn table_geometry(n_cols: usize, content_width: u32, font_size: f64) -> TableGeometry {
+    let n_cols = n_cols as u32;
+    let padding = (font_size * TABLE_PADDING_EM).max(TABLE_MIN_PADDING) as u32;
+    let total_borders = TABLE_BORDER * (n_cols + 1);
+    let col_width = (content_width.saturating_sub(total_borders) / n_cols).max(TABLE_MIN_COL_WIDTH);
+    TableGeometry {
+        col_width,
+        cell_inner: col_width.saturating_sub(padding * 2),
+        padding,
+        width: col_width * n_cols + total_borders,
+    }
 }
 
 // Draw the 1-based `page` of `layout` into a pixmap of at most `page_height`
 // rows; only blocks overlapping that slice of the document are drawn.
 fn render_page(
-    layout: &mut MarkdownLayout,
+    layout: &MarkdownLayout,
     font_system: &mut FontSystem,
     swash: &mut SwashCache,
     page: usize,
@@ -1063,7 +1128,7 @@ fn render_page(
     let mut pixmap = Pixmap::new(width, draw_height).ok_or("failed to allocate pixmap")?;
     pixmap.fill(tiny_skia::Color::WHITE);
     let y_end = y_start.saturating_add(draw_height);
-    for block in layout.blocks.iter_mut() {
+    for block in &layout.blocks {
         let bt = block.y_top();
         let bb = bt.saturating_add(block.height());
         if bb <= y_start || bt >= y_end {
@@ -1130,15 +1195,6 @@ struct TextLayout {
     height: u32,
     buffer: Buffer,
     color: Color,
-    lines: Vec<TextLineRange>,
-}
-
-#[derive(Debug)]
-struct TextLineRange {
-    line_i: usize,
-    layout_i: usize,
-    top: f32,
-    bottom: f32,
 }
 
 #[derive(Debug)]
@@ -1160,11 +1216,40 @@ fn layout_text(
     size: f32,
     style: InlineStyle,
 ) -> TextLayout {
-    let mut buffer = Buffer::new(font_system, Metrics::new(size, size * 1.4));
+    let mut buffer = Buffer::new(font_system, Metrics::new(size, size * LINE_HEIGHT_EM));
     buffer.set_size(Some(width as f32), None);
     set_buffer_text(&mut buffer, text, &inline_attrs(style));
     buffer.shape_until_scroll(font_system, false);
     text_layout_from_buffer(buffer, Color::rgb(0, 0, 0))
+}
+
+fn layout_code(
+    font_system: &mut FontSystem,
+    lang: &str,
+    text: &str,
+    width: u32,
+    size: f32,
+) -> TextLayout {
+    let spans = highlight_code_spans(lang, text);
+    let mut buffer = Buffer::new(font_system, Metrics::new(size, size * LINE_HEIGHT_EM));
+    buffer.set_size(Some(width as f32), None);
+    let rich: Vec<(&str, Attrs)> = spans
+        .iter()
+        .flat_map(|(style, s)| {
+            let fg = style.foreground;
+            let mut a = Attrs::new()
+                .family(Family::Monospace)
+                .color(Color::rgb(fg.r, fg.g, fg.b));
+            if style.font_style.contains(FontStyle::BOLD) {
+                a = a.weight(Weight::BOLD);
+            }
+            route_monospace_cjk(s, &a)
+        })
+        .collect();
+    let default_attrs = Attrs::new().family(Family::Monospace);
+    buffer.set_rich_text(rich, &default_attrs, Shaping::Advanced, None);
+    buffer.shape_until_scroll(font_system, false);
+    text_layout_from_buffer(buffer, CODE_TEXT_COLOR)
 }
 
 fn set_buffer_text(buffer: &mut Buffer, text: &str, attrs: &Attrs) {
@@ -1228,32 +1313,15 @@ fn inline_attrs(style: InlineStyle) -> Attrs<'static> {
 fn text_layout_from_buffer(buffer: Buffer, color: Color) -> TextLayout {
     let mut text_width = 0_f32;
     let mut text_height = 0_f32;
-    let mut lines = Vec::new();
-    let mut current_line = None;
-    let mut layout_i = 0;
     for run in buffer.layout_runs() {
         text_width = text_width.max(run.line_w);
-        if current_line == Some(run.line_i) {
-            layout_i += 1;
-        } else {
-            current_line = Some(run.line_i);
-            layout_i = 0;
-        }
-        let bottom = run.line_top + run.line_height;
-        text_height = text_height.max(bottom);
-        lines.push(TextLineRange {
-            line_i: run.line_i,
-            layout_i,
-            top: run.line_top,
-            bottom,
-        });
+        text_height = text_height.max(run.line_top + run.line_height);
     }
     TextLayout {
         width: text_width.ceil() as u32,
         height: text_height.ceil() as u32,
         buffer,
         color,
-        lines,
     }
 }
 
@@ -1266,7 +1334,7 @@ fn layout_inline_tokens(
     base_dir: &Path,
     image_cache: &mut HashMap<PathBuf, DynamicImage>,
 ) -> Result<InlineLayout, Box<dyn std::error::Error>> {
-    let line_height = (font_size * 1.4).ceil() as u32;
+    let line_height = (font_size * LINE_HEIGHT_EM).ceil() as u32;
     let mut lines: Vec<InlineLine> = vec![InlineLine::default()];
 
     for token in tokens {
@@ -1305,7 +1373,7 @@ fn layout_inline_tokens(
             y += line_height;
             continue;
         }
-        let baseline = line.baseline.max((font_size * 0.9) as u32);
+        let baseline = line.baseline.max((font_size * INLINE_BASELINE_EM) as u32);
         let height = (baseline + line.descent).max(line_height);
         for item in line.items {
             match item {
@@ -1402,7 +1470,7 @@ fn push_inline_words(
         let line = lines.last_mut().unwrap();
         let x = line.width;
         line.width = line.width.saturating_add(layout.width);
-        let baseline = (font_size * 0.9) as u32;
+        let baseline = (font_size * INLINE_BASELINE_EM) as u32;
         line.baseline = line.baseline.max(baseline);
         line.descent = line.descent.max(layout.height.saturating_sub(baseline));
         line.items.push(InlineLineItem::Text {
@@ -1468,7 +1536,10 @@ fn measure_segment_widths(
     style: InlineStyle,
 ) -> Vec<u32> {
     let joined: String = segments.concat();
-    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, font_size * 1.4));
+    let mut buffer = Buffer::new(
+        font_system,
+        Metrics::new(font_size, font_size * LINE_HEIGHT_EM),
+    );
     buffer.set_size(None, None);
     set_buffer_text(&mut buffer, &joined, &inline_attrs(style));
     buffer.shape_until_scroll(font_system, false);
@@ -1582,9 +1653,9 @@ impl RenderBlock {
         match self {
             Self::Text { layout, .. } => layout.height,
             Self::Inline { layout, .. } => layout.height,
-            Self::Code { layout, .. } => layout.height + CODE_PADDING * 2 + 6,
+            Self::Code { layout, .. } => layout.height + CODE_PADDING * 2 + CODE_BOTTOM_EXTRA,
             Self::Image { image, .. } => image.height(),
-            Self::Rule { .. } => 2,
+            Self::Rule { .. } => RULE_THICKNESS,
             Self::Rect { height, .. } => *height,
         }
     }
@@ -1604,7 +1675,7 @@ impl RenderBlock {
     // (document y → pixmap y).  Handles partial visibility when a block straddles
     // a page boundary.
     fn draw_with_offset(
-        &mut self,
+        &self,
         pixmap: &mut Pixmap,
         font_system: &mut FontSystem,
         swash: &mut SwashCache,
@@ -1655,8 +1726,8 @@ impl RenderBlock {
                     *x as i32,
                     y_adj,
                     *width,
-                    layout.height + CODE_PADDING * 2 + 6,
-                    [245, 245, 245, 255],
+                    layout.height + CODE_PADDING * 2 + CODE_BOTTOM_EXTRA,
+                    CODE_BG,
                 );
                 let text_top = CODE_PADDING as i32;
                 let text_visible_top = visible_top as i32 - text_top;
@@ -1693,8 +1764,8 @@ impl RenderBlock {
                     *x as i32,
                     *y as i32 - y_offset,
                     *width,
-                    2,
-                    [220, 220, 220, 255],
+                    RULE_THICKNESS,
+                    RULE_COLOR,
                 );
             }
             Self::Rect {
@@ -1725,20 +1796,15 @@ struct MarkdownDrawContext<'a> {
 
 fn draw_text_layout(
     ctx: &mut MarkdownDrawContext<'_>,
-    layout: &mut TextLayout,
+    layout: &TextLayout,
     x: i32,
     y: i32,
     visible_top: u32,
     visible_bottom: u32,
 ) {
-    if visible_top >= visible_bottom || layout.lines.is_empty() {
+    if visible_top >= visible_bottom {
         return;
     }
-    layout.buffer.shape_until_scroll(ctx.font_system, false);
-    let Some((first, last)) = text_visible_range(layout, visible_top as f32, visible_bottom as f32)
-    else {
-        return;
-    };
     let mut renderer = TextPixmapRenderer {
         pixmap: &mut *ctx.pixmap,
         font_system: &mut *ctx.font_system,
@@ -1746,34 +1812,12 @@ fn draw_text_layout(
         x,
         y,
     };
-    let line_height = layout.buffer.metrics().line_height;
-    for range in &layout.lines[first..last] {
-        let Some(line) = layout.buffer.lines.get(range.line_i) else {
-            continue;
-        };
-        let Some(layout_lines) = line.layout_opt() else {
-            continue;
-        };
-        let Some(layout_line) = layout_lines.get(range.layout_i) else {
-            continue;
-        };
-        let run_line_height = layout_line.line_height_opt.unwrap_or(line_height);
-        let glyph_height = layout_line.max_ascent + layout_line.max_descent;
-        let line_y = range.top + (run_line_height - glyph_height) / 2.0 + layout_line.max_ascent;
-        let Some(shape) = line.shape_opt() else {
-            continue;
-        };
-        let run = LayoutRun {
-            line_i: range.line_i,
-            text: line.text(),
-            rtl: shape.rtl,
-            glyphs: &layout_line.glyphs,
-            decorations: &layout_line.decorations,
-            line_y,
-            line_top: range.top,
-            line_height: run_line_height,
-            line_w: layout_line.w,
-        };
+    let runs = layout
+        .buffer
+        .layout_runs()
+        .skip_while(|run| run.line_top + run.line_height <= visible_top as f32)
+        .take_while(|run| run.line_top < visible_bottom as f32);
+    for run in runs {
         for glyph in run.glyphs {
             if glyph_is_missing(renderer.font_system, glyph) {
                 continue;
@@ -1788,7 +1832,7 @@ fn draw_text_layout(
 
 fn draw_inline_layout(
     ctx: &mut MarkdownDrawContext<'_>,
-    layout: &mut InlineLayout,
+    layout: &InlineLayout,
     x: i32,
     y: i32,
     visible_top: u32,
@@ -1797,7 +1841,7 @@ fn draw_inline_layout(
     if visible_top >= visible_bottom {
         return;
     }
-    for item in &mut layout.items {
+    for item in &layout.items {
         match item {
             InlineRenderItem::Text {
                 layout,
@@ -1841,22 +1885,6 @@ fn draw_inline_layout(
     }
 }
 
-fn text_visible_range(
-    layout: &TextLayout,
-    visible_top: f32,
-    visible_bottom: f32,
-) -> Option<(usize, usize)> {
-    let first = layout
-        .lines
-        .partition_point(|line| line.bottom <= visible_top);
-    let line = layout.lines.get(first)?;
-    if line.top >= visible_bottom {
-        return None;
-    }
-    let last = layout.lines[first..].partition_point(|line| line.top < visible_bottom);
-    Some((first, first + last))
-}
-
 fn glyph_is_missing(font_system: &FontSystem, glyph: &cosmic_text::LayoutGlyph) -> bool {
     glyph.glyph_id == 0
         && font_system
@@ -1885,25 +1913,55 @@ impl Renderer for TextPixmapRenderer<'_> {
         );
     }
 
+    // Blends straight into the pixel buffer: a 1x1 fill_rect per glyph pixel
+    // would build a tiny-skia pipeline for every pixel.
     fn glyph(&mut self, physical_glyph: PhysicalGlyph, color: Color) {
         let base_x = self.x + physical_glyph.x;
         let base_y = self.y + physical_glyph.y;
-        let pixmap = &mut *self.pixmap;
+        let width = self.pixmap.width() as i32;
+        let height = self.pixmap.height() as i32;
+        let data = self.pixmap.data_mut();
         self.swash.with_pixels(
             self.font_system,
             physical_glyph.cache_key,
             color,
             |gx, gy, pixel_color| {
-                fill_rect(
-                    pixmap,
-                    base_x + gx,
-                    base_y + gy,
-                    1,
-                    1,
-                    pixel_color.as_rgba(),
-                );
+                let px = base_x + gx;
+                let py = base_y + gy;
+                if px < 0 || py < 0 || px >= width || py >= height {
+                    return;
+                }
+                let idx = (py as usize * width as usize + px as usize) * 4;
+                let dst: &mut [u8; 4] = (&mut data[idx..idx + 4]).try_into().unwrap();
+                blend_source_over(dst, pixel_color.as_rgba());
             },
         );
+    }
+}
+
+/// Matches tiny-skia 0.12 lowp SourceOver for a solid colour (see fill_rect).
+/// `dst` is a premultiplied pixmap pixel; `rgba` is an unpremultiplied colour.
+fn blend_source_over(dst: &mut [u8; 4], rgba: [u8; 4]) {
+    let alpha = rgba[3];
+    match alpha {
+        0 => {}
+        255 => *dst = rgba,
+        _ => {
+            // tiny-skia premultiplies in f32, rounds to u16, then blends each
+            // channel with div255(v) = (v + 255) >> 8.
+            let a = alpha as f32 / 255.0;
+            let premul = |c: u8| ((c as f32 / 255.0 * a) * 255.0 + 0.5) as u16;
+            let src = [
+                premul(rgba[0]),
+                premul(rgba[1]),
+                premul(rgba[2]),
+                (a * 255.0 + 0.5) as u16,
+            ];
+            let inv = 255 - src[3];
+            for (d, s) in dst.iter_mut().zip(src) {
+                *d = (s + ((*d as u16 * inv + 255) >> 8)) as u8;
+            }
+        }
     }
 }
 
@@ -2139,7 +2197,7 @@ mod tests {
     ) -> Result<DynamicImage, Box<dyn std::error::Error>> {
         let blocks = parse_markdown_blocks(data);
         with_fonts(|font_system, swash| {
-            let mut layout = layout_document(
+            let layout = layout_document(
                 &blocks,
                 base_dir,
                 font_system,
@@ -2147,7 +2205,7 @@ mod tests {
                 font_size,
             )?;
             let page_height = page_height.unwrap_or(layout.height);
-            render_page(&mut layout, font_system, swash, page, page_height)
+            render_page(&layout, font_system, swash, page, page_height)
         })
     }
 
@@ -2807,6 +2865,25 @@ $$
             ink_in(code_bottom + 1, rgba.height()),
             "the paragraph after the failed diagram should render: {diagram}"
         );
+    }
+
+    #[test]
+    fn glyph_blend_matches_tiny_skia_fill_rect() {
+        // Glyph pixels bypass tiny-skia, so this also catches blend changes in
+        // a tiny-skia upgrade. The page under glyphs is always opaque.
+        let mut pixmap = Pixmap::new(1, 1).unwrap();
+        for d in [0, 1, 127, 128, 254, 255] {
+            for alpha in 0..=255_u8 {
+                for value in 0..=255_u8 {
+                    let rgba = [value, 255 - value, value / 2, alpha];
+                    let mut blended = [d, d, d, 255];
+                    pixmap.data_mut().copy_from_slice(&blended);
+                    fill_rect(&mut pixmap, 0, 0, 1, 1, rgba);
+                    blend_source_over(&mut blended, rgba);
+                    assert_eq!(&blended[..], pixmap.data(), "{rgba:?} over {d}");
+                }
+            }
+        }
     }
 
     #[test]
