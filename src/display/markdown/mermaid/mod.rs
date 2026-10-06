@@ -18,11 +18,15 @@ pub fn render_mermaid(
     let canvas_pad = 4.0;
     let inner_max_width = max_width as f32 - canvas_pad * 2.0;
     let scale = if width > inner_max_width {
-        (inner_max_width / width).max(0.2)
+        inner_max_width / width
     } else {
         1.0
     };
-    let canvas_w = (width * scale + canvas_pad * 2.0).ceil();
+    // Rounding up must not push a scaled-down canvas past the content width,
+    // which the Markdown layout would otherwise clip.
+    let canvas_w = (width * scale + canvas_pad * 2.0)
+        .ceil()
+        .min(max_width as f32);
     let canvas_h = (height * scale + canvas_pad * 2.0).ceil();
     let body = format!(
         r#"<g transform="translate({canvas_pad:.2},{canvas_pad:.2}) scale({scale:.4})">{fragment}</g>"#
@@ -126,5 +130,24 @@ mod tests {
             );
             assert_visible_content_is_not_clipped(name, &image);
         }
+    }
+
+    #[test]
+    fn wide_mermaid_diagram_is_scaled_to_fit_width() {
+        let mut font_system = FontSystem::new();
+        let source = format!(
+            "flowchart LR\n{}",
+            (0..30)
+                .map(|i| format!("N{i}-->N{}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let image = render_mermaid(&source, &mut font_system, 400, 18.0).unwrap();
+        assert!(
+            image.width() <= 400,
+            "wide Mermaid diagram should fit 400px, got {}",
+            image.width()
+        );
+        assert_visible_content_is_not_clipped("wide flowchart", &image);
     }
 }
