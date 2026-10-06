@@ -978,26 +978,12 @@ fn parse_state(input: &str) -> Result<StateDiagram, String> {
 
                 // Add states from transition if not already present
                 if from != "[*]" {
-                    ensure_state(
-                        &mut states,
-                        &normalized_from,
-                        &normalized_from,
-                        false,
-                        false,
-                        false,
-                    );
+                    ensure_state(&mut states, &normalized_from, "", false, false, false);
                 } else {
                     ensure_state(&mut states, START_STATE_ID, "[*]", true, false, false);
                 }
                 if to != "[*]" {
-                    ensure_state(
-                        &mut states,
-                        &normalized_to,
-                        &normalized_to,
-                        false,
-                        false,
-                        false,
-                    );
+                    ensure_state(&mut states, &normalized_to, "", false, false, false);
                 }
 
                 let transition = StateTransition {
@@ -1065,7 +1051,8 @@ fn parse_state_definition(rest: &str) -> Result<(String, String, bool), String> 
         return Ok((id.to_string(), label, is_composite));
     }
 
-    Ok((value.to_string(), value.to_string(), is_composite))
+    // A bare id names the state without labeling it.
+    Ok((value.to_string(), String::new(), is_composite))
 }
 
 fn parse_state_note(line: &str) -> Option<(String, String)> {
@@ -1088,6 +1075,8 @@ fn parse_state_note(line: &str) -> Option<(String, String)> {
     None
 }
 
+/// Adds the state `id` or merges flags into it. An empty `label` keeps the
+/// existing label, or labels a new state with its id.
 fn ensure_state(
     states: &mut Vec<State>,
     id: &str,
@@ -1861,6 +1850,23 @@ erDiagram
                 .iter()
                 .any(|t| t.from == "Idle" && t.to == "Processing")
         );
+    }
+
+    #[test]
+    fn state_alias_label_survives_later_references() {
+        let label_of = |src: &str| {
+            let st = state(src);
+            let ll = st.states.iter().find(|s| s.id == "LL").unwrap();
+            ll.label.clone()
+        };
+        for src in [
+            "stateDiagram-v2\nstate \"Long label\" as LL\nA --> LL\nLL --> A",
+            "stateDiagram-v2\nA --> LL\nstate \"Long label\" as LL\nLL --> A",
+            "stateDiagram-v2\nstate \"Long label\" as LL\nstate LL {\n    X --> Y\n}",
+        ] {
+            assert_eq!(label_of(src), "Long label", "{src:?}");
+        }
+        assert_eq!(label_of("stateDiagram-v2\nA --> LL"), "LL");
     }
 
     #[test]
