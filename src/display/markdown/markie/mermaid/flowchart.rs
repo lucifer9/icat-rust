@@ -490,7 +490,15 @@ fn render_edge<T: TextMeasure>(ctx: &mut RenderEdgeContext<'_, T>) -> String {
     path.extend_from_slice(waypoints);
     path.push((enter_x, enter_y));
 
+    // Doglegs between points that already share an axis would repeat a point;
+    // skip repeats so the arrowheads below always see a real segment.
     let mut points: Vec<(f32, f32)> = vec![path[0]];
+    let mut push_distinct = |point: (f32, f32)| {
+        let last = points[points.len() - 1];
+        if (last.0 - point.0).abs() > 0.01 || (last.1 - point.1).abs() > 0.01 {
+            points.push(point);
+        }
+    };
     for pair in path.windows(2) {
         let ((x1, y1), (x2, y2)) = (pair[0], pair[1]);
 
@@ -498,18 +506,22 @@ fn render_edge<T: TextMeasure>(ctx: &mut RenderEdgeContext<'_, T>) -> String {
             // Vertical primary axis (or horizontal same-rank): dogleg with vertical-first
             if (x1 - x2).abs() > 0.5 {
                 let mid_y = (y1 + y2) / 2.0;
-                points.push((x1, mid_y));
-                points.push((x2, mid_y));
+                push_distinct((x1, mid_y));
+                push_distinct((x2, mid_y));
             }
         } else {
             // Horizontal primary axis: dogleg with horizontal-first
             if (y1 - y2).abs() > 0.5 {
                 let mid_x = (x1 + x2) / 2.0;
-                points.push((mid_x, y1));
-                points.push((mid_x, y2));
+                push_distinct((mid_x, y1));
+                push_distinct((mid_x, y2));
             }
         }
-        points.push((x2, y2));
+        push_distinct((x2, y2));
+    }
+    // Touching endpoints collapse to one point; keep a (zero-length) segment.
+    if points.len() == 1 {
+        points.push(path[path.len() - 1]);
     }
 
     // Render polyline
@@ -800,6 +812,29 @@ mod tests {
         // Arrow tip at entry point (200, 120), pointing right (angle=0)
         assert!((pts[0].0 - 200.0).abs() < 1.0, "tip x={}", pts[0].0);
         assert!((pts[0].1 - 120.0).abs() < 1.0, "tip y={}", pts[0].1);
+    }
+
+    #[test]
+    fn arrowheads_point_along_every_flow_direction() {
+        let style = DiagramStyle::default();
+        for (direction, expected) in [
+            ("TD", (0.0, 1.0)),
+            ("BT", (0.0, -1.0)),
+            ("LR", (1.0, 0.0)),
+            ("RL", (-1.0, 0.0)),
+        ] {
+            let source = format!("flowchart {direction}\nA-->B");
+            let (svg, _, _) =
+                super::super::render::render_diagram(&source, &style, &mut MockMeasure).unwrap();
+            let pts = first_polygon_points(&svg);
+            let base = ((pts[1].0 + pts[2].0) / 2.0, (pts[1].1 + pts[2].1) / 2.0);
+            let (dx, dy) = (pts[0].0 - base.0, pts[0].1 - base.1);
+            let len = (dx * dx + dy * dy).sqrt();
+            assert!(
+                (dx / len - expected.0).abs() < 0.01 && (dy / len - expected.1).abs() < 0.01,
+                "{direction} arrowhead points ({dx}, {dy})"
+            );
+        }
     }
 
     #[test]
