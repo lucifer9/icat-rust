@@ -394,7 +394,8 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         let child_state_ids = diagram.nested_state_ids();
         let states_by_id = diagram.states_by_id();
 
-        // The implicit start state is never nested, so this is never empty.
+        // Parsing rejects empty diagrams and keeps nesting acyclic, so at
+        // least one state is top-level.
         let target_states: Vec<&State> = diagram
             .states
             .iter()
@@ -528,10 +529,11 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
         let cols = (nodes.len() as f32).sqrt().ceil() as usize;
 
         let mut row_heights: Vec<f32> = vec![0.0; nodes.len().div_ceil(cols)];
+        let mut col_widths: Vec<f32> = vec![0.0; cols];
         for (idx, node_id) in nodes.iter().enumerate() {
-            let row = idx / cols;
-            let (_, h) = node_sizes[node_id];
-            row_heights[row] = row_heights[row].max(h);
+            let (w, h) = node_sizes[node_id];
+            row_heights[idx / cols] = row_heights[idx / cols].max(h);
+            col_widths[idx % cols] = col_widths[idx % cols].max(w);
         }
 
         for (idx, node_id) in nodes.iter().enumerate() {
@@ -539,7 +541,7 @@ impl<'a, T: TextMeasure> LayoutEngine<'a, T> {
             let row = idx / cols;
             let (w, h) = node_sizes[node_id];
             let y = start_y + row_heights[..row].iter().sum::<f32>() + row as f32 * spacing_y;
-            let x = start_x + col as f32 * (w + spacing_x);
+            let x = start_x + col_widths[..col].iter().sum::<f32>() + col as f32 * spacing_x;
             positions.insert(node_id.clone(), Rect::new(x, y, w, h));
         }
 

@@ -62,8 +62,7 @@ impl MermaidDiagram {
             Self::Flowchart(fc) => fc.nodes.is_empty(),
             Self::Sequence(seq) => seq.participants.is_empty(),
             Self::ClassDiagram(cls) => cls.classes.is_empty(),
-            // The implicit start state is always present; it alone draws nothing useful.
-            Self::StateDiagram(st) => st.states.iter().all(|s| s.is_start),
+            Self::StateDiagram(st) => st.states.is_empty(),
             Self::ErDiagram(er) => er.entities.is_empty(),
         }
     }
@@ -898,16 +897,6 @@ fn parse_state(input: &str) -> Result<StateDiagram, String> {
     let mut states: Vec<State> = Vec::new();
     let mut transitions: Vec<StateTransition> = Vec::new();
     let mut composite_stack: Vec<String> = Vec::new();
-
-    // Add start state
-    states.push(State {
-        id: START_STATE_ID.to_string(),
-        label: "[*]".to_string(),
-        is_start: true,
-        is_end: false,
-        is_composite: false,
-        children: Vec::new(),
-    });
 
     for (line_idx, line) in (&mut lines).enumerate() {
         let line_num = line_idx + 2; // +2: skip first line + 1-indexed

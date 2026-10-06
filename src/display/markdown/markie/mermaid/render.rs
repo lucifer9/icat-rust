@@ -2384,6 +2384,19 @@ Note right of Child: child note"#,
         bands
     }
 
+    /// Pixels inside solid areas of the node stroke color, i.e. the start
+    /// dot; state outlines are at most a pixel thick.
+    fn start_dot_pixels(image: &RgbaImage) -> Vec<(u32, u32)> {
+        let stroke = |x: u32, y: u32| {
+            let p = image.get_pixel(x, y);
+            p[3] > 200 && p[1] > 180 && p[0] < 60 && p[2] < 60
+        };
+        (0..image.width() - 1)
+            .flat_map(|x| (0..image.height() - 1).map(move |y| (x, y)))
+            .filter(|&(x, y)| stroke(x, y) && stroke(x + 1, y) && stroke(x, y + 1))
+            .collect()
+    }
+
     #[test]
     fn state_arrowhead_is_drawn_outside_target_state() {
         let image = rasterize(&render_svg("stateDiagram-v2\nA --> B"));
@@ -2430,6 +2443,36 @@ Note right of Child: child note"#,
     }
 
     #[test]
+    fn state_diagram_without_start_transition_draws_no_start_dot() {
+        let source = "stateDiagram-v2\nA --> B";
+        let MermaidDiagram::StateDiagram(diagram) = parse_mermaid(source).unwrap() else {
+            panic!("expected a state diagram");
+        };
+        assert!(
+            !diagram.states.iter().any(|s| s.is_start),
+            "{:?}",
+            diagram.states
+        );
+        let dot_pixels = start_dot_pixels(&rasterize(&render_svg(source))).len();
+        assert_eq!(dot_pixels, 0, "unexpected start dot");
+    }
+
+    #[test]
+    fn grid_layout_keeps_unconnected_states_apart() {
+        let image = rasterize(&render_svg(
+            "stateDiagram-v2\nstate Comp {\n    [*] --> X\n    X --> Y\n}",
+        ));
+        let (left, top, right, bottom) = bounds(&image, is_node_fill);
+        let dot = start_dot_pixels(&image);
+        assert!(!dot.is_empty(), "missing start dot");
+        let inside = dot
+            .iter()
+            .filter(|(x, y)| (left..=right).contains(x) && (top..=bottom).contains(y))
+            .count();
+        assert_eq!(inside, 0, "start dot overlaps the composite state");
+    }
+
+    #[test]
     fn mutually_nested_states_render_without_recursing_forever() {
         let source = "stateDiagram\n    state A {\n        B --> X\n    }\n    state B {\n        A --> Y\n    }";
         assert_renders_visible("nesting cycle", source, &["A", "B", "X"]);
@@ -2471,6 +2514,7 @@ Note right of Child: child note"#,
         for source in [
             "pie title Pets\n  \"Dogs\" : 50",
             "flowchart LR\n  ??? invalid syntax ???",
+            "stateDiagram-v2\n",
         ] {
             let result = render_diagram(source, &DiagramStyle::default(), &mut MockMeasure);
             assert!(result.is_err(), "{source:?} should be rejected");
