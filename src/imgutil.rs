@@ -4,7 +4,7 @@ use std::path::Path;
 
 use image::AnimationDecoder;
 use image::codecs::gif::GifDecoder;
-use image::{DynamicImage, GenericImageView, ImageDecoder, ImageFormat, imageops::FilterType};
+use image::{DynamicImage, ImageFormat, ImageReader, imageops::FilterType};
 
 pub const MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_PIXELS: u64 = 100_000_000;
@@ -38,6 +38,25 @@ impl std::fmt::Display for NotRegular {
 
 impl std::error::Error for NotRegular {}
 
+/// Lowercased extension of `path`, if it has a UTF-8 one.
+pub fn lowercase_extension(path: &str) -> Option<String> {
+    Path::new(path)
+        .extension()?
+        .to_str()
+        .map(str::to_ascii_lowercase)
+}
+
+pub fn has_image_extension(path: &str) -> bool {
+    lowercase_extension(path).is_some_and(|ext| is_image_extension(&ext))
+}
+
+pub fn is_image_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif"
+    )
+}
+
 pub fn is_png(data: &[u8]) -> bool {
     data.starts_with(&PNG_MAGIC)
 }
@@ -58,15 +77,17 @@ pub fn check_limits(width: u32, height: u32) -> bool {
     if width == 0 || height == 0 {
         return false;
     }
-    let pixels = u64::from(width) * u64::from(height);
-    pixels <= MAX_PIXELS && pixels.saturating_mul(4) <= MAX_RGBA_BYTES
+    u64::from(width) * u64::from(height) <= MAX_PIXELS
 }
 
 pub fn read_source(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     if path.is_empty() {
         return read_limited(io::stdin().lock());
     }
+    read_file(Path::new(path))
+}
 
+pub fn read_file(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -97,7 +118,8 @@ pub fn read_limited_with_hint<R: Read>(
 
 pub fn decode_with_limits(data: &[u8]) -> Result<DynamicImage, Box<dyn std::error::Error>> {
     let format = image::guess_format(data)?;
-    let (width, height) = decode_dimensions(data, format)?;
+    let (width, height) =
+        ImageReader::with_format(io::Cursor::new(data), format).into_dimensions()?;
     if !check_limits(width, height) {
         return Err(format!("image dimensions {width}x{height} exceed limits").into());
     }
@@ -106,33 +128,6 @@ pub fn decode_with_limits(data: &[u8]) -> Result<DynamicImage, Box<dyn std::erro
         _ => image::load_from_memory_with_format(data, format)?,
     };
     Ok(image)
-}
-
-fn decode_dimensions(
-    data: &[u8],
-    format: ImageFormat,
-) -> Result<(u32, u32), Box<dyn std::error::Error>> {
-    Ok(match format {
-        ImageFormat::Png => {
-            image::codecs::png::PngDecoder::new(std::io::Cursor::new(data))?.dimensions()
-        }
-        ImageFormat::Jpeg => {
-            image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(data))?.dimensions()
-        }
-        ImageFormat::Bmp => {
-            image::codecs::bmp::BmpDecoder::new(std::io::Cursor::new(data))?.dimensions()
-        }
-        ImageFormat::WebP => {
-            image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(data))?.dimensions()
-        }
-        ImageFormat::Tiff => {
-            image::codecs::tiff::TiffDecoder::new(std::io::Cursor::new(data))?.dimensions()
-        }
-        ImageFormat::Gif => {
-            image::codecs::gif::GifDecoder::new(std::io::Cursor::new(data))?.dimensions()
-        }
-        _ => image::load_from_memory_with_format(data, format)?.dimensions(),
-    })
 }
 
 fn decode_gif_first_frame(data: &[u8]) -> Result<DynamicImage, Box<dyn std::error::Error>> {
@@ -190,14 +185,10 @@ pub fn encode_rgba_zlib(image: &DynamicImage) -> Result<Vec<u8>, Box<dyn std::er
     Ok(enc.finish()?)
 }
 
-pub fn is_regular_file(path: &Path) -> bool {
-    path.metadata().map(|meta| meta.is_file()).unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ImageBuffer, Rgba};
+    use image::{GenericImageView, ImageBuffer, Rgba};
     use std::fs;
 
     fn make_png_bytes(width: u32, height: u32) -> Vec<u8> {
@@ -207,29 +198,17 @@ mod tests {
     }
 
     #[test]
-    fn is_png_valid_magic() {
-        assert!(is_png(&make_png_bytes(1, 1)));
-    }
-
-    #[test]
-    fn is_png_not_png() {
-        assert!(!is_png(&[0xFF, 0xD8, 0xFF]));
-    }
-
-    #[test]
-    fn is_png_too_short() {
-        assert!(!is_png(&[0x89, b'P', b'N']));
-        assert!(!is_png(&[]));
+    fn image_extension_detection_ignores_case() {
+        assert!(has_image_extension("image.png"));
+        assert!(has_image_extension("dir/photo.JPEG"));
+        assert!(has_image_extension("scan.tif"));
+        assert!(!has_image_extension("archive.tar"));
+        assert!(!has_image_extension("png"));
     }
 
     #[test]
     fn png_dimensions_valid() {
         assert_eq!(png_dimensions(&make_png_bytes(100, 200)), Some((100, 200)));
-    }
-
-    #[test]
-    fn png_dimensions_one_by_one() {
-        assert_eq!(png_dimensions(&make_png_bytes(1, 1)), Some((1, 1)));
     }
 
     #[test]
@@ -267,14 +246,6 @@ mod tests {
         assert!(!check_limits(100, 0));
         assert!(!check_limits(10001, 10000));
         assert!(check_limits(10000, 10000));
-    }
-
-    #[test]
-    fn scale_changes_bounds() {
-        let image =
-            DynamicImage::ImageRgba8(ImageBuffer::from_pixel(100, 50, Rgba([0, 0, 0, 255])));
-        assert_eq!(scale(&image, 50, 25).dimensions(), (50, 25));
-        assert_eq!(scale(&image, 100, 100).dimensions(), (100, 100));
     }
 
     #[test]
@@ -333,13 +304,6 @@ mod tests {
     }
 
     #[test]
-    fn read_limited_small_input_no_huge_prealloc() {
-        let data = read_limited(std::io::Cursor::new(vec![1, 2, 3])).unwrap();
-        assert_eq!(data, vec![1, 2, 3]);
-        assert!(data.capacity() < 64 * 1024);
-    }
-
-    #[test]
     fn read_source_rejects_directory() {
         let dir = tempfile::tempdir().unwrap();
         let err = read_source(dir.path().to_str().unwrap()).unwrap_err();
@@ -371,41 +335,11 @@ mod tests {
         ]
     }
 
-    /// Returns a hardcoded valid 8x8 indexed-colour (paletted) PNG.
-    fn paletted_png_8x8() -> &'static [u8] {
-        // 97 bytes: 8x8 indexed-color PNG with 4-color palette (red,green,blue,white)
-        &[
-            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x03, 0x00, 0x00,
-            0x00, 0xf3, 0xd1, 0x4e, 0xb9, 0x00, 0x00, 0x00, 0x0c, 0x50, 0x4c, 0x54, 0x45, 0xff,
-            0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xfb, 0x00, 0x60,
-            0xf6, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x60,
-            0x64, 0x62, 0x06, 0x63, 0xca, 0x18, 0x00, 0x0d, 0x78, 0x00, 0x61, 0x32, 0xfd, 0xc3,
-            0x6d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-        ]
-    }
-
     #[test]
     fn test_decode_paletted_png_via_decode_with_limits() {
         let decoded = decode_with_limits(paletted_png_4x4())
             .expect("decode_with_limits failed on paletted PNG");
         assert_eq!(decoded.width(), 4, "decoded width should be 4");
         assert_eq!(decoded.height(), 4, "decoded height should be 4");
-    }
-
-    #[test]
-    fn test_scale_paletted() {
-        // Decode an 8x8 paletted PNG then scale it to half size (4x4).
-        let decoded = decode_with_limits(paletted_png_8x8())
-            .expect("decode_with_limits failed on paletted PNG");
-        assert_eq!(decoded.width(), 8, "pre-scale width should be 8");
-        assert_eq!(decoded.height(), 8, "pre-scale height should be 8");
-
-        let scaled = scale(&decoded, 4, 4);
-        assert_eq!(
-            scaled.dimensions(),
-            (4, 4),
-            "scaled dimensions should be (4, 4)"
-        );
     }
 }

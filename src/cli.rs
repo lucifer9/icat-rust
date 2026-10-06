@@ -1,12 +1,12 @@
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
 
 use glob::glob;
 
 // Single source of truth lives in the markdown renderer; the CLI default must
 // track it, otherwise editing the renderer constant silently has no effect.
 use crate::display::markdown::DEFAULT_MARKDOWN_FONT_PT;
+use crate::imgutil;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {
@@ -46,23 +46,25 @@ pub fn is_help_error(err: &(dyn Error + 'static)) -> bool {
 }
 
 pub fn parse_cli(args: &[String]) -> Result<Cli, Box<dyn Error>> {
-    let args = normalize_page_args(args);
     let mut page = None;
     let mut font_size_pt = DEFAULT_MARKDOWN_FONT_PT;
     let mut kind = InputKind::Auto;
     let mut files = Vec::with_capacity(args.len());
 
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if let Some(value) = arg.strip_prefix("--md-font-size=") {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if let Some((name, value)) = arg.split_once('=')
+            && matches!(name, "--md-font-size" | "--markdown-font-size")
+        {
             font_size_pt = parse_markdown_font_size(value)?;
-            i += 1;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--markdown-font-size=") {
-            font_size_pt = parse_markdown_font_size(value)?;
-            i += 1;
+        // `-p3` is shorthand for `-p 3`.
+        if let Some(value) = arg.strip_prefix("-p")
+            && !value.is_empty()
+            && value.bytes().all(|b| b.is_ascii_digit())
+        {
+            page = Some(parse_page(value)?);
             continue;
         }
         match arg.as_str() {
@@ -72,23 +74,21 @@ pub fn parse_cli(args: &[String]) -> Result<Cli, Box<dyn Error>> {
             }
             "--markdown" => kind = InputKind::Markdown,
             "--md-font-size" | "--markdown-font-size" => {
-                i += 1;
                 let value = args
-                    .get(i)
+                    .next()
                     .ok_or_else(|| format!("missing value for {arg}"))?;
                 font_size_pt = parse_markdown_font_size(value)?;
             }
             "-p" => {
-                i += 1;
                 let value = args
-                    .get(i)
+                    .next()
                     .ok_or_else(|| String::from("missing value for -p"))?;
                 page = Some(parse_page(value)?);
             }
+            "-" => files.push(arg.clone()),
             _ if arg.starts_with('-') => return Err(format!("unknown option {arg}").into()),
             _ => files.push(arg.clone()),
         }
-        i += 1;
     }
 
     Ok(Cli {
@@ -119,48 +119,24 @@ fn parse_markdown_font_size(value: &str) -> Result<f64, Box<dyn Error>> {
     Ok(size)
 }
 
-pub fn normalize_page_args(args: &[String]) -> Vec<String> {
-    let mut normalized = Vec::with_capacity(args.len());
-    for arg in args {
-        if let Some(value) = arg.strip_prefix("-p")
-            && !value.is_empty()
-            && all_digits(value)
-        {
-            normalized.push(String::from("-p"));
-            normalized.push(value.to_string());
-        } else {
-            normalized.push(arg.clone());
-        }
-    }
-    normalized
-}
-
-fn all_digits(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-}
-
+/// Expands each file argument into sources; `-` means stdin (an empty path).
 pub fn build_sources(cli: &Cli) -> Vec<Source> {
-    let mut sources = Vec::new();
-    for arg in &cli.files {
-        if arg == "-" {
-            sources.push(Source {
-                path: String::new(),
-                page: cli.page,
-                font_size_pt: cli.font_size_pt,
-                kind: cli.kind,
-            });
-            continue;
-        }
-        for path in expand_glob(arg) {
-            sources.push(Source {
-                path,
-                page: cli.page,
-                font_size_pt: cli.font_size_pt,
-                kind: cli.kind,
-            });
-        }
-    }
-    sources
+    cli.files
+        .iter()
+        .flat_map(|arg| {
+            if arg == "-" {
+                vec![String::new()]
+            } else {
+                expand_glob(arg)
+            }
+        })
+        .map(|path| Source {
+            path,
+            page: cli.page,
+            font_size_pt: cli.font_size_pt,
+            kind: cli.kind,
+        })
+        .collect()
 }
 
 pub fn expand_glob(arg: &str) -> Vec<String> {
@@ -185,30 +161,13 @@ pub fn expand_glob(arg: &str) -> Vec<String> {
 
 pub fn is_markdown_path(path: &str) -> bool {
     matches!(
-        Path::new(path)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase()),
-        Some(ext) if ext == "md" || ext == "markdown"
+        imgutil::lowercase_extension(path).as_deref(),
+        Some("md" | "markdown")
     )
 }
 
-pub fn has_image_path_extension(path: &str) -> bool {
-    matches!(
-        Path::new(path)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.to_ascii_lowercase()),
-        Some(ext)
-            if matches!(
-                ext.as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tiff" | "tif"
-            )
-    )
-}
-
-pub fn bytes_has_prefix(data: &[u8], prefix: &[u8]) -> bool {
-    data.starts_with(prefix)
+pub fn is_pdf_path(path: &str) -> bool {
+    imgutil::lowercase_extension(path).as_deref() == Some("pdf")
 }
 
 pub fn sanitize_control_chars(value: &str) -> String {
@@ -264,50 +223,18 @@ mod tests {
     }
 
     #[test]
-    fn build_sources_stdin_dash() {
+    fn build_sources_maps_dash_to_stdin_and_copies_options() {
         let sources = build_sources(&Cli {
-            page: None,
-            font_size_pt: DEFAULT_MARKDOWN_FONT_PT,
-            kind: InputKind::Auto,
-            files: vec![String::from("-")],
-        });
-        assert_eq!(sources.len(), 1);
-        assert!(sources[0].path.is_empty());
-    }
-
-    #[test]
-    fn build_sources_multiple_files() {
-        let sources = build_sources(&Cli {
-            page: None,
-            font_size_pt: DEFAULT_MARKDOWN_FONT_PT,
-            kind: InputKind::Auto,
-            files: vec![String::from("a.png"), String::from("b.jpg")],
-        });
-        assert_eq!(sources.len(), 2);
-        assert_eq!(sources[0].path, "a.png");
-        assert_eq!(sources[1].path, "b.jpg");
-    }
-
-    #[test]
-    fn build_sources_with_page() {
-        let sources = build_sources(&Cli {
-            page: Some(3),
-            font_size_pt: DEFAULT_MARKDOWN_FONT_PT,
-            kind: InputKind::Auto,
-            files: vec![String::from("doc.pdf")],
-        });
-        assert_eq!(sources[0].page, Some(3));
-    }
-
-    #[test]
-    fn build_sources_with_markdown_kind() {
-        let sources = build_sources(&Cli {
-            page: None,
-            font_size_pt: DEFAULT_MARKDOWN_FONT_PT,
+            page: Some(7),
+            font_size_pt: 20.0,
             kind: InputKind::Markdown,
-            files: vec![String::from("README.md")],
+            files: vec![String::from("a.md"), String::from("-")],
         });
-        assert_eq!(sources[0].kind, InputKind::Markdown);
+        let paths: Vec<_> = sources.iter().map(|src| src.path.as_str()).collect();
+        assert_eq!(paths, ["a.md", ""]);
+        assert!(sources.iter().all(|src| src.page == Some(7)
+            && src.font_size_pt == 20.0
+            && src.kind == InputKind::Markdown));
     }
 
     #[test]
@@ -413,6 +340,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_cli_accepts_dash_as_stdin_file() {
+        let cli = parse_cli(&[String::from("-")]).unwrap();
+        assert_eq!(cli.files, vec![String::from("-")]);
+    }
+
+    #[test]
     fn parse_cli_rejects_zero_page() {
         assert!(parse_cli(&[String::from("-p0"), String::from("doc.pdf")]).is_err());
     }
@@ -426,32 +359,9 @@ mod tests {
     }
 
     #[test]
-    fn image_extension_detection() {
-        assert!(has_image_path_extension("image.png"));
-        assert!(has_image_path_extension("photo.JPEG"));
-        assert!(has_image_path_extension("scan.tiff"));
-        assert!(!has_image_path_extension("archive.tar"));
-    }
-
-    #[test]
-    fn build_sources_with_markdown_page() {
-        let sources = build_sources(&Cli {
-            page: Some(7),
-            font_size_pt: DEFAULT_MARKDOWN_FONT_PT,
-            kind: InputKind::Markdown,
-            files: vec![String::from("README.md")],
-        });
-        assert_eq!(sources[0].page, Some(7));
-    }
-
-    #[test]
-    fn build_sources_with_markdown_font_size() {
-        let sources = build_sources(&Cli {
-            page: None,
-            font_size_pt: 20.0,
-            kind: InputKind::Markdown,
-            files: vec![String::from("README.md")],
-        });
-        assert_eq!(sources[0].font_size_pt, 20.0);
+    fn pdf_path_detection_requires_an_extension() {
+        assert!(is_pdf_path("paper.PDF"));
+        assert!(!is_pdf_path("pdf"));
+        assert!(!is_pdf_path("dir/pdf"));
     }
 }

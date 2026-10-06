@@ -12,22 +12,17 @@ pub struct PreparedImage {
 }
 
 pub fn image(path: &str, size: Size, tmux: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let raw = imgutil::read_source(path).map_err(|err| {
-        let label = if path.is_empty() { "<stdin>" } else { path };
-        format!("failed to read image {label}: {err}")
-    })?;
-    encode_and_send(&raw, size, tmux)
+    let raw =
+        imgutil::read_source(path).map_err(|err| format!("failed to read image {path}: {err}"))?;
+    image_from_bytes(&raw, size, tmux)
 }
 
 pub fn image_from_bytes(
-    data: &[u8],
+    raw: &[u8],
     size: Size,
     tmux: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    encode_and_send(data, size, tmux)
-}
 
-fn encode_and_send(raw: &[u8], size: Size, tmux: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Fast path: unscaled PNG — send raw bytes directly, no copy needed
     if imgutil::is_png(raw)
         && let Some((width, height)) = imgutil::png_dimensions(raw)

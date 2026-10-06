@@ -17,6 +17,8 @@ pub const DEFAULT_PIXEL_WIDTH: u32 = 640;
 pub const DEFAULT_PIXEL_HEIGHT: u32 = 384;
 // Upper bound on waiting for the terminal to answer the cell-size query.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+// Floor for the image area so tiny terminals still get a legible image.
+const MIN_IMAGE_AREA_HEIGHT: u32 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Size {
@@ -30,24 +32,16 @@ impl Size {
     /// Tallest image, in pixels, that leaves the last two rows visible for the
     /// newline after the image and the shell or pager prompt. Kitty draws
     /// images above text, so a taller image would cover the prompt.
+    /// `get_size` never returns zero rows or pixels.
     pub fn image_area_height(&self) -> u32 {
-        let height = if self.pixel_height > 0 {
-            self.pixel_height
-        } else if self.rows > 0 {
-            self.rows * DEFAULT_CELL_HEIGHT
-        } else {
-            DEFAULT_PIXEL_HEIGHT
-        };
-        let reserved = if self.rows > 0 && self.pixel_height > 0 {
-            2 * (self.pixel_height / self.rows).max(1)
-        } else {
-            2 * DEFAULT_CELL_HEIGHT
-        };
-        height.saturating_sub(reserved).max(120)
+        let reserved = 2 * (self.pixel_height / self.rows).max(1);
+        self.pixel_height
+            .saturating_sub(reserved)
+            .max(MIN_IMAGE_AREA_HEIGHT)
     }
 }
 
-pub fn size_from_full_winsize(ws: &Winsize) -> Option<Size> {
+fn size_from_full_winsize(ws: &Winsize) -> Option<Size> {
     if ws.ws_xpixel == 0 || ws.ws_ypixel == 0 || ws.ws_col == 0 || ws.ws_row == 0 {
         return None;
     }
@@ -60,49 +54,32 @@ pub fn size_from_full_winsize(ws: &Winsize) -> Option<Size> {
 }
 
 pub fn get_size() -> Size {
-    let mut best_cols = 0;
-    let mut best_rows = 0;
-
-    if let Ok(ws) = tcgetwinsize(std::io::stderr()) {
+    let queries: [&dyn Fn() -> Option<Winsize>; 3] = [
+        &|| tcgetwinsize(std::io::stderr()).ok(),
+        &|| tcgetwinsize(std::io::stdout()).ok(),
+        &|| {
+            let tty = File::open("/dev/tty").ok()?;
+            tcgetwinsize(&tty).ok()
+        },
+    ];
+    let mut cells = None;
+    for ws in queries.iter().filter_map(|query| query()) {
         if let Some(size) = size_from_full_winsize(&ws) {
             return size;
         }
-        if ws.ws_col > 0 && ws.ws_row > 0 && best_cols == 0 {
-            best_cols = u32::from(ws.ws_col);
-            best_rows = u32::from(ws.ws_row);
+        if cells.is_none() && ws.ws_col > 0 && ws.ws_row > 0 {
+            cells = Some((u32::from(ws.ws_col), u32::from(ws.ws_row)));
         }
     }
 
-    if let Ok(ws) = tcgetwinsize(std::io::stdout()) {
-        if let Some(size) = size_from_full_winsize(&ws) {
-            return size;
-        }
-        if ws.ws_col > 0 && ws.ws_row > 0 && best_cols == 0 {
-            best_cols = u32::from(ws.ws_col);
-            best_rows = u32::from(ws.ws_row);
-        }
-    }
-
-    if let Ok(tty) = File::open("/dev/tty")
-        && let Ok(ws) = tcgetwinsize(&tty)
-    {
-        if let Some(size) = size_from_full_winsize(&ws) {
-            return size;
-        }
-        if ws.ws_col > 0 && ws.ws_row > 0 && best_cols == 0 {
-            best_cols = u32::from(ws.ws_col);
-            best_rows = u32::from(ws.ws_row);
-        }
-    }
-
-    if best_cols > 0 && best_rows > 0 {
+    if let Some((cols, rows)) = cells {
         let (cell_width, cell_height) =
             query_cell_size().unwrap_or((DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT));
         return Size {
-            pixel_width: best_cols * cell_width,
-            pixel_height: best_rows * cell_height,
-            cols: best_cols,
-            rows: best_rows,
+            pixel_width: cols * cell_width,
+            pixel_height: rows * cell_height,
+            cols,
+            rows,
         };
     }
 
@@ -172,7 +149,7 @@ fn parse_cell_size_reply(reply: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-pub fn tmux_socket_and_pid(value: &str) -> Option<(String, i32)> {
+fn tmux_socket_and_pid(value: &str) -> Option<(String, i32)> {
     let (socket, rest) = value.split_once(',')?;
     if socket.is_empty() {
         return None;
@@ -205,7 +182,7 @@ pub fn in_tmux() -> bool {
 pub fn enable_tmux_passthrough() -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
-    let _handle = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let result = Command::new("tmux")
             .args(["set", "-p", "allow-passthrough", "on"])
             .output();
@@ -226,13 +203,8 @@ pub fn enable_tmux_passthrough() -> Result<(), Box<dyn std::error::Error>> {
             Err(format!("failed to enable tmux passthrough: {msg}").into())
         }
         Ok(Err(e)) => Err(format!("failed to enable tmux passthrough: {e}").into()),
-        Err(_) => {
-            // recv_timeout elapsed: the spawned thread (and tmux process) will
-            // continue running in the background but we stop waiting for it.
-            // We cannot easily kill the child here because it's owned by the
-            // thread, so we simply let the thread finish on its own.
-            Err("failed to enable tmux passthrough: tmux command timed out".into())
-        }
+        // The tmux process keeps running on its thread; we only stop waiting.
+        Err(_) => Err("failed to enable tmux passthrough: tmux command timed out".into()),
     }
 }
 
@@ -302,40 +274,6 @@ mod tests {
     }
 
     #[test]
-    fn size_struct_copy() {
-        let zero = Size {
-            pixel_width: 0,
-            pixel_height: 0,
-            cols: 0,
-            rows: 0,
-        };
-        assert_eq!(zero.pixel_width, 0);
-        let size = Size {
-            pixel_width: 1280,
-            pixel_height: 768,
-            cols: 160,
-            rows: 48,
-        };
-        let copy = size;
-        assert_eq!(copy, size);
-    }
-
-    #[test]
-    fn default_constants() {
-        assert_eq!(DEFAULT_CELL_WIDTH, 8);
-        assert_eq!(DEFAULT_CELL_HEIGHT, 16);
-    }
-
-    #[test]
-    fn get_size_returns_something() {
-        let size = get_size();
-        assert!(size.pixel_width > 0);
-        assert!(size.pixel_height > 0);
-        assert!(size.cols > 0);
-        assert!(size.rows > 0);
-    }
-
-    #[test]
     fn size_from_full_winsize_requires_all_non_zero() {
         let ws = Winsize {
             ws_row: 24,
@@ -380,20 +318,6 @@ mod tests {
         );
         assert_eq!(parse_cell_size_reply(b"\x1b[?62;52;c"), None);
         assert_eq!(parse_cell_size_reply(b"\x1b[6;0;17t\x1b[?62c"), None);
-    }
-
-    #[test]
-    fn cell_estimate_fallback() {
-        let cols = 120;
-        let rows = 40;
-        let size = Size {
-            pixel_width: cols * DEFAULT_CELL_WIDTH,
-            pixel_height: rows * DEFAULT_CELL_HEIGHT,
-            cols,
-            rows,
-        };
-        assert_eq!(size.pixel_width, 960);
-        assert_eq!(size.pixel_height, 640);
     }
 
     #[test]

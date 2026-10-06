@@ -73,10 +73,8 @@ fn run_icat_full(
 ) -> (Vec<u8>, Vec<u8>, bool) {
     let mut cmd = Command::new(icat_bin());
     cmd.args(args);
-    // Provide terminal size and strip TMUX so tests run in non-tmux mode by default
-    cmd.env("COLUMNS", "80")
-        .env("LINES", "24")
-        .env_remove("TMUX");
+    // Strip TMUX so tests run in non-tmux mode by default
+    cmd.env_remove("TMUX");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -139,10 +137,8 @@ fn assert_kitty_output(stdout: &[u8], tmux: bool) {
     assert!(!stdout.is_empty(), "stdout should not be empty");
     if tmux {
         // tmux passthrough prefix: \r\x1bPtmux;\x1b\x1b_G...
-        let tmux_prefix: &[u8] = b"\r\x1bPtmux;\x1b\x1b_G";
-        let alt_prefix: &[u8] = b"\x1bPtmux;\x1b\x1b_G";
         assert!(
-            stdout.starts_with(tmux_prefix) || stdout.starts_with(alt_prefix),
+            stdout.starts_with(b"\r\x1bPtmux;\x1b\x1b_G"),
             "expected tmux header prefix, got: {:?}",
             &stdout[..stdout.len().min(40)]
         );
