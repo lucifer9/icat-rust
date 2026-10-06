@@ -724,13 +724,23 @@ fn render_class_relation(
         x1, y1, x2, y2, style.edge_stroke, line_style
     ));
 
-    // Association points at the target; every other marker sits on the source end.
-    if relation.relation_type == ClassRelationType::Association {
-        svg.push_str(&draw_marker(&relation.relation_type, x2, y2, angle, style));
-    } else {
-        let back = angle + std::f32::consts::PI;
-        svg.push_str(&draw_marker(&relation.relation_type, x1, y1, back, style));
-    }
+    // As in Mermaid, `A <|-- B`, `A *-- B` and `A o-- B` mark the left-hand
+    // class, while `A --> B`, `A ..> B` and `A ..|> B` point at the right-hand one.
+    let (x, y, marker_angle) = match relation.relation_type {
+        ClassRelationType::Inheritance
+        | ClassRelationType::Composition
+        | ClassRelationType::Aggregation => (x1, y1, angle + std::f32::consts::PI),
+        ClassRelationType::Association
+        | ClassRelationType::Dependency
+        | ClassRelationType::Realization => (x2, y2, angle),
+    };
+    svg.push_str(&draw_marker(
+        &relation.relation_type,
+        x,
+        y,
+        marker_angle,
+        style,
+    ));
 
     if let Some(label) = &relation.label {
         // Offset the label to one side of the line, along its normal.
@@ -2383,6 +2393,53 @@ Note right of Child: child note"#,
             "classDiagram\n    Animal <|-- Duck\n    Animal <|-- Fish",
             &["Animal", "Duck", "Fish"],
         );
+    }
+
+    #[test]
+    fn class_markers_sit_at_the_end_mermaid_puts_them() {
+        // (relation, whether the marker belongs at the lower class B)
+        let cases = [
+            ("A <|-- B", false),
+            ("A *-- B", false),
+            ("A o-- B", false),
+            ("A --> B", true),
+            ("A ..> B", true),
+            ("A ..|> B", true),
+        ];
+        for (relation, at_b) in cases {
+            let image = rasterize(&render_svg(&format!(
+                "classDiagram\n  class A\n  class B\n  {relation}\n"
+            )));
+            // Class boxes are wide bands split by compartment separators;
+            // narrow bands are hollow markers.
+            let mut boxes: Vec<(u32, u32)> = Vec::new();
+            for (left, top, right, bottom) in node_bands(&image) {
+                match boxes.last_mut() {
+                    _ if right - left < 60 => {}
+                    Some(last) if top <= last.1 + 4 => last.1 = bottom,
+                    _ => boxes.push((top, bottom)),
+                }
+            }
+            assert_eq!(
+                boxes.len(),
+                2,
+                "{relation}: expected A above B, got {boxes:?}"
+            );
+            let (a_bottom, b_top) = (boxes[0].1, boxes[1].0);
+            // Markers are the only solid or filled shapes between the classes.
+            let marker_rows: Vec<u32> = image
+                .enumerate_pixels()
+                .filter(|(_, y, p)| *y > a_bottom && *y < b_top && (is_edge(p) || is_node_fill(p)))
+                .map(|(_, y, _)| y)
+                .collect();
+            assert!(marker_rows.len() > 20, "{relation}: marker not visible");
+            let mean = marker_rows.iter().sum::<u32>() / marker_rows.len() as u32;
+            let near_b = mean > (a_bottom + b_top) / 2;
+            assert_eq!(
+                near_b, at_b,
+                "{relation}: marker centered at row {mean}, A ends at {a_bottom}, B starts at {b_top}"
+            );
+        }
     }
 
     #[test]
