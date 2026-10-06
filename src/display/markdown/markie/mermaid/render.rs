@@ -238,10 +238,12 @@ fn render_sequence(
         y: participant_bottom + 34.0,
         left_edge,
         right_edge,
+        last_message_y: None,
         activation_starts: HashMap::new(),
         svg: String::new(),
     };
     renderer.render_elements(&diagram.elements, 0);
+    renderer.close_open_activations();
     let message_y = renderer.y;
 
     let lifeline_end_y = (message_y + 6.0).max(lifeline_start_y + 24.0);
@@ -281,6 +283,8 @@ struct SequenceRenderer<'a, T: TextMeasure> {
     y: f32,
     left_edge: f32,
     right_edge: f32,
+    /// Row of the latest message arrow, where activations start and end.
+    last_message_y: Option<f32>,
     activation_starts: HashMap<String, Vec<f32>>,
     svg: String,
 }
@@ -338,6 +342,8 @@ impl<T: TextMeasure> SequenceRenderer<'_, T> {
             style,
         ));
 
+        self.last_message_y = Some(y);
+
         if !msg.label.is_empty() {
             let center = ((x1 + x2) / 2.0, y - 10.0);
             let label_font = style.font_size * 0.82;
@@ -377,6 +383,7 @@ impl<T: TextMeasure> SequenceRenderer<'_, T> {
             std::f32::consts::PI,
             style,
         ));
+        self.last_message_y = Some(y_bot);
 
         if !msg.label.is_empty() {
             let label_font = style.font_size * 0.82;
@@ -389,41 +396,53 @@ impl<T: TextMeasure> SequenceRenderer<'_, T> {
         self.y = y_bot + 20.0;
     }
 
+    /// Activations and deactivations attach to the latest message, as in
+    /// Mermaid; before any message they attach to the next row.
+    fn activation_row(&self) -> f32 {
+        self.last_message_y.unwrap_or(self.y)
+    }
+
     fn render_activation(&mut self, participant: &str) {
-        if let Some(&cx) = self.centers.get(participant) {
-            let start = self.y - 10.0;
-            self.activation_starts
-                .entry(participant.to_string())
-                .or_default()
-                .push(start);
-            self.svg.push_str(&format!(
-                r#"<rect x="{:.2}" y="{:.2}" width="8" height="16" fill="{}" stroke="{}" stroke-width="1" />"#,
-                cx - 4.0,
-                start,
-                self.style.node_fill,
-                self.style.node_stroke
-            ));
-        }
-        self.y += 24.0;
+        let start = self.activation_row();
+        self.activation_starts
+            .entry(participant.to_string())
+            .or_default()
+            .push(start);
     }
 
     fn render_deactivation(&mut self, participant: &str) {
-        if let Some(&cx) = self.centers.get(participant)
-            && let Some(start) = self
-                .activation_starts
-                .get_mut(participant)
-                .and_then(Vec::pop)
+        if let Some(start) = self
+            .activation_starts
+            .get_mut(participant)
+            .and_then(Vec::pop)
         {
+            self.draw_activation_bar(participant, start, self.activation_row());
+        }
+    }
+
+    /// Ends activations that are never deactivated at the last message.
+    fn close_open_activations(&mut self) {
+        let end = self.activation_row();
+        let mut open: Vec<(String, Vec<f32>)> = self.activation_starts.drain().collect();
+        open.sort_by(|a, b| a.0.cmp(&b.0));
+        for (participant, starts) in open {
+            for start in starts {
+                self.draw_activation_bar(&participant, start, end);
+            }
+        }
+    }
+
+    fn draw_activation_bar(&mut self, participant: &str, start: f32, end: f32) {
+        if let Some(&cx) = self.centers.get(participant) {
             self.svg.push_str(&format!(
                 r#"<rect x="{:.2}" y="{:.2}" width="8" height="{:.2}" fill="{}" fill-opacity="0.35" stroke="{}" stroke-width="1" />"#,
                 cx - 4.0,
                 start,
-                (self.y - start).max(16.0),
+                (end - start).max(16.0),
                 self.style.node_fill,
                 self.style.node_stroke
             ));
         }
-        self.y += 24.0;
     }
 
     fn render_note(&mut self, participant: &str, position: &str, text: &str) {
@@ -2310,6 +2329,50 @@ Note right of Child: child note"#,
         assert!(
             !text.iter().any(|t| t.contains("+B") || t.contains("-A")),
             "activation markers must not become participants: {text:?}"
+        );
+    }
+
+    #[test]
+    fn sequence_activation_bar_spans_activating_to_deactivating_message() {
+        let image = rasterize(&render_svg(
+            "sequenceDiagram\n    participant A\n    participant B\n    A->>+B: Hello\n    B-->>-A: Hi",
+        ));
+        let (_, box_top, _, box_bottom) = node_bands(&image)[0];
+        // Above the participant names.
+        let box_row = box_top + 2;
+        let box_xs: Vec<u32> = (0..image.width())
+            .filter(|&x| is_node_fill(image.get_pixel(x, box_row)))
+            .collect();
+        let gap = box_xs.windows(2).position(|w| w[1] > w[0] + 1).unwrap();
+        let a_center = (box_xs[0] + box_xs[gap]) / 2;
+        let b_center = (box_xs[gap + 1] + box_xs[box_xs.len() - 1]) / 2;
+
+        // Message lines cross the left quarter between the lifelines, clear
+        // of the centered label pills; the dashed reply needs a range of x.
+        let quarter = a_center + (b_center - a_center) / 4;
+        let message_rows: Vec<u32> = (box_bottom + 2..image.height())
+            .filter(|&y| {
+                (quarter..quarter + 10).any(|x| {
+                    let p = image.get_pixel(x, y);
+                    p[3] > 32 && p[2] > p[0] && p[2] > p[1]
+                })
+            })
+            .collect();
+        let split = message_rows.windows(2).position(|w| w[1] > w[0] + 2);
+        let hello_row = message_rows[0];
+        let hi_row = message_rows[split.expect("two message rows") + 1];
+
+        // Skip the participant box outline.
+        let bar_rows: Vec<u32> = (box_bottom + 3..image.height())
+            .filter(|&y| {
+                let p = image.get_pixel(b_center, y);
+                p[3] > 40 && (p[0] > 60 || p[1] > 60)
+            })
+            .collect();
+        let (bar_top, bar_bottom) = (bar_rows[0], bar_rows[bar_rows.len() - 1]);
+        assert!(
+            bar_top.abs_diff(hello_row) <= 2 && bar_bottom.abs_diff(hi_row) <= 2,
+            "bar spans {bar_top}..={bar_bottom}, messages at {hello_row} and {hi_row}"
         );
     }
 
