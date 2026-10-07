@@ -19,7 +19,8 @@ pub fn parse_mermaid(input: &str) -> Result<MermaidDiagram, String> {
     let kind = first_line.split_whitespace().next().unwrap_or("");
 
     let diagram = if kind == "graph" || kind.starts_with("flowchart") {
-        MermaidDiagram::Flowchart(parse_flowchart(input))
+        let diagram = parse_flowchart(input).map_err(|e| format!("Flowchart parse error: {e}"))?;
+        MermaidDiagram::Flowchart(diagram)
     } else if kind == "sequenceDiagram" {
         MermaidDiagram::Sequence(parse_sequence(input))
     } else if kind.starts_with("classDiagram") {
@@ -72,7 +73,10 @@ impl MermaidDiagram {
 // FLOWCHART PARSER
 // ============================================
 
-fn parse_flowchart(input: &str) -> Flowchart {
+/// Every statement must parse: a diagram with one the parser does not
+/// understand is an error, so the caller shows the source instead of a
+/// picture with missing parts.
+fn parse_flowchart(input: &str) -> Result<Flowchart, String> {
     let mut lines = input.lines();
 
     // Parse direction from first line
@@ -98,6 +102,24 @@ fn parse_flowchart(input: &str) -> Flowchart {
         if rest.is_empty() {
             break;
         }
+        // Accessibility text runs to the end of the line, or for
+        // `accDescr { … }` to the closing brace, whatever it contains.
+        let acc_text = ["accTitle", "accDescr"]
+            .into_iter()
+            .find_map(|keyword| rest.strip_prefix(keyword))
+            .map(str::trim_start);
+        if let Some(text) = acc_text.and_then(|text| text.strip_prefix(':')) {
+            rest = &text[text.find('\n').unwrap_or(text.len())..];
+            continue;
+        }
+        if let Some(text) = rest
+            .strip_prefix("accDescr")
+            .and_then(|text| text.trim_start().strip_prefix('{'))
+        {
+            let close = text.find('}').ok_or("`accDescr {` has no closing `}`")?;
+            rest = &text[close + 1..];
+            continue;
+        }
         let statement_start = rest;
         let end = statement_len(rest);
         let statement = rest[..end].trim_end();
@@ -122,7 +144,7 @@ fn parse_flowchart(input: &str) -> Flowchart {
         // Unlike keywords and directives, a node statement may run past the
         // end of its line.
         let Some((statement, after)) = parse_flow_statement(statement_start) else {
-            continue;
+            return Err(format!("unrecognized statement `{statement}`"));
         };
         rest = after;
         // As in Mermaid, `e1@{ animate: true }` gives data to the edge
@@ -159,12 +181,12 @@ fn parse_flowchart(input: &str) -> Flowchart {
         }
     }
 
-    Flowchart {
+    Ok(Flowchart {
         direction,
         nodes,
         edges,
         subgraphs,
-    }
+    })
 }
 
 fn parse_flow_direction(line: &str) -> FlowDirection {
@@ -251,8 +273,7 @@ fn is_flow_directive(statement: &str) -> bool {
     matches!(
         keyword,
         "style" | "linkStyle" | "classDef" | "class" | "click" | "direction"
-    ) || keyword.starts_with("accTitle")
-        || keyword.starts_with("accDescr")
+    )
 }
 
 /// Length of the keyword or directive statement at the start of `s`: up to
@@ -2296,10 +2317,9 @@ stateDiagram
         for link in [
             "--o>", "->", "->>", "<--", "x--", "o--", "-.x", "x-.", "<==",
         ] {
-            let fc = flowchart(&format!("flowchart TD\n    Z\n    A {link} B"));
-            let ids: Vec<&str> = fc.nodes.iter().map(|n| n.id.as_str()).collect();
-            assert_eq!(ids, ["Z"], "{link}");
-            assert!(fc.edges.is_empty(), "{link}");
+            let src = format!("flowchart TD\n    Z\n    A {link} B");
+            let err = parse_mermaid(&src).expect_err(&src);
+            assert!(err.contains(&format!("`A {link} B`")), "{err}");
         }
     }
 
@@ -2682,6 +2702,59 @@ mod error_tests {
         ] {
             assert!(parse_mermaid(src).is_ok(), "{src}");
         }
+    }
+
+    #[test]
+    fn flowchart_statement_that_fails_to_parse_is_an_error() {
+        for (src, statement) in [
+            ("flowchart TD\n  A --> B\n  B -> C", "B -> C"),
+            (
+                "flowchart TD\n  A --> B; B[unclosed --> C\n  C",
+                "B[unclosed --> C",
+            ),
+            (
+                "flowchart TD\n  A --> B %% not a comment",
+                "A --> B %% not a comment",
+            ),
+            ("flowchart TD\n  A@{ shape: diam\n  B", "A@{ shape: diam"),
+        ] {
+            let err = parse_err(src);
+            assert_eq!(
+                err,
+                format!("Flowchart parse error: unrecognized statement `{statement}`")
+            );
+        }
+        let err = parse_err("flowchart TD\n  A\n  accDescr {\n  B");
+        assert!(err.contains("`accDescr {` has no closing `}`"), "{err}");
+    }
+
+    #[test]
+    fn flowchart_directives_are_not_statement_errors() {
+        let src = r#"flowchart TD
+    %% a comment
+    accTitle: Title; with a semicolon
+    accDescr: One line; with a semicolon
+    accDescr {
+        Overview
+        A --> Z
+    }
+    subgraph one [One]
+        direction LR
+        A:::hot --> B
+    end;
+    classDef hot fill:#f96
+    class B hot
+    style A fill:#f9f,stroke:#333
+    linkStyle 0 stroke:red
+    click A callback "Tooltip"
+    click B href "https://example.com" _blank"#;
+        let MermaidDiagram::Flowchart(fc) = parse_mermaid(src).unwrap() else {
+            panic!("expected a flowchart");
+        };
+        let ids: Vec<&str> = fc.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["A", "B"]);
+        assert_eq!(fc.edges.len(), 1);
+        assert_eq!(fc.subgraphs.len(), 1);
     }
 
     #[test]

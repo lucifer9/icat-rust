@@ -2854,6 +2854,7 @@ $$
         for diagram in [
             "stateDiagram\n    state \"unterminated",
             "pie title Pets\n    \"Dogs\" : 386",
+            "flowchart TD\n    A --> B\n    B -> C",
         ] {
             assert_falls_back_to_code_block(&format!("```mermaid\n{diagram}\n```"));
         }
