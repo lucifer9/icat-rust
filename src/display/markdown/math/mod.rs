@@ -126,6 +126,8 @@ mod tests {
         let font_size = 18.0;
         let cases = [
             ("square root", r"\sqrt{x^2 + y^2}"),
+            ("square root of fraction", r"\sqrt{\frac{a}{b}}"),
+            ("indexed root of fraction", r"\sqrt[3]{\frac{a}{b}}"),
             ("fraction", r"\frac{a + b}{c + d}"),
             ("binomial", r"\binom{n}{k}"),
             ("sum with limits", r"\sum_{i=1}^{n} i"),
@@ -160,6 +162,15 @@ mod tests {
         let mut font_system = FontSystem::new();
         let cases = [
             ("inline sqrt", r"\sqrt{x^2 + y^2}", false),
+            ("inline fraction sqrt", r"\sqrt{\frac{a}{b}}", false),
+            ("inline indexed sqrt", r"\sqrt[3]{x}", false),
+            ("inline expression index", r"\sqrt[n+1]{x}", false),
+            (
+                "inline wide root index",
+                r"\sqrt[12345]{\sqrt{\frac{a}{b}}}",
+                false,
+            ),
+            ("display indexed fraction", r"\sqrt[3]{\frac{1}{2}}", true),
             ("inline fraction", r"\frac{a + b}{c + d}", false),
             (
                 "display matrix",
@@ -174,8 +185,10 @@ mod tests {
         ];
 
         for (name, latex, display) in cases {
-            let rendered = render_math(latex, &mut font_system, 18.0, display).unwrap();
-            assert_ink_has_padding(name, &rendered.image);
+            for font_size in [18.0, 48.0, 96.0] {
+                let rendered = render_math(latex, &mut font_system, font_size, display).unwrap();
+                assert_ink_has_padding(name, &rendered.image);
+            }
         }
     }
 }

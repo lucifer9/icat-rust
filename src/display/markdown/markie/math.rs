@@ -698,9 +698,14 @@ impl<T: TextMeasure> MathLayout<'_, T> {
     ) -> MathBox {
         let inner = self.extent(radicand, font_size);
 
-        let index_width = index.map_or(0.0, |_| font_size * 0.5);
         let radical_width = font_size * 0.6;
-        let padding = font_size * 0.1;
+        let index_size = font_size * 0.6;
+        let measured_index = index.map(|node| (node, self.extent(node, index_size)));
+        // Reserve enough space to keep even a wide index left of the knee.
+        let index_width = measured_index.map_or(0.0, |(_, extent)| {
+            (extent.width + font_size * 0.1 - radical_width * 0.35).max(0.0)
+        });
+        let padding = font_size * 0.2;
         let overbar_gap = font_size * 0.15;
         let total_width = index_width + radical_width + inner.width + padding;
 
@@ -711,27 +716,26 @@ impl<T: TextMeasure> MathLayout<'_, T> {
         let bottom_y = baseline_y + inner_box.descent;
         let bar_end = sign_x + radical_width + inner_box.width + padding;
 
-        // The index sits in the notch, and its overbar ends in a short hook.
-        let (index_svg, hook) = match index {
-            Some(index) => {
-                let index_baseline = baseline_y - inner_box.ascent * 0.3;
-                let index_box = self.layout(index, font_size * 0.6, x, index_baseline);
-                let hook = format!(
-                    " L {:.2} {:.2}",
-                    bar_end - font_size * 0.1,
-                    top_y - font_size * 0.05
-                );
-                (index_box.svg, hook)
+        // Raise the index using the whole radical height, including any denominator.
+        let (index_svg, index_ascent, hook) = match measured_index {
+            Some((index, extent)) => {
+                let index_baseline = bottom_y - (bottom_y - top_y) * 0.6 - extent.descent;
+                let index_box = self.layout(index, index_size, x, index_baseline);
+                let hook_y = top_y - font_size * 0.05;
+                let hook = format!(" L {:.2} {:.2}", bar_end - font_size * 0.1, hook_y);
+                let ascent =
+                    (baseline_y - index_baseline + index_box.ascent).max(baseline_y - hook_y);
+                (index_box.svg, ascent, hook)
             }
-            None => (String::new(), String::new()),
+            None => (String::new(), 0.0, String::new()),
         };
 
         let radical_svg = format!(
             r#"<path d="M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}{hook}" stroke="{}" stroke-width="1.2" fill="none" />"#,
             sign_x,
-            baseline_y - font_size * 0.15,
+            bottom_y - font_size * 0.15,
             sign_x + radical_width * 0.35,
-            baseline_y,
+            bottom_y,
             sign_x + radical_width * 0.6,
             top_y,
             bar_end,
@@ -739,7 +743,7 @@ impl<T: TextMeasure> MathLayout<'_, T> {
             self.color
         );
 
-        let ascent = (baseline_y - top_y).max(inner_box.ascent + overbar_gap);
+        let ascent = (baseline_y - top_y).max(index_ascent);
         let descent = inner_box.descent.max(bottom_y - baseline_y);
 
         MathBox {
@@ -1204,6 +1208,133 @@ mod tests {
                     image.pixels().any(|pixel| pixel[3] > 0),
                     "{latex} rendered no ink"
                 );
+            }
+        }
+    }
+
+    fn svg_elements(svg: &str, name: &str) -> Vec<HashMap<String, String>> {
+        let mut reader = XmlReader::from_str(svg);
+        let mut elements = Vec::new();
+        loop {
+            match reader.read_event().unwrap() {
+                XmlEvent::Start(element) | XmlEvent::Empty(element)
+                    if element.name().as_ref() == name =>
+                {
+                    elements.push(
+                        element
+                            .attributes()
+                            .map(|attr| {
+                                let attr = attr.unwrap();
+                                (attr.key.as_ref().to_owned(), attr.value.into_owned())
+                            })
+                            .collect(),
+                    );
+                }
+                XmlEvent::Eof => return elements,
+                _ => {}
+            }
+        }
+    }
+
+    fn radical_points(svg: &str) -> Vec<(f32, f32)> {
+        let paths = svg_elements(svg, "path");
+        let coordinates: Vec<f32> = paths[0]["d"]
+            .split_whitespace()
+            .filter(|token| !matches!(*token, "M" | "L"))
+            .map(|coordinate| coordinate.parse().unwrap())
+            .collect();
+        let (points, remainder) = coordinates.as_chunks::<2>();
+        assert!(remainder.is_empty(), "radical path must contain x/y pairs");
+        points.iter().map(|&[x, y]| (x, y)).collect()
+    }
+
+    #[test]
+    fn radical_encloses_fraction_with_clearance() {
+        for font_size in [16.0, 32.0, 64.0] {
+            for display in [false, true] {
+                let result = render_math(
+                    r"\sqrt{\frac{a}{b}}",
+                    font_size,
+                    "#000000",
+                    &mut MockMeasure,
+                    display,
+                )
+                .unwrap();
+                let points = radical_points(&result.svg_fragment);
+                let knee = points[1];
+                let shoulder = points[2];
+                let bar_end = points[3];
+                let texts = svg_elements(&result.svg_fragment, "text");
+                let denominator_y: f32 = texts[1]["y"].parse().unwrap();
+                let denominator_size: f32 = texts[1]["font-size"].parse().unwrap();
+                let denominator_bottom = denominator_y + denominator_size * DESCENT_RATIO;
+                assert!(
+                    knee.1 >= denominator_bottom - 0.02,
+                    "root ends at {}, above denominator bottom {denominator_bottom}",
+                    knee.1
+                );
+
+                let lines = svg_elements(&result.svg_fragment, "line");
+                let rule_x1: f32 = lines[0]["x1"].parse().unwrap();
+                let rule_x2: f32 = lines[0]["x2"].parse().unwrap();
+                let rule_y: f32 = lines[0]["y1"].parse().unwrap();
+                let diagonal_x =
+                    knee.0 + (shoulder.0 - knee.0) * (rule_y - knee.1) / (shoulder.1 - knee.1);
+                assert!(
+                    rule_x1 - diagonal_x >= font_size * 0.15,
+                    "fraction rule starts too close to the radical stroke"
+                );
+                assert!(
+                    bar_end.0 - rule_x2 >= font_size * 0.15,
+                    "fraction rule ends too close to the overbar end"
+                );
+                let numerator_y: f32 = texts[0]["y"].parse().unwrap();
+                let numerator_size: f32 = texts[0]["font-size"].parse().unwrap();
+                let numerator_top = numerator_y - numerator_size * ASCENT_RATIO;
+                assert!(numerator_top - shoulder.1 >= font_size * 0.1);
+            }
+        }
+    }
+
+    #[test]
+    fn radical_index_sits_above_and_left_of_the_knee() {
+        for font_size in [16.0, 32.0, 64.0] {
+            for display in [false, true] {
+                for index in ["2", "3", "12", "12345"] {
+                    for radicand in ["x", r"\frac{a}{b}"] {
+                        let latex = format!(r"\sqrt[{index}]{{{radicand}}}");
+                        let result =
+                            render_math(&latex, font_size, "#000000", &mut MockMeasure, display)
+                                .unwrap();
+                        let points = radical_points(&result.svg_fragment);
+                        let knee = points[1];
+                        let top = points[2].1;
+                        let texts = svg_elements(&result.svg_fragment, "text");
+                        let index_x: f32 = texts[0]["x"].parse().unwrap();
+                        let index_y: f32 = texts[0]["y"].parse().unwrap();
+                        let index_size: f32 = texts[0]["font-size"].parse().unwrap();
+                        let index_bottom = index_y + index_size * DESCENT_RATIO;
+                        assert!(
+                            index_bottom <= (top + knee.1) / 2.0,
+                            "{latex}: index bottom {index_bottom} is too low between {top} and {}",
+                            knee.1
+                        );
+                        let index_width =
+                            MockMeasure.measure_width(index, index_size, false, false, false);
+                        assert!(
+                            index_x + index_width <= knee.0,
+                            "{latex}: index extends into the radical interior"
+                        );
+                        let index_top = index_y - index_size * ASCENT_RATIO;
+                        assert!(index_x >= 0.0 && index_x + index_width <= result.width);
+                        assert!(index_top >= -result.ascent - 0.02);
+                        assert!(index_bottom <= result.descent + 0.02);
+                        for (x, y) in points {
+                            assert!(x >= 0.0 && x <= result.width + 0.02);
+                            assert!(y >= -result.ascent - 0.02 && y <= result.descent + 0.02);
+                        }
+                    }
+                }
             }
         }
     }
