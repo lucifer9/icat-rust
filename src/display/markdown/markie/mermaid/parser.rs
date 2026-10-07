@@ -377,8 +377,8 @@ fn parse_shape(text: &str) -> Option<(String, NodeShape)> {
 }
 
 /// One link token as Mermaid's lexer reads it: an optional `<`, `x` or `o`,
-/// a `--`, `==` or dotted line, and an end character. `end` is `None` for a
-/// bare `--`, `==` or `-.` that opens a `-- text -->` link.
+/// a `--`, `==` or dotted line, and an end character; or a `~~~` line. `end`
+/// is `None` for a bare `--`, `==` or `-.` that opens a `-- text -->` link.
 struct LinkToken {
     style: EdgeStyle,
     start: Option<char>,
@@ -391,7 +391,10 @@ fn scan_link_token(s: &str) -> Option<(LinkToken, &str)> {
         _ => (None, s),
     };
     let end_char = |rest: &str| rest.chars().next().filter(|c| matches!(c, 'x' | 'o' | '>'));
-    let (style, len, end) = if body.starts_with("--") || body.starts_with("==") {
+    let (style, len, end) = if body.starts_with("~~~") && start.is_none() {
+        let n = body.bytes().take_while(|&b| b == b'~').count();
+        (EdgeStyle::Invisible, n, Some('~'))
+    } else if body.starts_with("--") || body.starts_with("==") {
         let line = body.as_bytes()[0];
         let style = if line == b'-' {
             EdgeStyle::Solid
@@ -481,6 +484,7 @@ fn scan_text_link<'a>(opener: &LinkToken, rest: &'a str) -> Option<(ParsedLink, 
         EdgeStyle::Solid => "--",
         EdgeStyle::Thick => "==",
         EdgeStyle::Dotted => ".-",
+        EdgeStyle::Invisible => return None,
     };
     let text_end = rest.find(closer_start)?;
     let (closer, after) = scan_link_token(&rest[text_end..])?;
@@ -2258,6 +2262,19 @@ stateDiagram
             assert_eq!((&e.style, &e.arrow_head), (&style, &head), "{from} -> {to}");
         }
         assert_eq!(node_ids(&fc), ["A", "B", "C", "D", "E", "F", "G"]);
+    }
+
+    #[test]
+    fn invisible_links_join_nodes_without_markers() {
+        let fc = flowchart("flowchart LR\n    A ~~~ B\n    B ~~~~ C");
+        assert_eq!(edge_pairs(&fc), [("A", "B"), ("B", "C")]);
+        for e in &fc.edges {
+            assert_eq!(e.style, EdgeStyle::Invisible);
+            assert_eq!(
+                (&e.arrow_head, &e.arrow_tail),
+                (&ArrowType::None, &ArrowType::None)
+            );
+        }
     }
 
     #[test]

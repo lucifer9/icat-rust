@@ -399,6 +399,7 @@ fn render_edge<T: TextMeasure>(ctx: &mut RenderEdgeContext<'_, T>) -> String {
         EdgeStyle::Solid => ("", 0.75),
         EdgeStyle::Dotted => (" stroke-dasharray=\"4,4\"", 0.75),
         EdgeStyle::Thick => ("", 1.5),
+        EdgeStyle::Invisible => return String::new(),
     };
 
     let from_cx = from.x + from.w / 2.0;

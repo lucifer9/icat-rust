@@ -3088,6 +3088,15 @@ Note right of Child: child note"#,
     }
 
     #[test]
+    fn invisible_link_places_nodes_like_a_link_but_draws_nothing() {
+        let visible = rasterize(&render_svg("flowchart TD\n    A --> B"));
+        let invisible = rasterize(&render_svg("flowchart TD\n    A ~~~ B"));
+        assert_eq!(node_bands(&invisible), node_bands(&visible));
+        let edge_pixels = invisible.pixels().filter(|p| is_edge(p)).count();
+        assert_eq!(edge_pixels, 0, "invisible link was drawn");
+    }
+
+    #[test]
     fn subgraph_box_keeps_equal_padding_when_clamped_at_top() {
         let image = rasterize(&render_svg(
             "flowchart TD\n    subgraph Group\n        A[Alpha] --> B[Beta]\n    end",

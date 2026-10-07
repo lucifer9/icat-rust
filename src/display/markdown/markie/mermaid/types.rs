@@ -24,6 +24,8 @@ pub enum EdgeStyle {
     Solid,
     Dotted,
     Thick,
+    /// `~~~`: positions nodes like a link but is not drawn.
+    Invisible,
 }
 
 /// Arrow types
