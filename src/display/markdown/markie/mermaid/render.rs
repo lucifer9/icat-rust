@@ -1055,7 +1055,10 @@ fn render_composite_state_contents(
     measure: &mut impl TextMeasure,
 ) -> String {
     let mut svg = String::new();
-    let child_states: Vec<&State> = state.child_state_ids().map(|id| states_by_id[id]).collect();
+    let mut child_states: Vec<&State> =
+        state.child_state_ids().map(|id| states_by_id[id]).collect();
+    // The composite's own start dot heads the column and its end dot closes it.
+    child_states.sort_by_key(|child| (!child.is_start, child.is_end));
     if child_states.is_empty() {
         return svg;
     }
@@ -1079,7 +1082,17 @@ fn render_composite_state_contents(
     for child_state in child_states {
         let (child_w, child_h) =
             LayoutEngine::new(measure, style.font_size).state_size(child_state, states_by_id);
-        let child_pos = Rect::new(content_left, y_cursor, content_width.max(child_w), child_h);
+        // Pseudo-states keep their size so they are still drawn as dots.
+        let child_pos = if child_state.is_start || child_state.is_end {
+            Rect::new(
+                content_left + (content_width - child_w) / 2.0,
+                y_cursor,
+                child_w,
+                child_h,
+            )
+        } else {
+            Rect::new(content_left, y_cursor, content_width.max(child_w), child_h)
+        };
         child_positions.insert(child_state.id.clone(), child_pos);
 
         svg.push_str(&render_state_node(
@@ -2578,18 +2591,43 @@ Note right of Child: child note"#,
     }
 
     #[test]
-    fn grid_layout_keeps_unconnected_states_apart() {
+    fn composite_start_dot_sits_between_title_and_first_child() {
         let image = rasterize(&render_svg(
             "stateDiagram-v2\nstate Comp {\n    [*] --> X\n    X --> Y\n}",
         ));
         let (left, top, right, bottom) = bounds(&image, is_node_fill);
         let dot = start_dot_pixels(&image);
         assert!(!dot.is_empty(), "missing start dot");
-        let inside = dot
+        let header_bottom = top + (test_style().font_size * 2.0 + 16.0) as u32;
+        let outside = dot
             .iter()
-            .filter(|(x, y)| (left..=right).contains(x) && (top..=bottom).contains(y))
+            .filter(|(x, y)| !(left..=right).contains(x) || !(header_bottom..=bottom).contains(y))
             .count();
-        assert_eq!(inside, 0, "start dot overlaps the composite state");
+        assert_eq!(
+            outside, 0,
+            "start dot must sit inside Comp, below its title"
+        );
+
+        // X's top border is the first outline row below the title that is
+        // wider than the dot.
+        let outline = |x: u32, y: u32| {
+            let p = image.get_pixel(x, y);
+            p[3] > 32 && p[1] > 100
+        };
+        let x_top = (header_bottom..bottom)
+            .find(|&y| (left..=right).filter(|&x| outline(x, y)).count() > 40)
+            .expect("X outline");
+        let dot_bottom = dot.iter().map(|&(_, y)| y).max().unwrap();
+        assert!(
+            dot_bottom < x_top,
+            "start dot ends at {dot_bottom}, X starts at {x_top}"
+        );
+
+        let title_edge_ink = (top..header_bottom)
+            .flat_map(|y| (left..=right).map(move |x| (x, y)))
+            .filter(|&(x, y)| is_edge(image.get_pixel(x, y)))
+            .count();
+        assert_eq!(title_edge_ink, 0, "a transition crosses the title band");
     }
 
     #[test]

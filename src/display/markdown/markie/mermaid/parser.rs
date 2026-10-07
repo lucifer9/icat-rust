@@ -949,27 +949,32 @@ fn parse_state(input: &str) -> Result<StateDiagram, String> {
                     (rest.trim().to_string(), None)
                 };
 
+                // Each composite owns its `[*]` pseudo-states, as in Mermaid.
+                let scoped = |base: &str| match composite_stack.last() {
+                    Some(parent) => format!("{base}{parent}"),
+                    None => base.to_string(),
+                };
                 let normalized_from = if from == "[*]" {
-                    START_STATE_ID.to_string()
+                    scoped(START_STATE_ID)
                 } else {
                     from.clone()
                 };
                 let normalized_to = if to == "[*]" {
-                    END_STATE_ID.to_string()
+                    scoped(END_STATE_ID)
                 } else {
                     to.clone()
                 };
 
                 // Add end state if needed
                 if to == "[*]" {
-                    ensure_state(&mut states, END_STATE_ID, "[*]", false, true, false);
+                    ensure_state(&mut states, &normalized_to, "[*]", false, true, false);
                 }
 
                 // Add states from transition if not already present
                 if from != "[*]" {
                     ensure_state(&mut states, &normalized_from, "", false, false, false);
                 } else {
-                    ensure_state(&mut states, START_STATE_ID, "[*]", true, false, false);
+                    ensure_state(&mut states, &normalized_from, "[*]", true, false, false);
                 }
                 if to != "[*]" {
                     ensure_state(&mut states, &normalized_to, "", false, false, false);
@@ -982,12 +987,8 @@ fn parse_state(input: &str) -> Result<StateDiagram, String> {
                 };
 
                 if let Some(parent_id) = composite_stack.last() {
-                    if from != "[*]" {
-                        add_state_child_state(&mut states, parent_id, &transition.from);
-                    }
-                    if to != "[*]" {
-                        add_state_child_state(&mut states, parent_id, &transition.to);
-                    }
+                    add_state_child_state(&mut states, parent_id, &transition.from);
+                    add_state_child_state(&mut states, parent_id, &transition.to);
                     add_state_child_transition(&mut states, parent_id, &transition);
                 }
 
@@ -1838,6 +1839,37 @@ erDiagram
             st.transitions
                 .iter()
                 .any(|t| t.from == "Idle" && t.to == "Processing")
+        );
+    }
+
+    #[test]
+    fn composite_pseudo_states_belong_to_their_composite() {
+        let st = state(
+            "stateDiagram-v2\n[*] --> Comp\nstate Comp {\n    [*] --> X\n    X --> [*]\n}\nComp --> [*]",
+        );
+        let by_id = st.states_by_id();
+        let comp: Vec<&State> = by_id["Comp"]
+            .child_state_ids()
+            .map(|id| by_id[id])
+            .collect();
+        let inner_start = comp.iter().find(|s| s.is_start).expect("Comp start");
+        let inner_end = comp.iter().find(|s| s.is_end).expect("Comp end");
+        for t in &st.transitions {
+            assert_ne!(
+                t.from, inner_start.id,
+                "top-level transition from Comp's start"
+            );
+            assert_ne!(t.to, inner_end.id, "top-level transition to Comp's end");
+        }
+        assert!(
+            st.transitions
+                .iter()
+                .any(|t| t.to == "Comp" && by_id[t.from.as_str()].is_start)
+        );
+        assert!(
+            st.transitions
+                .iter()
+                .any(|t| t.from == "Comp" && by_id[t.to.as_str()].is_end)
         );
     }
 
