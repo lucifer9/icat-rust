@@ -73,11 +73,18 @@ impl MermaidDiagram {
 // ============================================
 
 fn parse_flowchart(input: &str) -> Flowchart {
-    let mut lines = input.lines().peekable();
+    let mut lines = input.lines();
 
     // Parse direction from first line
     let first_line = lines.next().unwrap_or("");
     let direction = parse_flow_direction(first_line);
+
+    // Mermaid drops comment lines before parsing. The rest is scanned as one
+    // text because node text and links may continue onto the next line.
+    let body = lines
+        .filter(|line| !line.trim_start().starts_with("%%"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let mut nodes: Vec<FlowchartNode> = Vec::new();
     let mut edges: Vec<FlowchartEdge> = Vec::new();
@@ -85,67 +92,68 @@ fn parse_flowchart(input: &str) -> Flowchart {
     let mut current_subgraph: Option<Subgraph> = None;
     let mut edge_ids: Vec<String> = Vec::new();
 
-    for line in lines {
-        let line = line.trim();
-        if line.is_empty() {
+    let mut rest = body.as_str();
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
+        if rest.is_empty() {
+            break;
+        }
+        let statement_start = rest;
+        let end = statement_len(rest);
+        let statement = rest[..end].trim_end();
+        rest = &rest[end..];
+
+        if let Some(header) = subgraph_header(statement) {
+            current_subgraph = Some(Subgraph {
+                title: subgraph_title(header),
+                nodes: Vec::new(),
+            });
             continue;
         }
-
-        // Skip comments
-        if line.starts_with("%%") {
+        if statement == "end" {
+            if let Some(sg) = current_subgraph.take() {
+                subgraphs.push(sg);
+            }
             continue;
         }
-
-        for statement in split_statements(line) {
-            if let Some(header) = subgraph_header(statement) {
-                current_subgraph = Some(Subgraph {
-                    title: subgraph_title(header),
-                    nodes: Vec::new(),
-                });
-                continue;
-            }
-            if statement == "end" {
-                if let Some(sg) = current_subgraph.take() {
-                    subgraphs.push(sg);
-                }
-                continue;
-            }
-            if is_flow_directive(statement) {
-                continue;
-            }
-            let Some(statement) = parse_flow_statement(statement) else {
-                continue;
-            };
-            // As in Mermaid, `e1@{ animate: true }` gives data to the edge
-            // named `e1` rather than declaring a node.
-            if let [group] = statement.groups.as_slice()
-                && let [node] = group.as_slice()
-                && edge_ids.contains(&node.id)
+        if is_flow_directive(statement) {
+            continue;
+        }
+        // Unlike keywords and directives, a node statement may run past the
+        // end of its line.
+        let Some((statement, after)) = parse_flow_statement(statement_start) else {
+            continue;
+        };
+        rest = after;
+        // As in Mermaid, `e1@{ animate: true }` gives data to the edge
+        // named `e1` rather than declaring a node.
+        if let [group] = statement.groups.as_slice()
+            && let [node] = group.as_slice()
+            && edge_ids.contains(&node.id)
+        {
+            continue;
+        }
+        edge_ids.extend(statement.links.iter().filter_map(|link| link.id.clone()));
+        for node in statement.groups.iter().flatten() {
+            upsert_node(&mut nodes, node);
+            if let Some(sg) = &mut current_subgraph
+                && !sg.nodes.contains(&node.id)
             {
-                continue;
+                sg.nodes.push(node.id.clone());
             }
-            edge_ids.extend(statement.links.iter().filter_map(|link| link.id.clone()));
-            for node in statement.groups.iter().flatten() {
-                upsert_node(&mut nodes, node);
-                if let Some(sg) = &mut current_subgraph
-                    && !sg.nodes.contains(&node.id)
-                {
-                    sg.nodes.push(node.id.clone());
-                }
-            }
-            // `A & B --> C` links every node of one group to every node of the next.
-            for (link, pair) in statement.links.iter().zip(statement.groups.windows(2)) {
-                for from in &pair[0] {
-                    for to in &pair[1] {
-                        edges.push(FlowchartEdge {
-                            from: from.id.clone(),
-                            to: to.id.clone(),
-                            label: link.label.clone(),
-                            style: link.style.clone(),
-                            arrow_head: link.head.clone(),
-                            arrow_tail: link.tail.clone(),
-                        });
-                    }
+        }
+        // `A & B --> C` links every node of one group to every node of the next.
+        for (link, pair) in statement.links.iter().zip(statement.groups.windows(2)) {
+            for from in &pair[0] {
+                for to in &pair[1] {
+                    edges.push(FlowchartEdge {
+                        from: from.id.clone(),
+                        to: to.id.clone(),
+                        label: link.label.clone(),
+                        style: link.style.clone(),
+                        arrow_head: link.head.clone(),
+                        arrow_tail: link.tail.clone(),
+                    });
                 }
             }
         }
@@ -247,43 +255,41 @@ fn is_flow_directive(statement: &str) -> bool {
         || keyword.starts_with("accDescr")
 }
 
-/// Split a line at `;` outside node text, link labels, and quotes.
-fn split_statements(line: &str) -> Vec<&str> {
-    let mut statements = Vec::new();
-    let (mut depth, mut quoted, mut piped, mut start) = (0usize, false, false, 0);
-    for (i, c) in line.char_indices() {
+/// Length of the keyword or directive statement at the start of `s`: up to
+/// the end of the line or a `;` outside node text, quotes and link labels.
+fn statement_len(s: &str) -> usize {
+    let (mut depth, mut quoted, mut piped) = (0usize, false, false);
+    for (i, c) in s.char_indices() {
         match c {
+            '\n' => return i,
             '"' => quoted = !quoted,
             _ if quoted => {}
             '[' | '(' | '{' => depth += 1,
             ']' | ')' | '}' => depth = depth.saturating_sub(1),
             '|' if depth == 0 => piped = !piped,
-            ';' if depth == 0 && !piped => {
-                statements.push(line[start..i].trim());
-                start = i + 1;
-            }
+            ';' if depth == 0 && !piped => return i,
             _ => {}
         }
     }
-    statements.push(line[start..].trim());
-    statements.retain(|s| !s.is_empty());
-    statements
+    s.len()
 }
 
-fn parse_flow_statement(statement: &str) -> Option<FlowStatement> {
-    let (first, mut rest) = scan_group(statement)?;
+/// The node statement at the start of `s` and the text after it. As in
+/// Mermaid, a link may end or start a line and joins the lines around it.
+fn parse_flow_statement(s: &str) -> Option<(FlowStatement, &str)> {
+    let (first, mut rest) = scan_group(s)?;
     let mut parsed = FlowStatement {
         groups: vec![first],
         links: Vec::new(),
     };
-    while !rest.trim().is_empty() {
-        let (link, after_link) = scan_link(rest)?;
+    while let Some((link, after_link)) = scan_link(rest) {
         let (group, after_group) = scan_group(after_link)?;
         parsed.links.push(link);
         parsed.groups.push(group);
         rest = after_group;
     }
-    Some(parsed)
+    let rest = rest.trim_start_matches([' ', '\t']);
+    (rest.is_empty() || rest.starts_with(['\n', ';'])).then_some((parsed, rest))
 }
 
 fn scan_group(s: &str) -> Option<(Vec<ParsedNodeInfo>, &str)> {
@@ -336,8 +342,13 @@ fn parse_shape_data(data: &str) -> (Option<String>, Option<NodeShape>) {
     let (mut label, mut shape) = (None, None);
     let mut rest = Some(data);
     while let Some(entries) = rest {
-        let (entry, next) = match find_unquoted(entries, ",") {
-            Some(comma) => (&entries[..comma], Some(&entries[comma + 1..])),
+        // Entries are separated by commas, or by line breaks in multi-line data.
+        let separator = [",", "\n"]
+            .into_iter()
+            .filter_map(|separator| find_unquoted(entries, separator))
+            .min();
+        let (entry, next) = match separator {
+            Some(at) => (&entries[..at], Some(&entries[at + 1..])),
             None => (entries, None),
         };
         rest = next;
@@ -613,7 +624,9 @@ fn normalize_flowchart_label(raw: &str) -> String {
         label = inner.trim().to_string();
     }
 
-    label
+    // Text that continues onto the next line keeps the line break but not the
+    // source indentation.
+    label.lines().map(str::trim).collect::<Vec<_>>().join("\n")
 }
 
 // ============================================
@@ -2544,6 +2557,47 @@ stateDiagram
         assert_eq!(fc.nodes[3].shape, NodeShape::Rhombus);
         assert_eq!(edge_pairs(&fc), [("A", "B"), ("B", "C")]);
         assert_eq!(fc.edges[1].label.as_deref(), Some("text"));
+    }
+
+    #[test]
+    fn flowchart_statements_continue_across_lines() {
+        let fc = flowchart(
+            r#"flowchart TD
+    A["First line
+       second line"] -->
+    B[
+        Bracket text
+    ]
+    B
+    --> C
+
+    C -.->
+    %% a comment between the link and its target
+    D@{
+      shape: diam
+      label: "Multi-line data"
+    }
+    E
+    F"#,
+        );
+        let nodes: Vec<(&str, &str, NodeShape)> = fc
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.label.as_str(), n.shape.clone()))
+            .collect();
+        assert_eq!(
+            nodes,
+            [
+                ("A", "First line\nsecond line", NodeShape::Rect),
+                ("B", "Bracket text", NodeShape::Rect),
+                ("C", "C", NodeShape::Rect),
+                ("D", "Multi-line data", NodeShape::Rhombus),
+                ("E", "E", NodeShape::Rect),
+                ("F", "F", NodeShape::Rect),
+            ]
+        );
+        assert_eq!(edge_pairs(&fc), [("A", "B"), ("B", "C"), ("C", "D")]);
+        assert_eq!(fc.edges[2].style, EdgeStyle::Dotted);
     }
 
     #[test]
