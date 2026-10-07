@@ -95,35 +95,20 @@ fn parse_flowchart(input: &str) -> Flowchart {
             continue;
         }
 
-        // Subgraph start
-        if line.starts_with("subgraph ") {
-            let raw_title = line.strip_prefix("subgraph ").unwrap_or("").trim();
-            let title = if let Some(bracket_pos) = raw_title.find("[\"") {
-                let after = &raw_title[bracket_pos + 2..];
-                if let Some(end) = after.find("\"]") {
-                    after[..end].to_string()
-                } else {
-                    raw_title.to_string()
-                }
-            } else {
-                raw_title.to_string()
-            };
-            current_subgraph = Some(Subgraph {
-                title,
-                nodes: Vec::new(),
-            });
-            continue;
-        }
-
-        // Subgraph end
-        if line == "end" {
-            if let Some(sg) = current_subgraph.take() {
-                subgraphs.push(sg);
-            }
-            continue;
-        }
-
         for statement in split_statements(line) {
+            if let Some(header) = subgraph_header(statement) {
+                current_subgraph = Some(Subgraph {
+                    title: subgraph_title(header),
+                    nodes: Vec::new(),
+                });
+                continue;
+            }
+            if statement == "end" {
+                if let Some(sg) = current_subgraph.take() {
+                    subgraphs.push(sg);
+                }
+                continue;
+            }
             if is_flow_directive(statement) {
                 continue;
             }
@@ -220,6 +205,24 @@ fn upsert_node(nodes: &mut Vec<FlowchartNode>, node: &ParsedNodeInfo) {
             });
         }
     }
+}
+
+/// The rest of a `subgraph` statement, which may be empty.
+fn subgraph_header(statement: &str) -> Option<&str> {
+    statement
+        .strip_prefix("subgraph")
+        .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+/// Title of a subgraph header in any Mermaid form: `id [title]`, `id["title"]`,
+/// `"title"`, `Title with spaces`, or empty for a bare `subgraph`.
+fn subgraph_title(header: &str) -> String {
+    let header = header.trim();
+    let text = match find_unquoted(header, "[") {
+        Some(open) if header.ends_with(']') => &header[open + 1..header.len() - 1],
+        _ => header,
+    };
+    normalize_flowchart_label(text)
 }
 
 /// Statements that style or annotate nodes without declaring any.
@@ -2296,6 +2299,57 @@ stateDiagram
             ]
         );
         assert!(fc.edges.iter().all(|e| e.arrow_tail == ArrowType::None));
+    }
+
+    #[test]
+    fn subgraph_titles_parse_in_every_mermaid_form() {
+        let fc = flowchart(
+            r#"flowchart TD
+    subgraph one [First]
+        A
+    end
+    subgraph two[Second]
+        B
+    end
+    subgraph three["Third one"];
+        C
+    end;
+    subgraph "Quoted title"
+        D
+    end
+    subgraph "vim" [vim/]
+        E
+    end
+    subgraph Title With Spaces
+        F
+    end
+    subgraph
+        G
+    end"#,
+        );
+        let subgraphs: Vec<(&str, Vec<&str>)> = fc
+            .subgraphs
+            .iter()
+            .map(|sg| {
+                (
+                    sg.title.as_str(),
+                    sg.nodes.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            subgraphs,
+            [
+                ("First", vec!["A"]),
+                ("Second", vec!["B"]),
+                ("Third one", vec!["C"]),
+                ("Quoted title", vec!["D"]),
+                ("vim/", vec!["E"]),
+                ("Title With Spaces", vec!["F"]),
+                ("", vec!["G"]),
+            ]
+        );
+        assert_eq!(node_ids(&fc), ["A", "B", "C", "D", "E", "F", "G"]);
     }
 
     #[test]
