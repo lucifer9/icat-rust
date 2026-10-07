@@ -85,6 +85,7 @@ pub fn render_math<T: TextMeasure>(
         measure,
         color: text_color,
         extents: HashMap::new(),
+        widths: HashMap::new(),
     }
     .layout(&root, font_size, 0.0, 0.0);
 
@@ -395,6 +396,10 @@ struct MathLayout<'a, T: TextMeasure> {
     color: &'a str,
     // Keyed by node address: the tree stays borrowed and unmoved for the render.
     extents: HashMap<(*const MathNode, u32), Extent>,
+    // Text widths by `(text, font size bits, italic)`. Each leaf is still laid
+    // out once for every ancestor that sizes it, and text shaping dominates
+    // that cost.
+    widths: HashMap<(String, u32, bool), f32>,
 }
 
 impl<T: TextMeasure> MathLayout<'_, T> {
@@ -680,9 +685,11 @@ impl<T: TextMeasure> MathLayout<'_, T> {
             MathFont::SansSerif => ("sans-serif", ""),
         };
         let italic = matches!(font, MathFont::SerifItalic);
-        let width =
+        let key = (sanitize_xml_text(text), font_size.to_bits(), italic);
+        let width = *self.widths.entry(key).or_insert_with_key(|(text, _, _)| {
             self.measure
-                .measure_width(&sanitize_xml_text(text), font_size, false, false, italic);
+                .measure_width(text, font_size, false, false, italic)
+        });
         let svg = format!(
             r#"<text x="{:.2}" y="{:.2}" font-family="{}" font-size="{:.2}" fill="{}"{}>{}</text>"#,
             x,
@@ -1261,6 +1268,45 @@ mod tests {
                 _ => panic!("row {y}: {{ ink {open_span:?} vs mirrored }} ink {close_span:?}"),
             }
         }
+    }
+
+    /// Records how often each `(text, font size, italic)` run is measured.
+    #[derive(Default)]
+    struct CountingMeasure {
+        calls: HashMap<(String, u32, bool), usize>,
+    }
+
+    impl TextMeasure for CountingMeasure {
+        fn measure_width(
+            &mut self,
+            text: &str,
+            font_size: f32,
+            is_code: bool,
+            is_bold: bool,
+            is_italic: bool,
+        ) -> f32 {
+            *self
+                .calls
+                .entry((text.to_string(), font_size.to_bits(), is_italic))
+                .or_default() += 1;
+            MockMeasure.measure_width(text, font_size, is_code, is_bold, is_italic)
+        }
+    }
+
+    #[test]
+    fn nested_fractions_measure_each_text_run_once() {
+        let mut latex = "x".to_string();
+        for _ in 0..8 {
+            latex = format!(r"1 + \frac{{1}}{{{latex}}}");
+        }
+        let mut measure = CountingMeasure::default();
+        render_math(&latex, 16.0, "#000000", &mut measure, true).unwrap();
+
+        let repeated: Vec<_> = measure.calls.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(
+            repeated.is_empty(),
+            "runs measured more than once: {repeated:?}"
+        );
     }
 
     #[test]
