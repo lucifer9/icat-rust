@@ -773,7 +773,6 @@ impl<T: TextMeasure> MathLayout<'_, T> {
         let stroke_width = (font_size * 0.075).clamp(1.0, 2.0);
         let top = baseline_y - target_ascent;
         let bottom = baseline_y + target_descent;
-        let mid = baseline_y + (target_descent - target_ascent) * 0.08;
         let left = x + stroke_width;
         let right = x + width - stroke_width;
         let d = match op {
@@ -793,24 +792,8 @@ impl<T: TextMeasure> MathLayout<'_, T> {
                 top + height * 0.24,
                 bottom - height * 0.24
             ),
-            "{" => format!(
-                "M {right:.2} {top:.2} C {left:.2} {top:.2} {left:.2} {:.2} {:.2} {:.2} C {:.2} {:.2} {left:.2} {:.2} {right:.2} {bottom:.2}",
-                mid - height * 0.16,
-                x + width * 0.48,
-                mid,
-                x + width * 0.48,
-                mid,
-                mid + height * 0.16
-            ),
-            "}" => format!(
-                "M {left:.2} {top:.2} C {right:.2} {top:.2} {right:.2} {:.2} {:.2} {:.2} C {:.2} {:.2} {right:.2} {:.2} {left:.2} {bottom:.2}",
-                mid - height * 0.16,
-                x + width * 0.52,
-                mid,
-                x + width * 0.52,
-                mid,
-                mid + height * 0.16
-            ),
+            "{" => brace_path(right, left, x + width / 2.0, top, bottom),
+            "}" => brace_path(left, right, x + width / 2.0, top, bottom),
             "|" | "‖" => format!(
                 "M {:.2} {top:.2} L {:.2} {bottom:.2}",
                 x + width / 2.0,
@@ -996,6 +979,33 @@ struct StretchedDelimiterLayout {
     baseline_y: f32,
     target_ascent: f32,
     target_descent: f32,
+}
+
+/// Draws a curly brace whose arms curl toward `end_x` and whose cusp points
+/// at `tip_x` halfway down. Each curl is a quarter circle of radius `r`
+/// (control points at the usual 0.55 offset), so both halves mirror each other.
+fn brace_path(end_x: f32, tip_x: f32, spine_x: f32, top: f32, bottom: f32) -> String {
+    const K: f32 = 0.55;
+    let mid = (top + bottom) / 2.0;
+    let r = (end_x - spine_x).abs().min((bottom - top) / 4.0);
+    let (end_c, tip_c) = (
+        spine_x + (end_x - spine_x) * K,
+        spine_x + (tip_x - spine_x) * K,
+    );
+    format!(
+        "M {end_x:.2} {top:.2} C {end_c:.2} {top:.2} {spine_x:.2} {:.2} {spine_x:.2} {:.2} \
+         L {spine_x:.2} {:.2} C {spine_x:.2} {:.2} {tip_c:.2} {mid:.2} {tip_x:.2} {mid:.2} \
+         C {tip_c:.2} {mid:.2} {spine_x:.2} {:.2} {spine_x:.2} {:.2} \
+         L {spine_x:.2} {:.2} C {spine_x:.2} {:.2} {end_c:.2} {bottom:.2} {end_x:.2} {bottom:.2}",
+        top + r * (1.0 - K),
+        top + r,
+        mid - r,
+        mid - r * (1.0 - K),
+        mid + r * (1.0 - K),
+        mid + r,
+        bottom - r,
+        bottom - r * (1.0 - K),
+    )
 }
 
 fn is_supported_stretched_delimiter(op: &str) -> bool {
@@ -1206,31 +1216,51 @@ mod tests {
             let image = rasterize(&result);
             (result, image)
         };
-        let (open, open_image) = render(r"\left\{\begin{matrix}a\\b\\c\end{matrix}\right.");
+        let (_, open_image) = render(r"\left\{\begin{matrix}a\\b\\c\end{matrix}\right.");
         let (close, close_image) = render(r"\left.\begin{matrix}a\\b\\c\end{matrix}\right\}");
         let close_x0 = close.width - width;
 
-        // The matrix is centered on the baseline, so the tip sits on it.
-        let mid_row = (open.ascent + RASTER_PAD) as u32;
         let rows: Vec<u32> = (0..open_image.height())
             .filter(|&y| ink_span(&open_image, y, 0.0, width).is_some())
             .collect();
         let (top_row, bottom_row) = (rows[0], rows[rows.len() - 1]);
+        let span = |y: u32| ink_span(&open_image, y, 0.0, width).unwrap();
 
-        // `{`: the ends curl to the right edge and the tip sits at 0.48 of the
-        // width; `}` mirrors it.
-        let (left, right) = ink_span(&open_image, mid_row, 0.0, width).unwrap();
-        let tip = (left + right) / 2.0;
+        // `{`: the arms curl to the right edge, run down the middle, and meet
+        // in a cusp at the left edge halfway down.
+        let (left, _) = span((top_row + bottom_row) / 2);
         assert!(
-            (tip - width * 0.48).abs() <= 1.5,
-            "{{ tip at {tip}, expected near {}",
-            width * 0.48
+            left <= width * 0.15,
+            "{{ tip starts at {left}, expected at the left edge"
         );
         for y in [top_row, bottom_row] {
-            let (left, right) = ink_span(&open_image, y, 0.0, width).unwrap();
+            let (left, right) = span(y);
             assert!(
-                left >= width * 0.5 && right >= width * 0.85,
+                left >= width * 0.4 && right >= width * 0.85,
                 "{{ end at row {y} spans {left}..{right}, expected at the right edge"
+            );
+        }
+        let quarter = (bottom_row - top_row) / 4;
+        for y in [top_row + quarter, bottom_row - quarter] {
+            let (left, right) = span(y);
+            let centre = (left + right) / 2.0;
+            assert!(
+                (centre - width / 2.0).abs() <= width * 0.1,
+                "{{ arm at row {y} centred at {centre}, expected near {}",
+                width / 2.0
+            );
+        }
+        // Antialiasing can shift the lower half by a row, so each row may
+        // match any of the three rows around its mirror image.
+        for y in top_row + 1..bottom_row {
+            let upper = span(y);
+            let mirror = top_row + bottom_row - y;
+            assert!(
+                (mirror - 1..=mirror + 1).any(|m| {
+                    let lower = span(m);
+                    (upper.0 - lower.0).abs() <= 1.0 && (upper.1 - lower.1).abs() <= 1.0
+                }),
+                "row {y}: upper half {upper:?} does not mirror lower half near row {mirror}"
             );
         }
 
