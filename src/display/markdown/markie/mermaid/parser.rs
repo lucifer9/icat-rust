@@ -83,6 +83,7 @@ fn parse_flowchart(input: &str) -> Flowchart {
     let mut edges: Vec<FlowchartEdge> = Vec::new();
     let mut subgraphs: Vec<Subgraph> = Vec::new();
     let mut current_subgraph: Option<Subgraph> = None;
+    let mut edge_ids: Vec<String> = Vec::new();
 
     for line in lines {
         let line = line.trim();
@@ -115,6 +116,15 @@ fn parse_flowchart(input: &str) -> Flowchart {
             let Some(statement) = parse_flow_statement(statement) else {
                 continue;
             };
+            // As in Mermaid, `e1@{ animate: true }` gives data to the edge
+            // named `e1` rather than declaring a node.
+            if let [group] = statement.groups.as_slice()
+                && let [node] = group.as_slice()
+                && edge_ids.contains(&node.id)
+            {
+                continue;
+            }
+            edge_ids.extend(statement.links.iter().filter_map(|link| link.id.clone()));
             for node in statement.groups.iter().flatten() {
                 upsert_node(&mut nodes, node);
                 if let Some(sg) = &mut current_subgraph
@@ -164,15 +174,17 @@ fn parse_flow_direction(line: &str) -> FlowDirection {
     }
 }
 
-/// A node as written in a statement.
+/// A node as written in a statement. The label and shape come from `id[text]`
+/// or `id@{ … }` data; `None` keeps whatever the node was given elsewhere.
 struct ParsedNodeInfo {
     id: String,
-    /// Label and shape from `id[text]`; `None` for a bare `id`, which keeps
-    /// whatever the node was given elsewhere.
-    shape: Option<(String, NodeShape)>,
+    label: Option<String>,
+    shape: Option<NodeShape>,
 }
 
 struct ParsedLink {
+    /// `e1` in `A e1@--> B`.
+    id: Option<String>,
     style: EdgeStyle,
     head: ArrowType,
     tail: ArrowType,
@@ -186,24 +198,24 @@ struct FlowStatement {
 }
 
 fn upsert_node(nodes: &mut Vec<FlowchartNode>, node: &ParsedNodeInfo) {
-    let existing = nodes.iter_mut().find(|n| n.id == node.id);
-    match (existing, &node.shape) {
-        // As in Mermaid, the last text given for a node wins.
-        (Some(existing), Some((label, shape))) => {
-            existing.label = label.clone();
-            existing.shape = shape.clone();
-        }
-        (Some(_), None) => {}
-        (None, shape) => {
-            let (label, shape) = shape
-                .clone()
-                .unwrap_or_else(|| (node.id.clone(), NodeShape::Rect));
+    let index = match nodes.iter().position(|n| n.id == node.id) {
+        Some(index) => index,
+        None => {
             nodes.push(FlowchartNode {
                 id: node.id.clone(),
-                label,
-                shape,
+                label: node.id.clone(),
+                shape: NodeShape::Rect,
             });
+            nodes.len() - 1
         }
+    };
+    // As in Mermaid, the last text and shape given for a node win.
+    let existing = &mut nodes[index];
+    if let Some(label) = &node.label {
+        existing.label = label.clone();
+    }
+    if let Some(shape) = &node.shape {
+        existing.shape = shape.clone();
     }
 }
 
@@ -292,21 +304,85 @@ fn scan_node(s: &str) -> Option<(ParsedNodeInfo, &str)> {
         return None;
     }
     let shape_end = id_end + shape_len(&s[id_end..]);
-    let shape = if shape_end > id_end {
-        Some(parse_shape(&s[id_end..shape_end])?)
+    let (mut label, mut shape) = if shape_end > id_end {
+        let (label, shape) = parse_shape(&s[id_end..shape_end])?;
+        (Some(label), Some(shape))
     } else {
-        None
+        (None, None)
     };
     let mut rest = &s[shape_end..];
     // `A:::className` only styles the node.
     if let Some(after) = rest.strip_prefix(":::") {
         rest = &after[id_len(after)..];
     }
+    // As in Mermaid's lexer, the data ends at the first `}` outside quotes.
+    if let Some(after) = rest.strip_prefix("@{") {
+        let end = find_unquoted(after, "}")?;
+        let (data_label, data_shape) = parse_shape_data(&after[..end]);
+        label = data_label.or(label);
+        shape = data_shape.or(shape);
+        rest = &after[end + 1..];
+    }
     let node = ParsedNodeInfo {
         id: s[..id_end].to_string(),
+        label,
         shape,
     };
     Some((node, rest))
+}
+
+/// Label and shape from node data such as `shape: diam, label: "Text"`.
+fn parse_shape_data(data: &str) -> (Option<String>, Option<NodeShape>) {
+    let (mut label, mut shape) = (None, None);
+    let mut rest = Some(data);
+    while let Some(entries) = rest {
+        let (entry, next) = match find_unquoted(entries, ",") {
+            Some(comma) => (&entries[..comma], Some(&entries[comma + 1..])),
+            None => (entries, None),
+        };
+        rest = next;
+        let Some((key, value)) = entry.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        let value = ['"', '\'']
+            .into_iter()
+            .find_map(|q| value.strip_prefix(q)?.strip_suffix(q))
+            .unwrap_or(value);
+        match key.trim() {
+            // Mermaid ignores an empty label.
+            "label" if !value.is_empty() => label = Some(normalize_flowchart_label(value)),
+            "shape" => shape = Some(data_shape(value)),
+            _ => {}
+        }
+    }
+    (label, shape)
+}
+
+/// The shape drawn for a Mermaid shape name or alias from `@{ shape: … }`.
+/// Names without an equivalent here, such as `text` or `doc`, draw as a
+/// rectangle; the small start and stop circles draw as labelled circles.
+fn data_shape(name: &str) -> NodeShape {
+    match name {
+        "rounded" | "event" => NodeShape::RoundedRect,
+        "stadium" | "terminal" | "pill" => NodeShape::Stadium,
+        "fr-rect" | "subprocess" | "subproc" | "framed-rectangle" | "subroutine" => {
+            NodeShape::Subroutine
+        }
+        "cyl" | "db" | "database" | "cylinder" => NodeShape::Cylinder,
+        "circle" | "circ" | "sm-circ" | "start" | "small-circle" | "f-circ" | "junction"
+        | "filled-circle" | "cross-circ" | "summary" | "crossed-circle" => NodeShape::Circle,
+        "dbl-circ" | "double-circle" | "doublecircle" | "fr-circ" | "stop" | "framed-circle" => {
+            NodeShape::DoubleCircle
+        }
+        "diam" | "decision" | "diamond" | "question" => NodeShape::Rhombus,
+        "hex" | "hexagon" | "prepare" => NodeShape::Hexagon,
+        "lean-r" | "lean-right" | "in-out" => NodeShape::Parallelogram,
+        "lean-l" | "lean-left" | "out-in" => NodeShape::ParallelogramAlt,
+        "trap-b" | "priority" | "trapezoid-bottom" | "trapezoid" => NodeShape::Trapezoid,
+        "trap-t" | "manual" | "trapezoid-top" | "inv-trapezoid" => NodeShape::TrapezoidAlt,
+        _ => NodeShape::Rect,
+    }
 }
 
 /// Length of the node id at the start of `s`, using the characters of
@@ -459,18 +535,22 @@ fn arrow_tail(start: Option<char>, end: char) -> Option<ArrowType> {
 
 fn scan_link(s: &str) -> Option<(ParsedLink, &str)> {
     let mut s = s.trim_start();
-    // An edge id such as `e1@-->` only names the edge.
+    let mut id = None;
+    // An edge id such as `e1@-->` names the edge for later `e1@{ … }` data.
     if let Some(at) = s.find('@')
         && at > 0
         && id_len(s) == at
     {
+        id = Some(s[..at].to_string());
         s = &s[at + 1..];
     }
     let (token, rest) = scan_link_token(s)?;
     let Some(end) = token.end else {
-        return scan_text_link(&token, rest);
+        let (link, rest) = scan_text_link(&token, rest)?;
+        return Some((ParsedLink { id, ..link }, rest));
     };
     let link = ParsedLink {
+        id,
         head: arrow_type(end),
         // Mermaid ignores a start character that does not match the end.
         tail: arrow_tail(token.start, end).unwrap_or(ArrowType::None),
@@ -507,6 +587,7 @@ fn scan_text_link<'a>(opener: &LinkToken, rest: &'a str) -> Option<(ParsedLink, 
     };
     let text = rest[..text_end].trim();
     let link = ParsedLink {
+        id: None,
         style: closer.style,
         head: arrow_type(end),
         tail,
@@ -2393,6 +2474,76 @@ stateDiagram
         );
         assert_eq!(fc.edges[0].style, EdgeStyle::Dotted);
         assert_eq!(fc.edges[3].style, EdgeStyle::Thick);
+    }
+
+    #[test]
+    fn node_data_sets_shape_and_label() {
+        let fc = flowchart(
+            r#"flowchart TD
+    A@{ shape: diam, label: "Is it, really?" }
+    B@{ shape: cyl } --> C@{ label: 'Plain' }
+    D[Kept text]
+    D@{ shape: lean-l }
+    E@{}
+    F@{ shape: no-such-shape, label: Unquoted label }
+    G:::warn@{ shape: stadium }
+    H@{ shape: fr-rect } & I@{ shape: hex } --> J
+    K[Old]@{ label: "New" }"#,
+        );
+        let expected = [
+            ("A", "Is it, really?", NodeShape::Rhombus),
+            ("B", "B", NodeShape::Cylinder),
+            ("C", "Plain", NodeShape::Rect),
+            ("D", "Kept text", NodeShape::ParallelogramAlt),
+            ("E", "E", NodeShape::Rect),
+            ("F", "Unquoted label", NodeShape::Rect),
+            ("G", "G", NodeShape::Stadium),
+            ("H", "H", NodeShape::Subroutine),
+            ("I", "I", NodeShape::Hexagon),
+            ("J", "J", NodeShape::Rect),
+            ("K", "New", NodeShape::Rect),
+        ];
+        let nodes: Vec<(&str, &str, NodeShape)> = fc
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n.label.as_str(), n.shape.clone()))
+            .collect();
+        assert_eq!(nodes, expected);
+        assert_eq!(edge_pairs(&fc), [("B", "C"), ("H", "J"), ("I", "J")]);
+    }
+
+    #[test]
+    fn node_data_shape_aliases_match_mermaid() {
+        for (name, shape) in [
+            ("rounded", NodeShape::RoundedRect),
+            ("pill", NodeShape::Stadium),
+            ("subroutine", NodeShape::Subroutine),
+            ("database", NodeShape::Cylinder),
+            ("circle", NodeShape::Circle),
+            ("double-circle", NodeShape::DoubleCircle),
+            ("decision", NodeShape::Rhombus),
+            ("hexagon", NodeShape::Hexagon),
+            ("lean-r", NodeShape::Parallelogram),
+            ("out-in", NodeShape::ParallelogramAlt),
+            ("trap-b", NodeShape::Trapezoid),
+            ("manual", NodeShape::TrapezoidAlt),
+            ("text", NodeShape::Rect),
+        ] {
+            let fc = flowchart(&format!("flowchart TD\n    A@{{ shape: {name} }}"));
+            assert_eq!(fc.nodes[0].shape, shape, "{name}");
+        }
+    }
+
+    #[test]
+    fn edge_data_does_not_declare_nodes() {
+        let fc = flowchart(
+            "flowchart LR\n    A e1@--> B\n    B e2@-- text --> C\n    e1@{ animate: true }\n    e2@{ animate: true }\n    e3@{ shape: diam }",
+        );
+        // `e3` names no edge, so its data declares a node, as in Mermaid.
+        assert_eq!(node_ids(&fc), ["A", "B", "C", "e3"]);
+        assert_eq!(fc.nodes[3].shape, NodeShape::Rhombus);
+        assert_eq!(edge_pairs(&fc), [("A", "B"), ("B", "C")]);
+        assert_eq!(fc.edges[1].label.as_deref(), Some("text"));
     }
 
     #[test]
