@@ -83,8 +83,6 @@ fn parse_flowchart(input: &str) -> Flowchart {
     let mut edges: Vec<FlowchartEdge> = Vec::new();
     let mut subgraphs: Vec<Subgraph> = Vec::new();
     let mut current_subgraph: Option<Subgraph> = None;
-    let mut node_labels: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
 
     for line in lines {
         let line = line.trim();
@@ -125,55 +123,35 @@ fn parse_flowchart(input: &str) -> Flowchart {
             continue;
         }
 
-        // Try to parse as edge or node definition
-        if let Some(parsed) = parse_edge_line(line) {
-            // Register nodes if not already present (with full info including label and shape)
-            if !node_labels.contains_key(&parsed.from.id) {
-                nodes.push(FlowchartNode {
-                    id: parsed.from.id.clone(),
-                    label: parsed.from.label.clone(),
-                    shape: parsed.from.shape,
-                });
-                node_labels.insert(parsed.from.id.clone(), parsed.from.label.clone());
+        for statement in split_statements(line) {
+            if is_flow_directive(statement) {
+                continue;
             }
-            if !node_labels.contains_key(&parsed.to.id) {
-                nodes.push(FlowchartNode {
-                    id: parsed.to.id.clone(),
-                    label: parsed.to.label.clone(),
-                    shape: parsed.to.shape,
-                });
-                node_labels.insert(parsed.to.id.clone(), parsed.to.label.clone());
-            }
-
-            // Add edge endpoint nodes to current subgraph if inside one
-            if let Some(ref mut sg) = current_subgraph {
-                if !sg.nodes.contains(&parsed.from.id) {
-                    sg.nodes.push(parsed.from.id.clone());
-                }
-                if !sg.nodes.contains(&parsed.to.id) {
-                    sg.nodes.push(parsed.to.id.clone());
+            let Some(statement) = parse_flow_statement(statement) else {
+                continue;
+            };
+            for node in statement.groups.iter().flatten() {
+                upsert_node(&mut nodes, node);
+                if let Some(sg) = &mut current_subgraph
+                    && !sg.nodes.contains(&node.id)
+                {
+                    sg.nodes.push(node.id.clone());
                 }
             }
-
-            edges.push(FlowchartEdge {
-                from: parsed.from.id,
-                to: parsed.to.id,
-                label: parsed.label,
-                style: parsed.style,
-                arrow_head: parsed.arrow_head,
-                arrow_tail: parsed.arrow_tail,
-            });
-        } else if let Some((id, label, shape)) = extract_shaped_node(line) {
-            nodes.push(FlowchartNode {
-                id: id.clone(),
-                label: label.clone(),
-                shape,
-            });
-            node_labels.insert(id.clone(), label);
-
-            // Add to current subgraph if in one
-            if let Some(ref mut sg) = current_subgraph {
-                sg.nodes.push(id);
+            // `A & B --> C` links every node of one group to every node of the next.
+            for (link, pair) in statement.links.iter().zip(statement.groups.windows(2)) {
+                for from in &pair[0] {
+                    for to in &pair[1] {
+                        edges.push(FlowchartEdge {
+                            from: from.id.clone(),
+                            to: to.id.clone(),
+                            label: link.label.clone(),
+                            style: link.style.clone(),
+                            arrow_head: link.head.clone(),
+                            arrow_tail: link.tail.clone(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -201,186 +179,180 @@ fn parse_flow_direction(line: &str) -> FlowDirection {
     }
 }
 
+/// A node as written in a statement.
 struct ParsedNodeInfo {
     id: String,
-    label: String,
-    shape: NodeShape,
+    /// Label and shape from `id[text]`; `None` for a bare `id`, which keeps
+    /// whatever the node was given elsewhere.
+    shape: Option<(String, NodeShape)>,
 }
 
-struct ParsedEdgeLine {
-    from: ParsedNodeInfo,
-    to: ParsedNodeInfo,
-    label: Option<String>,
+struct ParsedLink {
     style: EdgeStyle,
-    arrow_head: ArrowType,
-    arrow_tail: ArrowType,
+    head: ArrowType,
+    tail: ArrowType,
+    label: Option<String>,
 }
 
-fn parse_edge_line(line: &str) -> Option<ParsedEdgeLine> {
-    // Edge patterns (order matters - longer patterns first)
-    let patterns = [
-        ("<==>", EdgeStyle::Thick, ArrowType::Arrow, ArrowType::Arrow),
-        ("<-->", EdgeStyle::Solid, ArrowType::Arrow, ArrowType::Arrow),
-        (
-            "<.->",
-            EdgeStyle::Dotted,
-            ArrowType::Arrow,
-            ArrowType::Arrow,
-        ),
-        ("x==x", EdgeStyle::Thick, ArrowType::Cross, ArrowType::Cross),
-        (
-            "o==o",
-            EdgeStyle::Thick,
-            ArrowType::Circle,
-            ArrowType::Circle,
-        ),
-        ("x--x", EdgeStyle::Solid, ArrowType::Cross, ArrowType::Cross),
-        (
-            "o--o",
-            EdgeStyle::Solid,
-            ArrowType::Circle,
-            ArrowType::Circle,
-        ),
-        (
-            "x-.x",
-            EdgeStyle::Dotted,
-            ArrowType::Cross,
-            ArrowType::Cross,
-        ),
-        (
-            "o-.o",
-            EdgeStyle::Dotted,
-            ArrowType::Circle,
-            ArrowType::Circle,
-        ),
-        ("<==", EdgeStyle::Thick, ArrowType::None, ArrowType::Arrow),
-        ("<--", EdgeStyle::Solid, ArrowType::None, ArrowType::Arrow),
-        ("<-.", EdgeStyle::Dotted, ArrowType::None, ArrowType::Arrow),
-        (
-            "o-->",
-            EdgeStyle::Solid,
-            ArrowType::Arrow,
-            ArrowType::Circle,
-        ),
-        (
-            "--o>",
-            EdgeStyle::Solid,
-            ArrowType::Arrow,
-            ArrowType::Circle,
-        ),
-        (
-            "o==>",
-            EdgeStyle::Thick,
-            ArrowType::Arrow,
-            ArrowType::Circle,
-        ),
-        (
-            "o-.->",
-            EdgeStyle::Dotted,
-            ArrowType::Arrow,
-            ArrowType::Circle,
-        ),
-        ("==o", EdgeStyle::Thick, ArrowType::Circle, ArrowType::None),
-        ("==x", EdgeStyle::Thick, ArrowType::Cross, ArrowType::None),
-        ("o==", EdgeStyle::Thick, ArrowType::None, ArrowType::Circle),
-        ("x==", EdgeStyle::Thick, ArrowType::None, ArrowType::Cross),
-        ("==>", EdgeStyle::Thick, ArrowType::Arrow, ArrowType::None),
-        ("--x", EdgeStyle::Solid, ArrowType::Cross, ArrowType::None),
-        ("x--", EdgeStyle::Solid, ArrowType::None, ArrowType::Cross),
-        ("--o", EdgeStyle::Solid, ArrowType::Circle, ArrowType::None),
-        ("o--", EdgeStyle::Solid, ArrowType::None, ArrowType::Circle),
-        ("-.->", EdgeStyle::Dotted, ArrowType::Arrow, ArrowType::None),
-        ("-.x", EdgeStyle::Dotted, ArrowType::Cross, ArrowType::None),
-        ("x-.", EdgeStyle::Dotted, ArrowType::None, ArrowType::Cross),
-        ("-.o", EdgeStyle::Dotted, ArrowType::Circle, ArrowType::None),
-        ("o-.", EdgeStyle::Dotted, ArrowType::None, ArrowType::Circle),
-        ("-.-", EdgeStyle::Dotted, ArrowType::None, ArrowType::None),
-        ("-->", EdgeStyle::Solid, ArrowType::Arrow, ArrowType::None),
-        ("---", EdgeStyle::Solid, ArrowType::None, ArrowType::None),
-        ("->>", EdgeStyle::Solid, ArrowType::Arrow, ArrowType::Arrow),
-        ("->", EdgeStyle::Solid, ArrowType::Arrow, ArrowType::None),
-        ("--", EdgeStyle::Solid, ArrowType::None, ArrowType::None),
-    ];
+/// `group (link group)*`, where a group is `node (& node)*`.
+struct FlowStatement {
+    groups: Vec<Vec<ParsedNodeInfo>>,
+    links: Vec<ParsedLink>,
+}
 
-    for (pattern, style, head, tail) in &patterns {
-        if let Some(pos) = line.find(pattern) {
-            let from_part = line[..pos].trim();
-            let rest = &line[pos + pattern.len()..];
-
-            // Parse optional label
-            let (to_part, label) = if let Some(stripped) = rest.strip_prefix('|') {
-                // Label before target: A -->|label| B
-                if let Some(end_label) = stripped.find('|') {
-                    let label_text = stripped[..end_label].trim();
-                    let after_label = stripped[end_label + 1..].trim();
-                    (after_label, Some(label_text.to_string()))
-                } else {
-                    (rest.trim(), None)
-                }
-            } else {
-                // No label, just target
-                (rest.trim(), None)
-            };
-
-            // Extract full node info (id, label, shape)
-            let from_info = extract_node_info(from_part)?;
-            let to_info = extract_node_info(to_part)?;
-
-            return Some(ParsedEdgeLine {
-                from: ParsedNodeInfo {
-                    id: from_info.0,
-                    label: from_info.1,
-                    shape: from_info.2,
-                },
-                to: ParsedNodeInfo {
-                    id: to_info.0,
-                    label: to_info.1,
-                    shape: to_info.2,
-                },
+fn upsert_node(nodes: &mut Vec<FlowchartNode>, node: &ParsedNodeInfo) {
+    let existing = nodes.iter_mut().find(|n| n.id == node.id);
+    match (existing, &node.shape) {
+        // As in Mermaid, the last text given for a node wins.
+        (Some(existing), Some((label, shape))) => {
+            existing.label = label.clone();
+            existing.shape = shape.clone();
+        }
+        (Some(_), None) => {}
+        (None, shape) => {
+            let (label, shape) = shape
+                .clone()
+                .unwrap_or_else(|| (node.id.clone(), NodeShape::RoundedRect));
+            nodes.push(FlowchartNode {
+                id: node.id.clone(),
                 label,
-                style: style.clone(),
-                arrow_head: head.clone(),
-                arrow_tail: tail.clone(),
+                shape,
             });
         }
     }
-
-    None
 }
 
-fn extract_node_id(part: &str) -> Option<String> {
-    let part = part.trim();
+/// Statements that style or annotate nodes without declaring any.
+fn is_flow_directive(statement: &str) -> bool {
+    let keyword = statement.split_whitespace().next().unwrap_or("");
+    matches!(
+        keyword,
+        "style" | "linkStyle" | "classDef" | "class" | "click" | "direction"
+    ) || keyword.starts_with("accTitle")
+        || keyword.starts_with("accDescr")
+}
 
-    // An unterminated shape like `A[Label` still names node `A`.
-    if let Some(pos) = part.find(['[', '(', '{', '<']) {
-        return Some(part[..pos].trim().to_string());
+/// Split a line at `;` outside node text, link labels, and quotes.
+fn split_statements(line: &str) -> Vec<&str> {
+    let mut statements = Vec::new();
+    let (mut depth, mut quoted, mut piped, mut start) = (0usize, false, false, 0);
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => piped = !piped,
+            ';' if depth == 0 && !piped => {
+                statements.push(line[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
     }
-
-    // Simple node id - alphanumeric and underscores
-    let id: String = part
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-
-    if id.is_empty() { None } else { Some(id) }
+    statements.push(line[start..].trim());
+    statements.retain(|s| !s.is_empty());
+    statements
 }
 
-/// Extract node ID, label, and shape from a part of an edge definition
-fn extract_node_info(part: &str) -> Option<(String, String, NodeShape)> {
-    if let Some(shaped) = extract_shaped_node(part) {
-        return Some(shaped);
+fn parse_flow_statement(statement: &str) -> Option<FlowStatement> {
+    let (first, mut rest) = scan_group(statement)?;
+    let mut parsed = FlowStatement {
+        groups: vec![first],
+        links: Vec::new(),
+    };
+    while !rest.trim().is_empty() {
+        let (link, after_link) = scan_link(rest)?;
+        let (group, after_group) = scan_group(after_link)?;
+        parsed.links.push(link);
+        parsed.groups.push(group);
+        rest = after_group;
     }
-
-    // Simple node - just an ID
-    let id = extract_node_id(part)?;
-    Some((id.clone(), id, NodeShape::RoundedRect))
+    Some(parsed)
 }
 
-/// Parse a node written with an explicit shape, such as `id[Label]` or `id{Label}`.
-fn extract_shaped_node(part: &str) -> Option<(String, String, NodeShape)> {
-    let part = part.trim();
+fn scan_group(s: &str) -> Option<(Vec<ParsedNodeInfo>, &str)> {
+    let (node, mut rest) = scan_node(s)?;
+    let mut group = vec![node];
+    while let Some(after_amp) = rest.trim_start().strip_prefix('&') {
+        let (node, after) = scan_node(after_amp)?;
+        group.push(node);
+        rest = after;
+    }
+    Some((group, rest))
+}
 
-    // Order matters: check longer patterns first
+fn scan_node(s: &str) -> Option<(ParsedNodeInfo, &str)> {
+    let s = s.trim_start();
+    let id_end = id_len(s);
+    if id_end == 0 {
+        return None;
+    }
+    let shape_end = id_end + shape_len(&s[id_end..]);
+    let shape = if shape_end > id_end {
+        Some(parse_shape(&s[id_end..shape_end])?)
+    } else {
+        None
+    };
+    let mut rest = &s[shape_end..];
+    // `A:::className` only styles the node.
+    if let Some(after) = rest.strip_prefix(":::") {
+        rest = &after[id_len(after)..];
+    }
+    let node = ParsedNodeInfo {
+        id: s[..id_end].to_string(),
+        shape,
+    };
+    Some((node, rest))
+}
+
+/// Length of the node id at the start of `s`. As in Mermaid, an id may contain
+/// `-`, but not where the `-` starts a link such as `A-->B` or `A-.->B`.
+fn id_len(s: &str) -> usize {
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let next = chars.peek().map(|&(_, next)| next);
+        let in_id = c.is_alphanumeric()
+            || c == '_'
+            || (c == '-' && !matches!(next, None | Some('-' | '>' | '.')));
+        if !in_id {
+            return i;
+        }
+    }
+    s.len()
+}
+
+/// Length of the node text such as `[text]` or `((text))` at the start of `s`.
+fn shape_len(s: &str) -> usize {
+    let (open, close) = match s.chars().next() {
+        Some('[') => ('[', ']'),
+        Some('(') => ('(', ')'),
+        Some('{') => ('{', '}'),
+        // Asymmetric `>text]`
+        Some('>') => ('>', ']'),
+        _ => return 0,
+    };
+    let (mut depth, mut quoted) = (0, false);
+    for (i, c) in s.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            _ if quoted => {}
+            _ if c == open && (open != '>' || i == 0) => depth += 1,
+            _ if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + c.len_utf8();
+                }
+            }
+            _ => {}
+        }
+    }
+    0
+}
+
+/// Label and shape of node text such as `[Label]` or `{Label}`.
+fn parse_shape(text: &str) -> Option<(String, NodeShape)> {
+    // Longer delimiters first.
     let patterns: &[(&str, &str, NodeShape)] = &[
         ("(((", ")))", NodeShape::DoubleCircle),
         ("[[", "]]", NodeShape::Subroutine),
@@ -395,23 +367,140 @@ fn extract_shaped_node(part: &str) -> Option<(String, String, NodeShape)> {
         ("[", "]", NodeShape::Rect),
         ("(", ")", NodeShape::RoundedRect),
         ("{", "}", NodeShape::Rhombus),
+        // No flag shape is drawn; keep the text in a rectangle.
+        (">", "]", NodeShape::Rect),
     ];
+    patterns.iter().find_map(|(open, close, shape)| {
+        let inner = text.strip_prefix(open)?.strip_suffix(close)?;
+        Some((normalize_flowchart_label(inner), shape.clone()))
+    })
+}
 
-    for (open, close, shape) in patterns {
-        if let Some(pos) = part.find(open) {
-            let after_open = &part[pos + open.len()..];
-            if let Some(end_pos) = after_open.find(close) {
-                let id = part[..pos].trim().to_string();
-                let label = normalize_flowchart_label(&after_open[..end_pos]);
+/// One link token as Mermaid's lexer reads it: an optional `<`, `x` or `o`,
+/// a `--`, `==` or dotted line, and an end character. `end` is `None` for a
+/// bare `--`, `==` or `-.` that opens a `-- text -->` link.
+struct LinkToken {
+    style: EdgeStyle,
+    start: Option<char>,
+    end: Option<char>,
+}
 
-                if !id.is_empty() {
-                    return Some((id, label, shape.clone()));
-                }
-            }
+fn scan_link_token(s: &str) -> Option<(LinkToken, &str)> {
+    let (start, body) = match s.chars().next() {
+        Some(c @ ('<' | 'x' | 'o')) => (Some(c), &s[1..]),
+        _ => (None, s),
+    };
+    let end_char = |rest: &str| rest.chars().next().filter(|c| matches!(c, 'x' | 'o' | '>'));
+    let (style, len, end) = if body.starts_with("--") || body.starts_with("==") {
+        let line = body.as_bytes()[0];
+        let style = if line == b'-' {
+            EdgeStyle::Solid
+        } else {
+            EdgeStyle::Thick
+        };
+        let n = body.bytes().take_while(|&b| b == line).count();
+        match end_char(&body[n..]) {
+            Some(end) => (style, n + 1, Some(end)),
+            // `---` is an open link; its last dash is the end.
+            None if n >= 3 => (style, n, Some(line as char)),
+            None => (style, n, None),
         }
-    }
+    } else {
+        // `-?\.+-` with an optional end character, or the `-.` opener.
+        let dash = usize::from(body.starts_with('-'));
+        let dots = body[dash..].bytes().take_while(|&b| b == b'.').count();
+        if dots == 0 {
+            return None;
+        }
+        let n = dash + dots;
+        if body[n..].starts_with('-') {
+            match end_char(&body[n + 1..]) {
+                Some(end) => (EdgeStyle::Dotted, n + 2, Some(end)),
+                None => (EdgeStyle::Dotted, n + 1, Some('-')),
+            }
+        } else if n == 2 && dash == 1 {
+            (EdgeStyle::Dotted, n, None)
+        } else {
+            return None;
+        }
+    };
+    Some((LinkToken { style, start, end }, &body[len..]))
+}
 
-    None
+fn arrow_type(c: char) -> ArrowType {
+    match c {
+        '>' => ArrowType::Arrow,
+        'x' => ArrowType::Cross,
+        'o' => ArrowType::Circle,
+        _ => ArrowType::None,
+    }
+}
+
+/// The tail decoration a link start character adds: only `<` before `>`, `x`
+/// before `x` and `o` before `o` make a two-ended link, as in Mermaid.
+fn arrow_tail(start: Option<char>, end: char) -> Option<ArrowType> {
+    match (start, end) {
+        (None, _) => Some(ArrowType::None),
+        (Some('<'), '>') | (Some('x'), 'x') | (Some('o'), 'o') => Some(arrow_type(end)),
+        _ => None,
+    }
+}
+
+fn scan_link(s: &str) -> Option<(ParsedLink, &str)> {
+    let mut s = s.trim_start();
+    // An edge id such as `e1@-->` only names the edge.
+    if let Some(at) = s.find('@')
+        && at > 0
+        && id_len(s) == at
+    {
+        s = &s[at + 1..];
+    }
+    let (token, rest) = scan_link_token(s)?;
+    let Some(end) = token.end else {
+        return scan_text_link(&token, rest);
+    };
+    let link = ParsedLink {
+        head: arrow_type(end),
+        // Mermaid ignores a start character that does not match the end.
+        tail: arrow_tail(token.start, end).unwrap_or(ArrowType::None),
+        style: token.style,
+        label: None,
+    };
+    // `-->|text|`
+    let Some(after_pipe) = rest.trim_start().strip_prefix('|') else {
+        return Some((link, rest));
+    };
+    let close = after_pipe.find('|')?;
+    let label = Some(after_pipe[..close].trim().to_string());
+    Some((ParsedLink { label, ..link }, &after_pipe[close + 1..]))
+}
+
+/// The rest of `-- text -->`, `== text ==>` or `-. text .->` after its opener.
+fn scan_text_link<'a>(opener: &LinkToken, rest: &'a str) -> Option<(ParsedLink, &'a str)> {
+    let closer_start = match opener.style {
+        EdgeStyle::Solid => "--",
+        EdgeStyle::Thick => "==",
+        EdgeStyle::Dotted => ".-",
+    };
+    let text_end = rest.find(closer_start)?;
+    let (closer, after) = scan_link_token(&rest[text_end..])?;
+    let end = closer.end?;
+    if closer.style != opener.style {
+        return None;
+    }
+    let tail = match opener.start {
+        None => ArrowType::None,
+        // Mermaid rejects `<-- text --x`, unlike a mismatched plain `x-->`.
+        start => arrow_tail(start, end)?,
+    };
+    let text = rest[..text_end].trim();
+    let link = ParsedLink {
+        style: closer.style,
+        head: arrow_type(end),
+        tail,
+        label: (!text.is_empty()).then(|| text.to_string()),
+    };
+    Some((link, after))
 }
 
 fn normalize_flowchart_label(raw: &str) -> String {
@@ -1516,6 +1605,7 @@ flowchart LR
     C --> D((Circle))
     D --> E{Diamond}
     F[/Lean/]
+    F --> G>Flag]
 "#,
         );
         let expected = [
@@ -1525,6 +1615,8 @@ flowchart LR
             ("D", "Circle", NodeShape::Circle),
             ("E", "Diamond", NodeShape::Rhombus),
             ("F", "Lean", NodeShape::Parallelogram),
+            // The asymmetric flag shape is drawn as a rectangle.
+            ("G", "Flag", NodeShape::Rect),
         ];
         assert_eq!(fc.nodes.len(), expected.len());
         for (id, label, shape) in expected {
@@ -2053,14 +2145,15 @@ stateDiagram
     #[test]
     fn test_parse_flowchart_cross_and_circle_arrows() {
         let fc = flowchart(
-            "flowchart TD\n    A --x B\n    C x-- D\n    E --o F\n    G o-- H\n    I x--x J\n    K o--o L\n",
+            "flowchart TD\n    A --x B\n    C ---x D\n    E --o F\n    G o--> H\n    I x--x J\n    K o--o L\n",
         );
         assert_eq!(fc.edges.len(), 6);
         for (from, to, head, tail) in [
             ("A", "B", ArrowType::Cross, ArrowType::None),
-            ("C", "D", ArrowType::None, ArrowType::Cross),
+            ("C", "D", ArrowType::Cross, ArrowType::None),
             ("E", "F", ArrowType::Circle, ArrowType::None),
-            ("G", "H", ArrowType::None, ArrowType::Circle),
+            // Mermaid ignores a start marker that does not match the end.
+            ("G", "H", ArrowType::Arrow, ArrowType::None),
             ("I", "J", ArrowType::Cross, ArrowType::Cross),
             ("K", "L", ArrowType::Circle, ArrowType::Circle),
         ] {
@@ -2072,13 +2165,14 @@ stateDiagram
 
     #[test]
     fn test_parse_flowchart_dotted_cross_and_circle_arrows() {
-        let fc = flowchart("flowchart TD\n    A -.x B\n    C x-. D\n    E -.o F\n    G o-. H\n");
+        let fc =
+            flowchart("flowchart TD\n    A -.-x B\n    C x-.-x D\n    E -.-o F\n    G o-.-o H\n");
         assert_eq!(fc.edges.len(), 4);
         for (from, to, head, tail) in [
             ("A", "B", ArrowType::Cross, ArrowType::None),
-            ("C", "D", ArrowType::None, ArrowType::Cross),
+            ("C", "D", ArrowType::Cross, ArrowType::Cross),
             ("E", "F", ArrowType::Circle, ArrowType::None),
-            ("G", "H", ArrowType::None, ArrowType::Circle),
+            ("G", "H", ArrowType::Circle, ArrowType::Circle),
         ] {
             let e = edge(&fc, from, to);
             assert_eq!(e.style, EdgeStyle::Dotted, "{from} -> {to}");
@@ -2088,12 +2182,112 @@ stateDiagram
     }
 
     #[test]
-    fn test_parse_flowchart_open_arrow_variant() {
-        let fc = flowchart("flowchart TD\n    A --o> B\n");
-        assert_eq!(fc.edges.len(), 1);
-        let e = edge(&fc, "A", "B");
-        assert_eq!(e.arrow_head, ArrowType::Arrow);
-        assert_eq!(e.arrow_tail, ArrowType::Circle);
+    fn non_mermaid_link_aliases_are_rejected() {
+        for link in [
+            "--o>", "->", "->>", "<--", "x--", "o--", "-.x", "x-.", "<==",
+        ] {
+            let fc = flowchart(&format!("flowchart TD\n    Z\n    A {link} B"));
+            let ids: Vec<&str> = fc.nodes.iter().map(|n| n.id.as_str()).collect();
+            assert_eq!(ids, ["Z"], "{link}");
+            assert!(fc.edges.is_empty(), "{link}");
+        }
+    }
+
+    fn edge_pairs(fc: &Flowchart) -> Vec<(&str, &str)> {
+        fc.edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str()))
+            .collect()
+    }
+
+    fn node_ids(fc: &Flowchart) -> Vec<&str> {
+        fc.nodes.iter().map(|n| n.id.as_str()).collect()
+    }
+
+    #[test]
+    fn flowchart_chains_and_groups_link_every_pair() {
+        let fc = flowchart("flowchart TD\n    A-->B-->C\n    D & E --> F & G; G --> H");
+        assert_eq!(node_ids(&fc), ["A", "B", "C", "D", "E", "F", "G", "H"]);
+        assert_eq!(
+            edge_pairs(&fc),
+            [
+                ("A", "B"),
+                ("B", "C"),
+                ("D", "F"),
+                ("D", "G"),
+                ("E", "F"),
+                ("E", "G"),
+                ("G", "H")
+            ]
+        );
+    }
+
+    #[test]
+    fn flowchart_link_text_forms_keep_their_labels() {
+        let fc = flowchart(
+            "flowchart TD\n    A -- one --> B\n    B -. two .-> C\n    C == three ==> D\n    D --> |four| E\n    E -- five --- F",
+        );
+        for (from, to, label, style, head) in [
+            ("A", "B", "one", EdgeStyle::Solid, ArrowType::Arrow),
+            ("B", "C", "two", EdgeStyle::Dotted, ArrowType::Arrow),
+            ("C", "D", "three", EdgeStyle::Thick, ArrowType::Arrow),
+            ("D", "E", "four", EdgeStyle::Solid, ArrowType::Arrow),
+            ("E", "F", "five", EdgeStyle::Solid, ArrowType::None),
+        ] {
+            let e = edge(&fc, from, to);
+            assert_eq!(e.label.as_deref(), Some(label), "{from} -> {to}");
+            assert_eq!((&e.style, &e.arrow_head), (&style, &head), "{from} -> {to}");
+        }
+        assert_eq!(node_ids(&fc), ["A", "B", "C", "D", "E", "F"]);
+    }
+
+    #[test]
+    fn flowchart_longer_and_thick_open_links_parse() {
+        let fc = flowchart(
+            "flowchart TD\n    A ---> B\n    B -..-> C\n    C ====> D\n    D === E\n    E ---- F\n    F---oG",
+        );
+        for (from, to, style, head) in [
+            ("A", "B", EdgeStyle::Solid, ArrowType::Arrow),
+            ("B", "C", EdgeStyle::Dotted, ArrowType::Arrow),
+            ("C", "D", EdgeStyle::Thick, ArrowType::Arrow),
+            ("D", "E", EdgeStyle::Thick, ArrowType::None),
+            ("E", "F", EdgeStyle::Solid, ArrowType::None),
+            ("F", "G", EdgeStyle::Solid, ArrowType::Circle),
+        ] {
+            let e = edge(&fc, from, to);
+            assert_eq!((&e.style, &e.arrow_head), (&style, &head), "{from} -> {to}");
+        }
+        assert_eq!(node_ids(&fc), ["A", "B", "C", "D", "E", "F", "G"]);
+    }
+
+    #[test]
+    fn flowchart_ids_ending_in_o_or_x_stay_whole() {
+        let fc = flowchart(
+            "flowchart TD\n    Foo-->Bar\n    box-->C\n    dev--- ops\n    my-node --> x",
+        );
+        assert_eq!(
+            edge_pairs(&fc),
+            [
+                ("Foo", "Bar"),
+                ("box", "C"),
+                ("dev", "ops"),
+                ("my-node", "x")
+            ]
+        );
+        assert!(fc.edges.iter().all(|e| e.arrow_tail == ArrowType::None));
+    }
+
+    #[test]
+    fn flowchart_bare_and_redeclared_nodes_are_single_nodes() {
+        let fc = flowchart(
+            "flowchart TD\n    A --> B\n    B[Later label]\n    E\n    click A callback \"Tip\"\n    style B fill:#f9f\n    class A,B important",
+        );
+        assert_eq!(node_ids(&fc), ["A", "B", "E"]);
+        let b = &fc.nodes[1];
+        assert_eq!(
+            (b.label.as_str(), &b.shape),
+            ("Later label", &NodeShape::Rect)
+        );
     }
 }
 
