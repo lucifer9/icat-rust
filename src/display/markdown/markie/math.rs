@@ -47,6 +47,8 @@ enum MathNode {
     /// Table for matrices, cases, aligned equations
     Table {
         rows: Vec<Vec<MathNode>>,
+        /// Cells sit at the left of their column instead of its centre.
+        left_aligned: bool,
     },
     /// Stretchy operator (parentheses, brackets that scale)
     StretchyOp {
@@ -80,8 +82,12 @@ pub fn render_math<T: TextMeasure>(
     let mathml =
         latex_to_mathml(&latex, style).map_err(|e| format!("LaTeX parse error: {:?}", e))?;
 
-    // latex2mathml closes `\bigl(` and friends with a misspelled `</mro>`.
-    let mathml = mathml.replace("</mro>", "</mo>");
+    // latex2mathml closes `\bigl(` and friends with a misspelled `</mro>`
+    // and leaves the left-aligned matrix attribute unquoted.
+    let mathml = mathml.replace("</mro>", "</mo>").replace(
+        "<mtable columnalign=left>",
+        r#"<mtable columnalign="left">"#,
+    );
     let root = parse_mathml(&escape_leaf_text(&mathml))?;
     let mbox = MathLayout {
         measure,
@@ -159,12 +165,15 @@ fn preprocess_latex(latex: &str) -> String {
     let latex = replace_command_aliases(latex);
     let mut result = String::with_capacity(latex.len());
 
-    // aligned → align (supported by latex2mathml)
-    // cases → \left\{ + matrix + \right. (preserves the semantic left curly brace)
-    let latex = latex.replace("\\begin{aligned}", "\\begin{align}");
-    let latex = latex.replace("\\end{aligned}", "\\end{align}");
-    let latex = latex.replace("\\begin{cases}", "\\left\\{\\begin{matrix}");
-    let latex = latex.replace("\\end{cases}", "\\end{matrix}\\right.");
+    // latex2mathml's `align` is a left-aligned matrix, which is how `cases`
+    // sets its columns; `align` and `aligned` keep their centred columns.
+    // cases → \left\{ + align (preserves the semantic left curly brace)
+    let latex = latex.replace("\\begin{aligned}", "\\begin{matrix}");
+    let latex = latex.replace("\\end{aligned}", "\\end{matrix}");
+    let latex = latex.replace("\\begin{align}", "\\begin{matrix}");
+    let latex = latex.replace("\\end{align}", "\\end{matrix}");
+    let latex = latex.replace("\\begin{cases}", "\\left\\{\\begin{align}");
+    let latex = latex.replace("\\end{cases}", "\\end{align}\\right.");
 
     // Single-pass scan for \begin{array}{...} → \begin{matrix}
     let begin_array = "\\begin{array}";
@@ -245,11 +254,8 @@ type Attrs = Vec<(String, String)>;
 fn parse_mathml_attrs(element: &BytesStart<'_>) -> Result<Attrs, String> {
     element
         .attributes()
-        // latex2mathml emits a few legacy unquoted attributes such as
-        // `columnalign=left`; ignore only those malformed attributes while
-        // normalizing every valid attribute through quick-xml.
-        .filter_map(Result::ok)
         .map(|attribute| {
+            let attribute = attribute.map_err(|err| format!("XML attribute error: {err}"))?;
             let value = attribute
                 .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|err| format!("XML attribute decode error: {err}"))?;
@@ -419,6 +425,9 @@ fn build_node(tag: &str, children: Vec<MathNode>, attrs: &Attrs) -> MathNode {
                     _ => None,
                 })
                 .collect(),
+            left_aligned: attrs
+                .iter()
+                .any(|(key, value)| key == "columnalign" && value == "left"),
         },
         _ => row_or_single(children),
     }
@@ -669,7 +678,9 @@ impl<T: TextMeasure> MathLayout<'_, T> {
             MathNode::Root { radicand, index } => {
                 self.radical(radicand, Some(index), font_size, x, baseline_y)
             }
-            MathNode::Table { rows } => self.table(rows, font_size, x, baseline_y),
+            MathNode::Table { rows, left_aligned } => {
+                self.table(rows, *left_aligned, font_size, x, baseline_y)
+            }
             MathNode::StretchyOp { op, form } => {
                 self.regular_stretchy_operator(op, form, font_size, x, baseline_y)
             }
@@ -978,6 +989,7 @@ impl<T: TextMeasure> MathLayout<'_, T> {
     fn table(
         &mut self,
         rows: &[Vec<MathNode>],
+        left_aligned: bool,
         font_size: f32,
         x: f32,
         baseline_y: f32,
@@ -1038,10 +1050,11 @@ impl<T: TextMeasure> MathLayout<'_, T> {
 
             for (col_idx, cell) in row.iter().enumerate() {
                 let col_width = col_widths.get(col_idx).copied().unwrap_or(0.0);
-                let cell_width = self.extent(cell, cell_size).width;
-
-                // Center cell in column
-                let cell_x = current_x + (col_width - cell_width) / 2.0;
+                let cell_x = if left_aligned {
+                    current_x
+                } else {
+                    current_x + (col_width - self.extent(cell, cell_size).width) / 2.0
+                };
 
                 let rendered = self.layout(cell, cell_size, cell_x, row_baseline);
                 svg.push_str(&rendered.svg);
@@ -1237,6 +1250,32 @@ mod tests {
             assert_eq!(svg(alias), svg(supported), "{alias}");
         }
         assert!(!svg(r"\bigl( x \bigr)").contains("PARSE ERROR"));
+    }
+
+    #[test]
+    fn cases_columns_are_left_aligned() {
+        let mut measure = MockMeasure;
+        let svg = |latex: &str, measure: &mut MockMeasure| {
+            render_math(latex, 16.0, "#000000", measure, true)
+                .unwrap()
+                .svg_fragment
+        };
+        // x of the `<text>` element whose content is exactly `content`.
+        let text_x = |svg: &str, content: &str| -> f32 {
+            let end = svg.find(&format!(">{content}</text>")).unwrap();
+            let start = svg[..end].rfind("<text x=\"").unwrap() + "<text x=\"".len();
+            svg[start..].split('"').next().unwrap().parse().unwrap()
+        };
+
+        let cases = svg(r"\begin{cases} 1 & x \\ 100 & y \end{cases}", &mut measure);
+        assert_eq!(text_x(&cases, "1"), text_x(&cases, "100"), "{cases}");
+
+        // Plain matrices keep their centred columns.
+        let matrix = svg(
+            r"\begin{matrix} 1 & x \\ 100 & y \end{matrix}",
+            &mut measure,
+        );
+        assert!(text_x(&matrix, "1") > text_x(&matrix, "100"), "{matrix}");
     }
 
     #[test]
