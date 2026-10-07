@@ -80,7 +80,7 @@ pub fn render_math<T: TextMeasure>(
     let mathml =
         latex_to_mathml(&latex, style).map_err(|e| format!("LaTeX parse error: {:?}", e))?;
 
-    let root = parse_mathml(&mathml)?;
+    let root = parse_mathml(&escape_leaf_text(&mathml))?;
     let mbox = MathLayout {
         measure,
         color: text_color,
@@ -143,6 +143,40 @@ fn preprocess_latex(latex: &str) -> String {
     result = result.replace("\\end{array}", "\\end{matrix}");
 
     result
+}
+
+/// latex2mathml writes operator and text characters verbatim, so `x<0`
+/// becomes `<mo><</mo>` and `\&` a bare `&`, neither of which is valid XML.
+/// It only emits text inside leaf elements (`mi`, `mn`, `mo`, `mtext`) that
+/// hold no child elements, so the text of a leaf runs to the next `</`.
+fn escape_leaf_text(mathml: &str) -> String {
+    let mut out = String::with_capacity(mathml.len());
+    let mut rest = mathml;
+    while let Some(start) = rest.find('<') {
+        let tag_end = rest[start..]
+            .find('>')
+            .map_or(rest.len(), |i| start + i + 1);
+        let tag = &rest[start..tag_end];
+        out.push_str(&rest[..tag_end]);
+        rest = &rest[tag_end..];
+        let name = tag[1..].split([' ', '>']).next().unwrap_or_default();
+        if tag.ends_with("/>") || !matches!(name, "mi" | "mn" | "mo" | "mtext") {
+            continue;
+        }
+        let text_end = rest.find("</").unwrap_or(rest.len());
+        for (i, ch) in rest[..text_end].char_indices() {
+            match ch {
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                // Keep the character references latex2mathml writes itself.
+                '&' if !rest[i..text_end].starts_with("&#") => out.push_str("&amp;"),
+                _ => out.push(ch),
+            }
+        }
+        rest = &rest[text_end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 struct MathBox {
@@ -1104,6 +1138,25 @@ mod tests {
                     "{latex} rendered no ink"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn comparison_and_ampersand_characters_render_as_text() {
+        let mut measure = MockMeasure;
+        for (latex, glyph) in [
+            ("x<0", "&lt;"),
+            (r"x \lt 0", "&lt;"),
+            (r"\begin{cases} 1 & x<0 \\ 0 & x>0 \end{cases}", "&lt;"),
+            (r"a \& b", "&amp;"),
+        ] {
+            let result = render_math(latex, 16.0, "#000000", &mut measure, false)
+                .unwrap_or_else(|err| panic!("{latex} failed to render: {err}"));
+            assert!(
+                result.svg_fragment.contains(glyph),
+                "{latex} should draw {glyph}: {}",
+                result.svg_fragment
+            );
         }
     }
 
