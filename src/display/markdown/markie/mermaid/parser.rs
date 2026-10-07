@@ -309,15 +309,20 @@ fn scan_node(s: &str) -> Option<(ParsedNodeInfo, &str)> {
     Some((node, rest))
 }
 
-/// Length of the node id at the start of `s`. As in Mermaid, an id may contain
-/// `-`, but not where the `-` starts a link such as `A-->B` or `A-.->B`.
+/// Length of the node id at the start of `s`, using the characters of
+/// Mermaid's `NODE_STRING` token plus `:`. An id may contain `-` and `=`, but
+/// not where they start a link such as `A-->B`, `A-.->B` or `A==>B`, and `:`
+/// only where it does not start `:::class`. Unlike Mermaid, `&` always
+/// separates nodes, and quotes and backticks never belong to an id.
 fn id_len(s: &str) -> usize {
     let mut chars = s.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
         let next = chars.peek().map(|&(_, next)| next);
         let in_id = c.is_alphanumeric()
-            || c == '_'
-            || (c == '-' && !matches!(next, None | Some('-' | '>' | '.')));
+            || "!#$%'*+.?\\_/".contains(c)
+            || (c == '-' && !matches!(next, None | Some('-' | '>' | '.')))
+            || (c == '=' && next != Some('='))
+            || (c == ':' && !s[i..].starts_with(":::"));
         if !in_id {
             return i;
         }
@@ -2350,6 +2355,44 @@ stateDiagram
             ]
         );
         assert_eq!(node_ids(&fc), ["A", "B", "C", "D", "E", "F", "G"]);
+    }
+
+    #[test]
+    fn flowchart_ids_accept_mermaid_node_string_characters() {
+        let fc = flowchart(
+            "flowchart LR\n    a.b --> c/d\n    root-->I/O\n    x#1 --> y!\n    $p+q --- 'r'*s?\n    w\\v --> e=f\n    App-->|GET|https://host/x",
+        );
+        assert_eq!(
+            edge_pairs(&fc),
+            [
+                ("a.b", "c/d"),
+                ("root", "I/O"),
+                ("x#1", "y!"),
+                ("$p+q", "'r'*s?"),
+                ("w\\v", "e=f"),
+                ("App", "https://host/x")
+            ]
+        );
+    }
+
+    #[test]
+    fn flowchart_link_characters_still_end_ids() {
+        let fc = flowchart(
+            "flowchart LR\n    A-.->B\n    A & B --> C\n    A==>B\n    C---D\n    D:::hot-->E",
+        );
+        assert_eq!(
+            edge_pairs(&fc),
+            [
+                ("A", "B"),
+                ("A", "C"),
+                ("B", "C"),
+                ("A", "B"),
+                ("C", "D"),
+                ("D", "E")
+            ]
+        );
+        assert_eq!(fc.edges[0].style, EdgeStyle::Dotted);
+        assert_eq!(fc.edges[3].style, EdgeStyle::Thick);
     }
 
     #[test]
