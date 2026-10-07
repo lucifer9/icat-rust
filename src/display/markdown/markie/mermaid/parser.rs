@@ -847,18 +847,20 @@ fn parse_class_method(vis: Visibility, member: &str) -> Option<ClassMethod> {
 }
 
 fn parse_class_relation(line: &str) -> Option<ClassRelation> {
+    use ClassMarker::{Arrow, FilledDiamond, HollowDiamond, Triangle};
+    // (token, from marker, to marker, dashed)
     let patterns = [
-        ("<|--", ClassRelationType::Inheritance),
-        ("*--", ClassRelationType::Composition),
-        ("o--", ClassRelationType::Aggregation),
-        ("-->", ClassRelationType::Association),
-        ("--", ClassRelationType::Association),
-        ("..>", ClassRelationType::Dependency),
-        ("..|>", ClassRelationType::Realization),
-        ("..", ClassRelationType::Dependency),
+        ("<|--", Triangle, ClassMarker::None, false),
+        ("*--", FilledDiamond, ClassMarker::None, false),
+        ("o--", HollowDiamond, ClassMarker::None, false),
+        ("-->", ClassMarker::None, Arrow, false),
+        ("--", ClassMarker::None, Arrow, false),
+        ("..>", ClassMarker::None, Arrow, true),
+        ("..|>", ClassMarker::None, Triangle, true),
+        ("..", ClassMarker::None, Arrow, true),
     ];
 
-    for (pattern, rel_type) in &patterns {
+    for (pattern, from_marker, to_marker, dashed) in patterns {
         if let Some(pos) = line.find(pattern) {
             let from = line[..pos].trim().to_string();
             let rest = line[pos + pattern.len()..].trim();
@@ -875,7 +877,9 @@ fn parse_class_relation(line: &str) -> Option<ClassRelation> {
             return Some(ClassRelation {
                 from,
                 to,
-                relation_type: rel_type.clone(),
+                from_marker,
+                to_marker,
+                dashed,
                 label,
             });
         }
@@ -1736,10 +1740,8 @@ classDiagram
         };
         assert_eq!(relation("Session").label.as_deref(), Some("creates"));
         assert_eq!(relation("AuditLog").label.as_deref(), Some("writes"));
-        assert_eq!(
-            relation("AuditLog").relation_type,
-            ClassRelationType::Dependency
-        );
+        assert_eq!(relation("AuditLog").to_marker, ClassMarker::Arrow);
+        assert!(relation("AuditLog").dashed);
     }
 
     #[test]

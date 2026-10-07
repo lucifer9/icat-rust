@@ -235,21 +235,29 @@ impl ClassMethod {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ClassRelationType {
-    Inheritance,
-    Composition,
-    Aggregation,
-    Association,
-    Dependency,
-    Realization,
+/// Decoration at one end of a class relation, drawn at the class it is written
+/// next to: `A <|-- B` marks A, `A --> B` marks B.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClassMarker {
+    None,
+    /// `<` or `>`
+    Arrow,
+    /// `<|` or `|>`
+    Triangle,
+    /// `*`
+    FilledDiamond,
+    /// `o`
+    HollowDiamond,
 }
 
 #[derive(Debug, Clone)]
 pub struct ClassRelation {
     pub from: String,
     pub to: String,
-    pub relation_type: ClassRelationType,
+    pub from_marker: ClassMarker,
+    pub to_marker: ClassMarker,
+    /// `..` instead of `--`.
+    pub dashed: bool,
     pub label: Option<String>,
 }
 

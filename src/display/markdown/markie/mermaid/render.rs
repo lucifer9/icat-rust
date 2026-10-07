@@ -712,11 +712,10 @@ fn render_class_relation(
     let (x1, y1) = rect_boundary_point(from, angle);
     let (x2, y2) = rect_boundary_point(to, angle + std::f32::consts::PI);
 
-    let line_style = match relation.relation_type {
-        ClassRelationType::Dependency | ClassRelationType::Realization => {
-            " stroke-dasharray=\"6,3\""
-        }
-        _ => "",
+    let line_style = if relation.dashed {
+        " stroke-dasharray=\"6,3\""
+    } else {
+        ""
     };
 
     svg.push_str(&format!(
@@ -724,23 +723,14 @@ fn render_class_relation(
         x1, y1, x2, y2, style.edge_stroke, line_style
     ));
 
-    // As in Mermaid, `A <|-- B`, `A *-- B` and `A o-- B` mark the left-hand
-    // class, while `A --> B`, `A ..> B` and `A ..|> B` point at the right-hand one.
-    let (x, y, marker_angle) = match relation.relation_type {
-        ClassRelationType::Inheritance
-        | ClassRelationType::Composition
-        | ClassRelationType::Aggregation => (x1, y1, angle + std::f32::consts::PI),
-        ClassRelationType::Association
-        | ClassRelationType::Dependency
-        | ClassRelationType::Realization => (x2, y2, angle),
-    };
     svg.push_str(&draw_marker(
-        &relation.relation_type,
-        x,
-        y,
-        marker_angle,
+        relation.from_marker,
+        x1,
+        y1,
+        angle + std::f32::consts::PI,
         style,
     ));
+    svg.push_str(&draw_marker(relation.to_marker, x2, y2, angle, style));
 
     if let Some(label) = &relation.label {
         // Offset the label to one side of the line, along its normal.
@@ -756,21 +746,14 @@ fn render_class_relation(
     svg
 }
 
-fn draw_marker(
-    relation_type: &ClassRelationType,
-    x: f32,
-    y: f32,
-    angle: f32,
-    style: &DiagramStyle,
-) -> String {
+fn draw_marker(marker: ClassMarker, x: f32, y: f32, angle: f32, style: &DiagramStyle) -> String {
     let cos = angle.cos();
     let sin = angle.sin();
 
-    match relation_type {
-        ClassRelationType::Association | ClassRelationType::Dependency => {
-            arrowhead(ArrowHead::Filled, x, y, angle, style)
-        }
-        ClassRelationType::Inheritance | ClassRelationType::Realization => {
+    match marker {
+        ClassMarker::None => String::new(),
+        ClassMarker::Arrow => arrowhead(ArrowHead::Filled, x, y, angle, style),
+        ClassMarker::Triangle => {
             let p1 = (x - cos * 14.0 + sin * 7.0, y - sin * 14.0 - cos * 7.0);
             let p2 = (x - cos * 14.0 - sin * 7.0, y - sin * 14.0 + cos * 7.0);
             format!(
@@ -778,7 +761,7 @@ fn draw_marker(
                 x, y, p1.0, p1.1, p2.0, p2.1, style.node_fill, style.edge_stroke
             )
         }
-        ClassRelationType::Composition => {
+        ClassMarker::FilledDiamond => {
             let p1 = (x - cos * 16.0 + sin * 6.0, y - sin * 16.0 - cos * 6.0);
             let p2 = (x - cos * 16.0 - sin * 6.0, y - sin * 16.0 + cos * 6.0);
             let back = (x - cos * 24.0, y - sin * 24.0);
@@ -787,7 +770,7 @@ fn draw_marker(
                 x, y, p1.0, p1.1, back.0, back.1, p2.0, p2.1, style.edge_stroke
             )
         }
-        ClassRelationType::Aggregation => {
+        ClassMarker::HollowDiamond => {
             let p1 = (x - cos * 16.0 + sin * 6.0, y - sin * 16.0 - cos * 6.0);
             let p2 = (x - cos * 16.0 - sin * 6.0, y - sin * 16.0 + cos * 6.0);
             let back = (x - cos * 24.0, y - sin * 24.0);
