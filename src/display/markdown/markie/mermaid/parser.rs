@@ -212,7 +212,7 @@ fn upsert_node(nodes: &mut Vec<FlowchartNode>, node: &ParsedNodeInfo) {
         (None, shape) => {
             let (label, shape) = shape
                 .clone()
-                .unwrap_or_else(|| (node.id.clone(), NodeShape::RoundedRect));
+                .unwrap_or_else(|| (node.id.clone(), NodeShape::Rect));
             nodes.push(FlowchartNode {
                 id: node.id.clone(),
                 label,
@@ -1570,6 +1570,8 @@ mod tests {
         assert_eq!(fc.edges.len(), 1);
         assert_eq!(fc.nodes[0].id, "A");
         assert_eq!(fc.nodes[0].label, "A");
+        // Like Mermaid, a node given only by its id is a plain rectangle.
+        assert_eq!(fc.nodes[0].shape, NodeShape::Rect);
         assert_eq!(fc.nodes[1].id, "B");
         assert_eq!(fc.edges[0].from, "A");
         assert_eq!(fc.edges[0].to, "B");
@@ -1610,6 +1612,7 @@ flowchart LR
     D --> E{Diamond}
     F[/Lean/]
     F --> G>Flag]
+    G --> H(Round)
 "#,
         );
         let expected = [
@@ -1621,6 +1624,7 @@ flowchart LR
             ("F", "Lean", NodeShape::Parallelogram),
             // The asymmetric flag shape is drawn as a rectangle.
             ("G", "Flag", NodeShape::Rect),
+            ("H", "Round", NodeShape::RoundedRect),
         ];
         assert_eq!(fc.nodes.len(), expected.len());
         for (id, label, shape) in expected {

@@ -3097,6 +3097,20 @@ Note right of Child: child note"#,
     }
 
     #[test]
+    fn undeclared_flowchart_nodes_have_square_corners() {
+        let image = rasterize(&render_svg("flowchart TD\n    A --> B(Round)"));
+        let bands = node_bands(&image);
+        assert_eq!(bands.len(), 2, "expected A above B, got {bands:?}");
+        let square_corner =
+            |(left, top, _, _): (u32, u32, u32, u32)| is_node_fill(image.get_pixel(left, top));
+        assert!(square_corner(bands[0]), "bare A should be a rectangle");
+        assert!(
+            !square_corner(bands[1]),
+            "B(Round) should keep rounded corners"
+        );
+    }
+
+    #[test]
     fn subgraph_box_keeps_equal_padding_when_clamped_at_top() {
         let image = rasterize(&render_svg(
             "flowchart TD\n    subgraph Group\n        A[Alpha] --> B[Beta]\n    end",
