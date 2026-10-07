@@ -846,45 +846,121 @@ fn parse_class_method(vis: Visibility, member: &str) -> Option<ClassMethod> {
     })
 }
 
+/// Parse `A "1" <|--* "many" B : label`: optional quoted cardinalities around
+/// a `--` or `..` line with an optional marker at either end.
 fn parse_class_relation(line: &str) -> Option<ClassRelation> {
-    use ClassMarker::{Arrow, FilledDiamond, HollowDiamond, Triangle};
-    // (token, from marker, to marker, dashed)
-    let patterns = [
-        ("<|--", Triangle, ClassMarker::None, false),
-        ("*--", FilledDiamond, ClassMarker::None, false),
-        ("o--", HollowDiamond, ClassMarker::None, false),
-        ("-->", ClassMarker::None, Arrow, false),
-        ("--", ClassMarker::None, Arrow, false),
-        ("..>", ClassMarker::None, Arrow, true),
-        ("..|>", ClassMarker::None, Triangle, true),
-        ("..", ClassMarker::None, Arrow, true),
-    ];
-
-    for (pattern, from_marker, to_marker, dashed) in patterns {
-        if let Some(pos) = line.find(pattern) {
-            let from = line[..pos].trim().to_string();
-            let rest = line[pos + pattern.len()..].trim();
-
-            let (to, label) = if let Some((to_part, label_part)) = rest.split_once(':') {
-                let to = to_part.trim().to_string();
-                let label = label_part.trim().trim_matches('"').trim().to_string();
-                let label = if label.is_empty() { None } else { Some(label) };
-                (to, label)
-            } else {
-                (rest.to_string(), None)
-            };
-
-            return Some(ClassRelation {
-                from,
-                to,
-                from_marker,
-                to_marker,
-                dashed,
-                label,
-            });
-        }
+    let (body, label) = match find_unquoted(line, ":") {
+        Some(pos) => (&line[..pos], Some(line[pos + 1..].trim())),
+        None => (line, None),
+    };
+    let link = [find_unquoted(body, "--"), find_unquoted(body, "..")]
+        .into_iter()
+        .flatten()
+        .min()?;
+    let (left, from_marker) = strip_left_marker(body[..link].trim_end());
+    let (right, to_marker) = strip_right_marker(body[link + 2..].trim_start());
+    let (from, from_cardinality) = split_trailing_quoted(left.trim_end());
+    let (to_cardinality, to) = split_leading_quoted(right.trim_start());
+    let to = to.trim_end();
+    if !is_class_name(from) || !is_class_name(to) {
+        return None;
     }
 
+    Some(ClassRelation {
+        from: from.to_string(),
+        to: to.to_string(),
+        from_marker,
+        to_marker,
+        dashed: body[link..].starts_with(".."),
+        from_cardinality,
+        to_cardinality,
+        label: label
+            .map(|l| l.trim_matches('"').trim().to_string())
+            .filter(|l| !l.is_empty()),
+    })
+}
+
+fn strip_left_marker(s: &str) -> (&str, ClassMarker) {
+    let markers = [
+        ("<|", ClassMarker::Triangle),
+        ("<", ClassMarker::Arrow),
+        ("*", ClassMarker::FilledDiamond),
+        ("()", ClassMarker::Lollipop),
+    ];
+    for (token, marker) in markers {
+        if let Some(rest) = s.strip_suffix(token) {
+            return (rest, marker);
+        }
+    }
+    // `o` is a marker only when it stands apart: `Foo--Bar` links class `Foo`.
+    match s.strip_suffix('o') {
+        Some(rest) if rest.is_empty() || rest.ends_with([' ', '\t', '"']) => {
+            (rest, ClassMarker::HollowDiamond)
+        }
+        _ => (s, ClassMarker::None),
+    }
+}
+
+fn strip_right_marker(s: &str) -> (&str, ClassMarker) {
+    let markers = [
+        ("|>", ClassMarker::Triangle),
+        (">", ClassMarker::Arrow),
+        ("*", ClassMarker::FilledDiamond),
+        ("()", ClassMarker::Lollipop),
+    ];
+    for (token, marker) in markers {
+        if let Some(rest) = s.strip_prefix(token) {
+            return (rest, marker);
+        }
+    }
+    match s.strip_prefix('o') {
+        Some(rest) if rest.starts_with([' ', '\t', '"']) => (rest, ClassMarker::HollowDiamond),
+        _ => (s, ClassMarker::None),
+    }
+}
+
+/// Split `Name "card"` into the name and the quoted cardinality.
+fn split_trailing_quoted(s: &str) -> (&str, Option<String>) {
+    if let Some(inner) = s.strip_suffix('"')
+        && let Some(open) = inner.rfind('"')
+    {
+        return (
+            inner[..open].trim_end(),
+            Some(inner[open + 1..].to_string()),
+        );
+    }
+    (s, None)
+}
+
+/// Split `"card" Name` into the quoted cardinality and the name.
+fn split_leading_quoted(s: &str) -> (Option<String>, &str) {
+    if let Some(inner) = s.strip_prefix('"')
+        && let Some(close) = inner.find('"')
+    {
+        return (
+            Some(inner[..close].to_string()),
+            inner[close + 1..].trim_start(),
+        );
+    }
+    (None, s)
+}
+
+fn is_class_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s
+            .contains(|c: char| c.is_whitespace() || matches!(c, '"' | '<' | '>' | '|' | '(' | ')'))
+}
+
+/// Byte offset of the first `needle` outside double quotes.
+fn find_unquoted(s: &str, needle: &str) -> Option<usize> {
+    let mut quoted = false;
+    for (i, c) in s.char_indices() {
+        if c == '"' {
+            quoted = !quoted;
+        } else if !quoted && s[i..].starts_with(needle) {
+            return Some(i);
+        }
+    }
     None
 }
 
@@ -1742,6 +1818,57 @@ classDiagram
         assert_eq!(relation("AuditLog").label.as_deref(), Some("writes"));
         assert_eq!(relation("AuditLog").to_marker, ClassMarker::Arrow);
         assert!(relation("AuditLog").dashed);
+    }
+
+    #[test]
+    fn class_relations_follow_mermaid_relation_grammar() {
+        use ClassMarker::*;
+        // (line, from, from marker, dashed, to marker, to)
+        let cases = [
+            ("A <|-- B", "A", Triangle, false, None, "B"),
+            ("A --|> B", "A", None, false, Triangle, "B"),
+            ("A *-- B", "A", FilledDiamond, false, None, "B"),
+            ("A --* B", "A", None, false, FilledDiamond, "B"),
+            ("A o-- B", "A", HollowDiamond, false, None, "B"),
+            ("A --o B", "A", None, false, HollowDiamond, "B"),
+            ("A <-- B", "A", Arrow, false, None, "B"),
+            ("A -- B", "A", None, false, None, "B"),
+            ("A .. B", "A", None, true, None, "B"),
+            ("A <.. B", "A", Arrow, true, None, "B"),
+            ("A <|.. B", "A", Triangle, true, None, "B"),
+            ("A ..|> B", "A", None, true, Triangle, "B"),
+            ("A <|--|> B", "A", Triangle, false, Triangle, "B"),
+            ("A *--* B", "A", FilledDiamond, false, FilledDiamond, "B"),
+            ("bar ()-- foo", "bar", Lollipop, false, None, "foo"),
+            ("foo --() bar", "foo", None, false, Lollipop, "bar"),
+            ("Foo--Bar", "Foo", None, false, None, "Bar"),
+            ("Foo-Bar --> Baz", "Foo-Bar", None, false, Arrow, "Baz"),
+        ];
+        for (line, from, from_marker, dashed, to_marker, to) in cases {
+            let cls = class(&format!("classDiagram\n    {line}"));
+            let names: Vec<&str> = cls.classes.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, [from, to], "{line}");
+            let rel = &cls.relations[0];
+            assert_eq!(
+                (rel.from_marker, rel.dashed, rel.to_marker),
+                (from_marker, dashed, to_marker),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_relation_cardinalities_and_labels_stay_out_of_class_names() {
+        let cls = class(
+            "classDiagram\n    Customer \"1\" --> \"0..*\" Ticket : buys\n    A ..> B : see -- note",
+        );
+        let names: Vec<&str> = cls.classes.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Customer", "Ticket", "A", "B"]);
+        let buys = &cls.relations[0];
+        assert_eq!(buys.from_cardinality.as_deref(), Some("1"));
+        assert_eq!(buys.to_cardinality.as_deref(), Some("0..*"));
+        assert_eq!(buys.label.as_deref(), Some("buys"));
+        assert_eq!(cls.relations[1].label.as_deref(), Some("see -- note"));
     }
 
     #[test]

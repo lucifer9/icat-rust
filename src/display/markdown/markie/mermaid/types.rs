@@ -248,6 +248,8 @@ pub enum ClassMarker {
     FilledDiamond,
     /// `o`
     HollowDiamond,
+    /// `()`, a lollipop interface
+    Lollipop,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +260,8 @@ pub struct ClassRelation {
     pub to_marker: ClassMarker,
     /// `..` instead of `--`.
     pub dashed: bool,
+    pub from_cardinality: Option<String>,
+    pub to_cardinality: Option<String>,
     pub label: Option<String>,
 }
 

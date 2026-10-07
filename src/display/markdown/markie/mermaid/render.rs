@@ -732,6 +732,16 @@ fn render_class_relation(
     ));
     svg.push_str(&draw_marker(relation.to_marker, x2, y2, angle, style));
 
+    let ends = [
+        (&relation.from_cardinality, (x1, y1), 1.0),
+        (&relation.to_cardinality, (x2, y2), -1.0),
+    ];
+    for (cardinality, end, inward) in ends {
+        if let Some(text) = cardinality {
+            svg.push_str(&cardinality_text(text, end, angle, inward, style, measure));
+        }
+    }
+
     if let Some(label) = &relation.label {
         // Offset the label to one side of the line, along its normal.
         let label_offset = 18.0;
@@ -746,12 +756,53 @@ fn render_class_relation(
     svg
 }
 
+/// Cardinality text beside the line end at `end`. `angle` is the from-to
+/// direction of the line and `inward` is +1 at the from end and -1 at the to
+/// end. The text sits on the side opposite the relation label, just clear of
+/// both the line and the class box.
+fn cardinality_text(
+    text: &str,
+    end: (f32, f32),
+    angle: f32,
+    inward: f32,
+    style: &DiagramStyle,
+    measure: &mut impl TextMeasure,
+) -> String {
+    let font_size = style.font_size * 0.8;
+    let w = measure.measure_width(&sanitize_xml_text(text), font_size, false, false, false);
+    let h = font_size;
+    let (cos, sin) = (angle.cos(), angle.sin());
+    // Half extents of the text box along the line and across it, plus a gap;
+    // the gap across also clears the up to 7px wide end markers.
+    let along = cos.abs() * w / 2.0 + sin.abs() * h / 2.0 + 4.0;
+    let across = sin.abs() * w / 2.0 + cos.abs() * h / 2.0 + 8.0;
+    let x = end.0 + inward * cos * along + sin * across;
+    let y = end.1 + inward * sin * along - cos * across;
+    format!(
+        r#"<text x="{:.2}" y="{:.2}" dy="0.35em" font-family="{}" font-size="{:.1}" fill="{}" text-anchor="middle">{}</text>"#,
+        x,
+        y,
+        style.font_family,
+        font_size,
+        style.edge_text,
+        escape_xml(text)
+    )
+}
+
 fn draw_marker(marker: ClassMarker, x: f32, y: f32, angle: f32, style: &DiagramStyle) -> String {
     let cos = angle.cos();
     let sin = angle.sin();
 
     match marker {
         ClassMarker::None => String::new(),
+        // A hollow circle touching the class box.
+        ClassMarker::Lollipop => format!(
+            r#"<circle cx="{:.2}" cy="{:.2}" r="6" fill="{}" stroke="{}" stroke-width="1" />"#,
+            x - cos * 6.0,
+            y - sin * 6.0,
+            style.node_fill,
+            style.edge_stroke
+        ),
         ClassMarker::Arrow => arrowhead(ArrowHead::Filled, x, y, angle, style),
         ClassMarker::Triangle => {
             let p1 = (x - cos * 14.0 + sin * 7.0, y - sin * 14.0 - cos * 7.0);
@@ -2533,27 +2584,17 @@ Note right of Child: child note"#,
             ("A --> B", true),
             ("A ..> B", true),
             ("A ..|> B", true),
+            ("A <-- B", false),
+            ("A <.. B", false),
+            ("A <|.. B", false),
+            ("A --|> B", true),
+            ("A --* B", true),
+            ("A --o B", true),
+            ("A ()-- B", false),
+            ("A --() B", true),
         ];
         for (relation, at_b) in cases {
-            let image = rasterize(&render_svg(&format!(
-                "classDiagram\n  class A\n  class B\n  {relation}\n"
-            )));
-            // Class boxes are wide bands split by compartment separators;
-            // narrow bands are hollow markers.
-            let mut boxes: Vec<(u32, u32)> = Vec::new();
-            for (left, top, right, bottom) in node_bands(&image) {
-                match boxes.last_mut() {
-                    _ if right - left < 60 => {}
-                    Some(last) if top <= last.1 + 4 => last.1 = bottom,
-                    _ => boxes.push((top, bottom)),
-                }
-            }
-            assert_eq!(
-                boxes.len(),
-                2,
-                "{relation}: expected A above B, got {boxes:?}"
-            );
-            let (a_bottom, b_top) = (boxes[0].1, boxes[1].0);
+            let (image, a_bottom, b_top) = render_two_classes(relation);
             // Markers are the only solid or filled shapes between the classes.
             let marker_rows: Vec<u32> = image
                 .enumerate_pixels()
@@ -2566,6 +2607,62 @@ Note right of Child: child note"#,
             assert_eq!(
                 near_b, at_b,
                 "{relation}: marker centered at row {mean}, A ends at {a_bottom}, B starts at {b_top}"
+            );
+        }
+    }
+
+    /// Renders classes A and B joined by `relation` and returns the image with
+    /// the bottom row of A and the top row of B, which must sit below A.
+    fn render_two_classes(relation: &str) -> (RgbaImage, u32, u32) {
+        let image = rasterize(&render_svg(&format!(
+            "classDiagram\n  class A\n  class B\n  {relation}\n"
+        )));
+        // Class boxes are wide bands split by compartment separators;
+        // narrow bands are hollow markers.
+        let mut boxes: Vec<(u32, u32)> = Vec::new();
+        for (left, top, right, bottom) in node_bands(&image) {
+            match boxes.last_mut() {
+                _ if right - left < 60 => {}
+                Some(last) if top <= last.1 + 4 => last.1 = bottom,
+                _ => boxes.push((top, bottom)),
+            }
+        }
+        assert_eq!(
+            boxes.len(),
+            2,
+            "{relation}: expected A above B, got {boxes:?}"
+        );
+        (image, boxes[0].1, boxes[1].0)
+    }
+
+    #[test]
+    fn plain_class_links_draw_no_markers() {
+        for relation in ["A -- B", "A .. B"] {
+            let (image, a_bottom, b_top) = render_two_classes(relation);
+            let widest_row = (a_bottom + 1..b_top)
+                .map(|y| {
+                    (0..image.width())
+                        .filter(|&x| is_edge(image.get_pixel(x, y)))
+                        .count()
+                })
+                .max()
+                .unwrap();
+            assert!(
+                widest_row <= 3,
+                "{relation}: only a thin line should join the classes, got a {widest_row}px row"
+            );
+        }
+    }
+
+    #[test]
+    fn class_cardinalities_render_as_their_own_text() {
+        let text = visible_text(&render_svg(
+            "classDiagram\n  Customer \"1\" --> \"many\" Ticket : buys",
+        ));
+        for expected in ["Customer", "Ticket", "1", "many", "buys"] {
+            assert!(
+                text.iter().any(|t| t == expected),
+                "missing text {expected:?}, got {text:?}"
             );
         }
     }
