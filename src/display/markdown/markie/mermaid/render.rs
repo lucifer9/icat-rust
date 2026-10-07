@@ -1146,47 +1146,65 @@ fn render_state_transitions<'r>(
             .or_insert(0) += 1;
     }
 
+    // Every transition is routed before any label is placed, so labels can
+    // keep off all the lines.
+    let mut pair_seen: HashMap<(String, String), usize> = HashMap::new();
+    let routed: Vec<Option<(StateEdge, StateRoute)>> = transitions
+        .iter()
+        .map(|transition| {
+            let key = state_pair_key(&transition.from, &transition.to);
+            let seen = pair_seen.entry(key.clone()).or_insert(0);
+            let route_index = *seen;
+            *seen += 1;
+            let from = position_of(&transition.from)?;
+            let to = position_of(&transition.to)?;
+            if transition.from == transition.to {
+                return None;
+            }
+            let edge = StateEdge::new(
+                from,
+                to,
+                RouteSlot::new(transition, route_index, pair_totals[&key]),
+            );
+            let route = edge.route(&Blockers::new(obstacles, edge.from_center, edge.to_center));
+            Some((edge, route))
+        })
+        .collect();
+
     let mut svg = String::new();
     let mut extents = Vec::new();
-    let mut pair_seen: HashMap<(String, String), usize> = HashMap::new();
     let mut occupied_labels: Vec<Rect> = Vec::new();
-    for transition in transitions {
-        let key = state_pair_key(&transition.from, &transition.to);
-        let seen = pair_seen.entry(key.clone()).or_insert(0);
-        let route_index = *seen;
-        *seen += 1;
-        let route_total = pair_totals[&key];
-
-        let (Some(from), Some(to)) = (position_of(&transition.from), position_of(&transition.to))
-        else {
+    for (index, (transition, routed_edge)) in transitions.iter().zip(&routed).enumerate() {
+        let Some(routed_edge) = routed_edge else {
+            if transition.from == transition.to
+                && let Some(pos) = position_of(&transition.from)
+            {
+                let (t_svg, extent) = render_state_self_transition(
+                    transition,
+                    pos,
+                    style,
+                    measure,
+                    &mut occupied_labels,
+                );
+                svg.push_str(&t_svg);
+                extents.push(extent);
+            }
             continue;
         };
-        if transition.from == transition.to {
-            let (t_svg, extent) = render_state_self_transition(
-                transition,
-                from,
-                style,
-                measure,
-                &mut occupied_labels,
-            );
-            svg.push_str(&t_svg);
-            extents.push(extent);
-            continue;
-        }
-
-        let edge = StateEdge::new(
-            from,
-            to,
-            RouteSlot::new(transition, route_index, route_total),
-        );
-        let route = edge.route(&Blockers::new(obstacles, edge.from_center, edge.to_center));
-        svg.push_str(&emit_route(&route, style));
+        let route = &routed_edge.1;
+        svg.push_str(&emit_route(route, style));
         let mut extent_points = route.points.clone();
         if let Some(label) = &transition.label {
+            let other_routes: Vec<&StateRoute> = routed
+                .iter()
+                .enumerate()
+                .filter(|&(other, _)| other != index)
+                .filter_map(|(_, routed)| routed.as_ref().map(|(_, route)| route))
+                .collect();
             let (pill, rect) = place_state_label(
                 label,
-                &edge,
-                route.label_anchor,
+                routed_edge,
+                &other_routes,
                 obstacles,
                 &mut occupied_labels,
                 style,
@@ -1781,12 +1799,36 @@ fn emit_route(route: &StateRoute, style: &DiagramStyle) -> String {
     svg
 }
 
-/// Places `label` near `anchor`, trying spots beside the center-to-center
-/// line and scoring overlap with states and earlier labels plus distance moved.
+/// Point and unit tangent at fraction `t` of the length of `points`.
+fn polyline_at(points: &[(f32, f32)], t: f32) -> ((f32, f32), (f32, f32)) {
+    let length = |((x1, y1), (x2, y2)): ((f32, f32), (f32, f32))| (x2 - x1).hypot(y2 - y1);
+    let segments = || points.windows(2).map(|w| (w[0], w[1]));
+    let mut remaining = segments().map(length).sum::<f32>() * t;
+    let mut at = (points[0], (1.0, 0.0));
+    // Zero-length segments, as in a Z between states at equal height, have
+    // no direction.
+    for segment @ ((x1, y1), end) in segments().filter(|&s| length(s) > 1e-3) {
+        let len = length(segment);
+        let tangent = ((end.0 - x1) / len, (end.1 - y1) / len);
+        if remaining <= len {
+            return (
+                (x1 + tangent.0 * remaining, y1 + tangent.1 * remaining),
+                tangent,
+            );
+        }
+        remaining -= len;
+        at = (end, tangent);
+    }
+    at
+}
+
+/// Places `label` beside the drawn `route`, trying spots along its middle
+/// and scoring overlap with states, earlier labels and `other_routes` plus
+/// distance moved from the route's label anchor.
 fn place_state_label(
     label: &str,
-    edge: &StateEdge,
-    anchor: (f32, f32),
+    (edge, route): &(StateEdge, StateRoute),
+    other_routes: &[&StateRoute],
     obstacles: &[Rect],
     occupied_labels: &mut Vec<Rect>,
     style: &DiagramStyle,
@@ -1795,16 +1837,20 @@ fn place_state_label(
     let label_font = style.font_size * 0.85;
     let (label_width, label_height) = pill_size(measure, label, label_font);
     let slot = &edge.slot;
-    let ((px1, py1), (px2, py2)) = (edge.start, edge.end);
-    let dx = px2 - px1;
-    let dy = py2 - py1;
-    let len = (dx * dx + dy * dy).sqrt().max(1.0);
-    let tx = dx / len;
-    let ty = dy / len;
-    let perp_x = -ty;
-    let perp_y = tx;
-    let tangent_offset = slot.lane_offset + slot.global_lane * 6.0;
-    let (anchor_x, anchor_y) = anchor;
+    let tangent_offset = slot.global_lane * 6.0;
+    let (anchor_x, anchor_y) = route.label_anchor;
+    // Among straight parallel transitions, a label beside an inner lane
+    // would cover its neighbour, so it sits on its own line; the outermost
+    // lanes put theirs on the outer side. Side 0 means on the line.
+    let sides = match route.points[..] {
+        [_, _] if slot.lane.abs() < slot.max_lane => vec![0.0],
+        [(x1, y1), (x2, y2)] if slot.lane != 0.0 => {
+            let ((fx, fy), (tx, ty)) = (edge.from_center, edge.to_center);
+            let (mx, my) = ((x1 + x2) / 2.0, (y1 + y2) / 2.0);
+            vec![((tx - fx) * (my - fy) - (ty - fy) * (mx - fx)).signum()]
+        }
+        _ => vec![slot.side, -slot.side],
+    };
 
     let score = |lx: f32, ly: f32| -> f32 {
         let r = Rect::new(
@@ -1827,6 +1873,15 @@ fn place_state_label(
                 s += 220.0;
             }
         }
+        for other in other_routes {
+            let crosses = other.points.windows(2).any(|segment| {
+                let ((x1, y1), (x2, y2)) = (segment[0], segment[1]);
+                line_intersects_rect(x1, y1, x2, y2, &r)
+            });
+            if crosses {
+                s += 60.0;
+            }
+        }
         s
     };
     let movement_weight = 2.0;
@@ -1835,46 +1890,33 @@ fn place_state_label(
         (score(lx, ly) + mv * movement_weight, mv)
     };
 
-    let base_dist = 28.0 + slot.lane.abs() * 10.0 + slot.global_lane.abs() * 4.0;
-    let mut best = (
-        anchor_x + perp_x * base_dist * slot.side + tx * tangent_offset,
-        anchor_y + perp_y * base_dist * slot.side + ty * tangent_offset,
-    );
-    let (mut best_cost, mut best_move) = cost_and_move(best.0, best.1);
-
-    let sides = [slot.side, -slot.side];
-    let dists = [24.0, 34.0, 44.0, 54.0, 66.0, 78.0];
-    let mut candidates = Vec::new();
+    // Center of a pill whose nearest edge is `gap` from the route, on the
+    // left of its direction for `side` 1 and the right for -1.
+    let beside = |t: f32, side: f32, gap: f32| {
+        let ((ax, ay), (tx, ty)) = polyline_at(&route.points, t);
+        let reach = gap + label_width / 2.0 * ty.abs() + label_height / 2.0 * tx.abs();
+        (
+            ax - ty * reach * side + tx * tangent_offset,
+            ay + tx * reach * side + ty * tangent_offset,
+        )
+    };
+    let mut best = None;
     for t in [0.38, 0.46, 0.5, 0.54, 0.62] {
-        let ax = px1 + dx * t;
-        let ay = py1 + dy * t;
-        for side in sides {
-            for dist in dists {
-                candidates.push((
-                    ax + perp_x * dist * side + tx * tangent_offset,
-                    ay + perp_y * dist * side + ty * tangent_offset,
-                ));
+        for &side in &sides {
+            for gap in [8.0, 14.0, 24.0, 34.0, 44.0, 56.0, 68.0] {
+                let (lx, ly) = beside(t, side, gap);
+                let (cost, mv) = cost_and_move(lx, ly);
+                if best.is_none_or(|(best_cost, best_move, _): (f32, f32, _)| {
+                    cost < best_cost || ((cost - best_cost).abs() < f32::EPSILON && mv < best_move)
+                }) {
+                    best = Some((cost, mv, (lx, ly)));
+                }
             }
         }
     }
-    // Side-lane routes run vertically, so also try shifting straight sideways.
-    if edge.verticalish {
-        for side in sides {
-            for dist in dists {
-                candidates.push((anchor_x + side * dist, anchor_y + slot.lane_offset * 0.5));
-            }
-        }
-    }
-    for (lx, ly) in candidates {
-        let (cost, mv) = cost_and_move(lx, ly);
-        if cost < best_cost || ((cost - best_cost).abs() < f32::EPSILON && mv < best_move) {
-            best_cost = cost;
-            best_move = mv;
-            best = (lx, ly);
-        }
-    }
+    let (_, _, center) = best.expect("label candidates are never empty");
 
-    let (pill, rect) = label_pill(measure, style, label, label_font, best);
+    let (pill, rect) = label_pill(measure, style, label, label_font, center);
     occupied_labels.push(rect);
     (pill, rect)
 }
@@ -2768,6 +2810,98 @@ Note right of Child: child note"#,
             gaps.len() == 1 && gaps[0] >= 8,
             "expected two lines at least 8 px apart on row {row}, got ink at {xs:?}"
         );
+    }
+
+    /// A transition's drawn points and the center of its label.
+    type LabeledRoute = (Vec<(f32, f32)>, (f32, f32));
+
+    /// Each labeled transition's route and label, in SVG order. Labels on
+    /// self-transition loops are not told apart.
+    fn routes_with_labels(svg: &str) -> Vec<LabeledRoute> {
+        let style = test_style();
+        let mut reader = Reader::from_str(svg);
+        let mut routes: Vec<Vec<(f32, f32)>> = Vec::new();
+        let mut labeled = Vec::new();
+        loop {
+            let e = match reader.read_event().unwrap() {
+                Event::Empty(e) | Event::Start(e) => e,
+                Event::Eof => break,
+                _ => continue,
+            };
+            let attr = |name: &str| {
+                e.try_get_attribute(name)
+                    .unwrap()
+                    .map(|a| a.value.into_owned())
+            };
+            let num = |name: &str| attr(name).unwrap().parse::<f32>().unwrap();
+            let is_edge_stroke = attr("stroke").as_deref() == Some(style.edge_stroke.as_str());
+            match e.name().as_ref() {
+                "line" if is_edge_stroke => {
+                    routes.push(vec![(num("x1"), num("y1")), (num("x2"), num("y2"))]);
+                }
+                "polyline" if is_edge_stroke => routes.push(
+                    attr("points")
+                        .unwrap()
+                        .split_whitespace()
+                        .map(|p| {
+                            let (x, y) = p.split_once(',').unwrap();
+                            (x.parse().unwrap(), y.parse().unwrap())
+                        })
+                        .collect(),
+                ),
+                "text" if attr("fill").as_deref() == Some(style.edge_text.as_str()) => {
+                    labeled.push((routes.last().unwrap().clone(), (num("x"), num("y"))));
+                }
+                _ => {}
+            }
+        }
+        labeled
+    }
+
+    fn distance_to_route(route: &[(f32, f32)], (px, py): (f32, f32)) -> f32 {
+        route
+            .windows(2)
+            .map(|w| {
+                let ((x1, y1), (x2, y2)) = (w[0], w[1]);
+                let (dx, dy) = (x2 - x1, y2 - y1);
+                let len2 = (dx * dx + dy * dy).max(1e-6);
+                let t = (((px - x1) * dx + (py - y1) * dy) / len2).clamp(0.0, 1.0);
+                (px - x1 - dx * t).hypot(py - y1 - dy * t)
+            })
+            .fold(f32::MAX, f32::min)
+    }
+
+    #[test]
+    fn transition_labels_sit_nearest_their_own_lines() {
+        for source in [
+            // S2 --> S1 runs along the bottom of the triangle.
+            "stateDiagram-v2\nS0 --> S2: L0\nS0 --> S1: L1\nS2 --> S1: L2",
+            // Stacked states joined by vertical lanes.
+            "stateDiagram-v2\nA --> B: go\nB --> A: back",
+            "stateDiagram-v2\nA --> B: x\nA --> B: y\nB --> A: z",
+            // C keeps B out of A's column, so the lanes run diagonally.
+            "stateDiagram-v2\nA --> B: go\nB --> A: back\nA --> C",
+        ] {
+            let labeled = routes_with_labels(&render_svg(source));
+            assert_eq!(
+                labeled.len(),
+                source.matches(':').count(),
+                "{source:?}: {labeled:?}"
+            );
+            for (own, center) in &labeled {
+                let own_distance = distance_to_route(own, *center);
+                for (other, _) in &labeled {
+                    if other != own {
+                        let other_distance = distance_to_route(other, *center);
+                        assert!(
+                            own_distance < other_distance,
+                            "{source:?}: label at {center:?} is {own_distance} from its line \
+                             {own:?} but {other_distance} from {other:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
