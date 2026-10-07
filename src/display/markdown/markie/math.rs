@@ -80,6 +80,8 @@ pub fn render_math<T: TextMeasure>(
     let mathml =
         latex_to_mathml(&latex, style).map_err(|e| format!("LaTeX parse error: {:?}", e))?;
 
+    // latex2mathml closes `\bigl(` and friends with a misspelled `</mro>`.
+    let mathml = mathml.replace("</mro>", "</mo>");
     let root = parse_mathml(&escape_leaf_text(&mathml))?;
     let mbox = MathLayout {
         measure,
@@ -97,12 +99,64 @@ pub fn render_math<T: TextMeasure>(
     })
 }
 
+/// Common LaTeX commands latex2mathml does not know, mapped to spellings it
+/// does. Size and style hints map to nothing, so their argument renders at
+/// its normal size instead of next to a parse error.
+const COMMAND_ALIASES: &[(&str, &str)] = &[
+    ("le", r"\leq"),
+    ("ge", r"\geq"),
+    ("neg", r"\lnot"),
+    ("dots", r"\ldots"),
+    ("varnothing", r"\emptyset"),
+    ("ast", "*"),
+    ("gcd", r"\operatorname{gcd}"),
+    ("dfrac", r"\frac"),
+    ("tfrac", r"\frac"),
+    ("vert", "|"),
+    ("lvert", "|"),
+    ("rvert", "|"),
+    ("Vert", r"\|"),
+    ("lVert", r"\|"),
+    ("rVert", r"\|"),
+    ("displaystyle", ""),
+    ("textstyle", ""),
+    ("limits", ""),
+    ("big", ""),
+    ("Big", ""),
+    ("bigg", ""),
+    ("Bigg", ""),
+];
+
+fn replace_command_aliases(latex: &str) -> String {
+    let mut result = String::with_capacity(latex.len());
+    let mut rest = latex;
+    while let Some(pos) = rest.find('\\') {
+        result.push_str(&rest[..pos]);
+        let after = &rest[pos + 1..];
+        let name_len = after
+            .find(|c: char| !c.is_ascii_alphabetic())
+            .unwrap_or(after.len());
+        // `\\` is a row break; copy it whole so its second backslash does
+        // not start a command.
+        let len = name_len.max(after.chars().next().map_or(0, char::len_utf8));
+        let name = &after[..name_len];
+        match COMMAND_ALIASES.iter().find(|(alias, _)| *alias == name) {
+            Some((_, replacement)) => result.push_str(replacement),
+            None => result.push_str(&rest[pos..pos + 1 + len]),
+        }
+        rest = &after[len..];
+    }
+    result.push_str(rest);
+    result
+}
+
 /// Map unsupported LaTeX environments to supported equivalents for latex2mathml.
 ///
 /// These replacements are safe from false substring matches because `\begin{` and
 /// `\end{` are LaTeX command sequences that won't appear as arbitrary substrings
 /// in well-formed LaTeX input.
 fn preprocess_latex(latex: &str) -> String {
+    let latex = replace_command_aliases(latex);
     let mut result = String::with_capacity(latex.len());
 
     // aligned → align (supported by latex2mathml)
@@ -1158,6 +1212,31 @@ mod tests {
                 result.svg_fragment
             );
         }
+    }
+
+    #[test]
+    fn command_aliases_render_like_their_supported_spelling() {
+        let mut measure = MockMeasure;
+        let mut svg = |latex: &str| {
+            render_math(latex, 16.0, "#000000", &mut measure, false)
+                .unwrap_or_else(|err| panic!("{latex} failed to render: {err}"))
+                .svg_fragment
+        };
+        for (alias, supported) in [
+            (r"a \le b \ge c", r"a \leq b \geq c"),
+            (r"\neg p, \dots", r"\lnot p, \ldots"),
+            (r"\dfrac{a}{b} + \tfrac{c}{d}", r"\frac{a}{b} + \frac{c}{d}"),
+            (r"\lvert x \rvert + \Vert y \Vert", r"| x | + \| y \|"),
+            (r"\displaystyle\sum\limits_i \big( x \big)", r"\sum_i ( x )"),
+            // A row break followed by letters is not a command.
+            (
+                r"\begin{matrix} a \\le \end{matrix}",
+                r"\begin{matrix} a \\ le \end{matrix}",
+            ),
+        ] {
+            assert_eq!(svg(alias), svg(supported), "{alias}");
+        }
+        assert!(!svg(r"\bigl( x \bigr)").contains("PARSE ERROR"));
     }
 
     #[test]
