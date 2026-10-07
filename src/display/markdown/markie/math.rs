@@ -1195,6 +1195,74 @@ mod tests {
         }
     }
 
+    /// Leftmost and rightmost inked columns of image row `y` between columns
+    /// `x0..x1` of the formula box, in formula coordinates.
+    fn ink_span(image: &image::RgbaImage, y: u32, x0: f32, x1: f32) -> Option<(f32, f32)> {
+        let first = (x0 + RASTER_PAD).floor() as u32;
+        let last = ((x1 + RASTER_PAD).ceil() as u32).min(image.width());
+        let inked: Vec<u32> = (first..last)
+            .filter(|&x| image.get_pixel(x, y)[3] > 64)
+            .collect();
+        Some((
+            *inked.first()? as f32 - RASTER_PAD,
+            *inked.last()? as f32 + 1.0 - RASTER_PAD,
+        ))
+    }
+
+    #[test]
+    fn stretched_braces_point_their_tip_at_mid_height() {
+        let font_size = 32.0;
+        let width = stretched_delimiter_width("{", font_size);
+        let render = |latex: &str| {
+            let result = render_math(latex, font_size, "#000000", &mut MockMeasure, true).unwrap();
+            let image = rasterize(&result);
+            (result, image)
+        };
+        let (open, open_image) = render(r"\left\{\begin{matrix}a\\b\\c\end{matrix}\right.");
+        let (close, close_image) = render(r"\left.\begin{matrix}a\\b\\c\end{matrix}\right\}");
+        let close_x0 = close.width - width;
+
+        // The matrix is centered on the baseline, so the tip sits on it.
+        let mid_row = (open.ascent + RASTER_PAD) as u32;
+        let rows: Vec<u32> = (0..open_image.height())
+            .filter(|&y| ink_span(&open_image, y, 0.0, width).is_some())
+            .collect();
+        let (top_row, bottom_row) = (rows[0], rows[rows.len() - 1]);
+
+        // `{`: the ends curl to the right edge and the tip sits at 0.48 of the
+        // width; `}` mirrors it.
+        let (left, right) = ink_span(&open_image, mid_row, 0.0, width).unwrap();
+        let tip = (left + right) / 2.0;
+        assert!(
+            (tip - width * 0.48).abs() <= 1.5,
+            "{{ tip at {tip}, expected near {}",
+            width * 0.48
+        );
+        for y in [top_row, bottom_row] {
+            let (left, right) = ink_span(&open_image, y, 0.0, width).unwrap();
+            assert!(
+                left >= width * 0.5 && right >= width * 0.85,
+                "{{ end at row {y} spans {left}..{right}, expected at the right edge"
+            );
+        }
+
+        // Comparing every row against the mirrored `}` catches a control
+        // point moved in only one of the two paths.
+        for y in 0..open_image.height() {
+            let open_span = ink_span(&open_image, y, 0.0, width);
+            let close_span = ink_span(&close_image, y, close_x0, close.width)
+                .map(|(left, right)| (close.width - right, close.width - left));
+            match (open_span, close_span) {
+                (None, None) => {}
+                (Some(open), Some(mirrored)) => assert!(
+                    (open.0 - mirrored.0).abs() <= 1.0 && (open.1 - mirrored.1).abs() <= 1.0,
+                    "row {y}: {{ ink {open:?} differs from mirrored }} ink {mirrored:?}"
+                ),
+                _ => panic!("row {y}: {{ ink {open_span:?} vs mirrored }} ink {close_span:?}"),
+            }
+        }
+    }
+
     #[test]
     fn test_preprocess_latex_handles_unclosed_array_spec() {
         // Malformed input must terminate and still rewrite the environment.
