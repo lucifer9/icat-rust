@@ -1266,6 +1266,8 @@ struct RouteSlot {
     /// Offset among parallel transitions, centered on 0.
     lane: f32,
     lane_offset: f32,
+    /// Largest `|lane|` among the parallel transitions.
+    max_lane: f32,
     /// Name-derived spread in -2..=2 that keeps unrelated labels apart.
     global_lane: f32,
     /// Preferred side for lanes and labels.
@@ -1290,6 +1292,7 @@ impl RouteSlot {
             hash,
             lane,
             lane_offset: lane * 30.0,
+            max_lane: (total as f32 - 1.0) / 2.0,
             global_lane: (hash % 5) as f32 - 2.0,
             // Self transitions are drawn as loops, so the names always differ here.
             side: if transition.from < transition.to {
@@ -1317,6 +1320,40 @@ fn state_anchor(rect: &Rect, angle: f32) -> (f32, f32) {
     } else {
         rect_boundary_point(rect, angle)
     }
+}
+
+/// Half the width of `rect` measured across a line at `angle`.
+fn cross_half_extent(rect: &Rect, angle: f32) -> f32 {
+    if is_round_state(rect) {
+        rect.w / 2.0
+    } else {
+        rect.w / 2.0 * angle.sin().abs() + rect.h / 2.0 * angle.cos().abs()
+    }
+}
+
+/// Where a ray at `angle`, starting `offset` to the left of the center of
+/// `rect`, leaves `rect`. `offset` must stay below `cross_half_extent`.
+fn shifted_anchor(rect: &Rect, angle: f32, offset: f32) -> (f32, f32) {
+    let (cx, cy) = rect.center();
+    let (dx, dy) = (angle.cos(), angle.sin());
+    let (ox, oy) = (cx - dy * offset, cy + dx * offset);
+    let t = if is_round_state(rect) {
+        let r = rect.w / 2.0;
+        (r * r - offset * offset).sqrt()
+    } else {
+        // Distance along the ray to the side it leaves through on one axis.
+        let exit = |d: f32, o: f32, lo: f32, hi: f32| {
+            if d > 1e-5 {
+                (hi - o) / d
+            } else if d < -1e-5 {
+                (lo - o) / d
+            } else {
+                f32::INFINITY
+            }
+        };
+        exit(dx, ox, rect.x, rect.right()).min(exit(dy, oy, rect.y, rect.bottom()))
+    };
+    (ox + dx * t, oy + dy * t)
 }
 
 /// Where a vertical line at `x` leaves `rect` through its bottom or top.
@@ -1454,14 +1491,16 @@ impl<'a> StateEdge<'a> {
                 |(lane_x, _)| lane_x,
             );
             self.side_lane_route(lane_x)
-        } else if blockers.crosses(self.start, self.end) {
-            self.detour_route(blockers)
-        } else {
+        } else if let Some(segment) = [1.0, 0.5]
+            .map(|spacing| self.parallel_segment(spacing))
+            .into_iter()
+            .find(|&(start, end)| !blockers.crosses(start, end))
+        {
             // Jitter the label anchor along the edge to reduce label-label collisions.
-            let ((x1, y1), (x2, y2)) = (self.start, self.end);
             let jitter = ((self.slot.hash % 7) as f32 - 3.0) * 0.07;
-            let t = (0.5 + jitter).clamp(0.25, 0.75);
-            self.straight_route((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t))
+            self.straight_route(segment, (0.5 + jitter).clamp(0.25, 0.75))
+        } else {
+            self.detour_route(blockers)
         }
     }
 
@@ -1478,10 +1517,7 @@ impl<'a> StateEdge<'a> {
                 self.u_route(lane_y)
             }
             (_, Some((lane_x, _))) => self.side_lane_route(lane_x),
-            _ => {
-                let ((x1, y1), (x2, y2)) = (self.start, self.end);
-                self.straight_route(((x1 + x2) / 2.0, (y1 + y2) / 2.0))
-            }
+            _ => self.straight_route(self.parallel_segment(1.0), 0.5),
         }
     }
 
@@ -1508,11 +1544,35 @@ impl<'a> StateEdge<'a> {
         })
     }
 
-    fn straight_route(&self, label_anchor: (f32, f32)) -> StateRoute {
+    /// Draws `segment` with the label anchored at fraction `t` along it.
+    fn straight_route(&self, segment: ((f32, f32), (f32, f32)), t: f32) -> StateRoute {
+        let ((x1, y1), (x2, y2)) = segment;
         StateRoute {
-            points: vec![self.start, self.end],
-            label_anchor,
+            points: vec![(x1, y1), (x2, y2)],
+            label_anchor: (x1 + (x2 - x1) * t, y1 + (y2 - y1) * t),
         }
+    }
+
+    /// The center-to-center line shifted sideways by this transition's lane,
+    /// with `spacing` scaling the gap between lanes. Lanes are counted in the
+    /// pair's canonical direction (`state_pair_key`), so `A --> B` and
+    /// `B --> A` land on opposite sides.
+    fn parallel_segment(&self, spacing: f32) -> ((f32, f32), (f32, f32)) {
+        if self.slot.lane == 0.0 {
+            return (self.start, self.end);
+        }
+        let (fx, fy) = self.from_center;
+        let (tx, ty) = self.to_center;
+        let angle = (ty - fy).atan2(tx - fx);
+        // Keep the outermost lanes well inside both states' cross-sections.
+        let limit =
+            0.6 * cross_half_extent(self.from, angle).min(cross_half_extent(self.to, angle));
+        let lane_gap = (limit / self.slot.max_lane).min(30.0) * spacing;
+        let offset = self.slot.lane * lane_gap * self.slot.side;
+        (
+            shifted_anchor(self.from, angle, offset),
+            shifted_anchor(self.to, angle + std::f32::consts::PI, -offset),
+        )
     }
 
     /// Joins the facing sides with an orthogonal Z through the middle of the
@@ -2679,6 +2739,34 @@ Note right of Child: child note"#,
         assert!(
             x2 > a.right() && x2 < b.x,
             "middle leg outside the gap: {points:?}"
+        );
+    }
+
+    #[test]
+    fn opposite_diagonal_transitions_draw_separate_lines() {
+        // C keeps B out of A's column, so A and B are joined diagonally.
+        let image = rasterize(&render_svg("stateDiagram-v2\nA --> B\nB --> A\nA --> C"));
+        let bands = node_bands(&image);
+        assert_eq!(bands.len(), 2, "expected A above B and C, got {bands:?}");
+        let ((a_left, _, _, a_bottom), (b_left, b_top, _, _)) = (bands[0], bands[1]);
+        assert!(b_left + 40 < a_left, "B must sit left of A: {bands:?}");
+        let row = (a_bottom + b_top) / 2;
+        // Columns left of A hold only the diagonal transitions on this row;
+        // thin diagonal lines are faint, so match their hue at any coverage.
+        let xs: Vec<u32> = (0..a_left)
+            .filter(|&x| {
+                let p = image.get_pixel(x, row);
+                p[3] > 32 && p[2] > p[0] && p[2] > p[1]
+            })
+            .collect();
+        let gaps: Vec<u32> = xs
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .filter(|&g| g > 1)
+            .collect();
+        assert!(
+            gaps.len() == 1 && gaps[0] >= 8,
+            "expected two lines at least 8 px apart on row {row}, got ink at {xs:?}"
         );
     }
 
