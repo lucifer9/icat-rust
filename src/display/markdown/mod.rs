@@ -683,6 +683,13 @@ fn collect_table(
 
 // ── AST utilities ─────────────────────────────────────────────────────────────
 
+fn warn_math_failed(err: &str) {
+    eprintln!(
+        "Warning: failed to render math: {}",
+        crate::cli::sanitize_control_chars(err)
+    );
+}
+
 fn flatten_tokens(tokens: &[InlineToken]) -> String {
     let mut s = String::new();
     for t in tokens {
@@ -758,7 +765,7 @@ fn layout_document(
             } => doc.list(items, *ordered, *tight)?,
             Block::BlockQuote(children) => doc.block_quote(children),
             Block::Code { lang, text } => doc.code(lang, text),
-            Block::Math(text) => doc.math(text, true)?,
+            Block::Math(text) => doc.math(text, true),
             Block::Rule => doc.rule(),
             Block::Table { header, rows } => doc.table(header, rows)?,
         }
@@ -812,7 +819,7 @@ impl DocBuilder<'_> {
                     ));
                 }
             }
-            [InlineToken::Math { text, display }] => self.math(text, *display)?,
+            [InlineToken::Math { text, display }] => self.math(text, *display),
             _ if !flatten_tokens(tokens).trim().is_empty()
                 || tokens
                     .iter()
@@ -940,14 +947,18 @@ impl DocBuilder<'_> {
         self.push_advance(block, CODE_BLOCK_GAP);
     }
 
-    fn math(&mut self, text: &str, display: bool) -> Result<(), Box<dyn std::error::Error>> {
-        let rendered = math::render_math(text, self.font_system, self.font_size as f32, display)
-            .map_err(|err| format!("failed to render math: {err}"))?;
-        self.push_centered_image(scale_markdown_image_to_width(
-            &rendered.image,
-            self.content_width,
-        ));
-        Ok(())
+    fn math(&mut self, text: &str, display: bool) {
+        match math::render_math(text, self.font_system, self.font_size as f32, display) {
+            Ok(rendered) => self.push_centered_image(scale_markdown_image_to_width(
+                &rendered.image,
+                self.content_width,
+            )),
+            // Show the LaTeX source instead of dropping the rest of the document.
+            Err(err) => {
+                warn_math_failed(&err);
+                self.code("latex", text);
+            }
+        }
     }
 
     fn rule(&mut self) {
@@ -1347,9 +1358,19 @@ fn layout_inline_tokens(
                 push_inline_words(font_system, &mut lines, text, width, font_size, style);
             }
             InlineToken::Math { text, display } => {
-                let rendered = math::render_math(text, font_system, font_size, *display)
-                    .map_err(|err| format!("failed to render math: {err}"))?;
-                push_inline_image(&mut lines, rendered.image, rendered.baseline, width);
+                match math::render_math(text, font_system, font_size, *display) {
+                    Ok(rendered) => {
+                        push_inline_image(&mut lines, rendered.image, rendered.baseline, width)
+                    }
+                    Err(err) => {
+                        warn_math_failed(&err);
+                        let style = InlineStyle {
+                            mono: true,
+                            ..InlineStyle::default()
+                        };
+                        push_inline_words(font_system, &mut lines, text, width, font_size, style);
+                    }
+                }
             }
             InlineToken::SoftBreak => {
                 let space_width = cached_space_width(font_system, font_size);
@@ -2834,12 +2855,41 @@ $$
             "stateDiagram\n    state \"unterminated",
             "pie title Pets\n    \"Dogs\" : 386",
         ] {
-            assert_mermaid_falls_back_to_code_block(diagram);
+            assert_falls_back_to_code_block(&format!("```mermaid\n{diagram}\n```"));
         }
     }
 
-    fn assert_mermaid_falls_back_to_code_block(diagram: &str) {
-        let md = format!("```mermaid\n{diagram}\n```\n\nAfter diagram.\n");
+    #[test]
+    fn math_render_error_falls_back_to_source() {
+        let unknown = r"\begin{unknown}x\end{unknown}";
+        assert_falls_back_to_code_block(&format!("$$\n{unknown}\n$$"));
+
+        // Inline math falls back to its source text within the paragraph.
+        let md = format!("Before ${unknown}$ after.\n");
+        let image = render_markdown(md.as_bytes(), Path::new(""), 800).unwrap();
+        let plain = render_markdown(b"Before  after.\n", Path::new(""), 800).unwrap();
+        assert!(
+            ink_columns(&image) > ink_columns(&plain),
+            "the inline LaTeX source should render as text"
+        );
+    }
+
+    fn ink_columns(image: &DynamicImage) -> usize {
+        let rgba = image.to_rgba8();
+        (0..rgba.width())
+            .filter(|&x| {
+                (0..rgba.height()).any(|y| {
+                    let p = rgba.get_pixel(x, y);
+                    p[0] < 160 && p[1] < 160 && p[2] < 160
+                })
+            })
+            .count()
+    }
+
+    /// Renders `block` followed by a paragraph and checks that the block shows
+    /// up as a code block with text and the paragraph still renders.
+    fn assert_falls_back_to_code_block(block: &str) {
+        let md = format!("{block}\n\nAfter block.\n");
         let image = render_markdown(md.as_bytes(), Path::new(""), 800).unwrap();
         let rgba = image.to_rgba8();
         let code_rows: Vec<u32> = (0..rgba.height())
@@ -2859,11 +2909,11 @@ $$
         };
         assert!(
             ink_in(code_top, code_bottom),
-            "the Mermaid source should render as code text: {diagram}"
+            "the source should render as code text: {block}"
         );
         assert!(
             ink_in(code_bottom + 1, rgba.height()),
-            "the paragraph after the failed diagram should render: {diagram}"
+            "the paragraph after the failed block should render: {block}"
         );
     }
 
