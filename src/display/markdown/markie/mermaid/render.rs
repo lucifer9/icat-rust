@@ -1515,35 +1515,65 @@ impl<'a> StateEdge<'a> {
         }
     }
 
-    /// Leaves the facing sides vertically and crosses over at mid-height,
-    /// if that path is clear.
+    /// Joins the facing sides with an orthogonal Z through the middle of the
+    /// gap between the states: top and bottom ports when they are stacked,
+    /// side midpoints when they sit side by side. Tries the axis with the
+    /// wider gap first.
     fn z_route(&self, blockers: &Blockers) -> Option<StateRoute> {
+        let (from, to) = (self.from, self.to);
         let (from_cx, from_cy) = self.from_center;
         let (to_cx, to_cy) = self.to_center;
-        let going_right = to_cx > from_cx;
-        let from_x = if going_right {
-            self.from.right()
-        } else {
-            self.from.x
+        let vertical = {
+            let down = to_cy > from_cy;
+            let from_y = if down { from.bottom() } else { from.y };
+            let to_y = if down { to.y } else { to.bottom() };
+            let mid_y = (from_y + to_y) / 2.0;
+            // Ports a quarter width toward each other leave the centers to
+            // vertical transitions.
+            let toward = (to_cx - from_cx).signum();
+            let (from_x, to_x) = if is_round_state(from) || is_round_state(to) {
+                (from_cx, to_cx)
+            } else {
+                (from_cx + toward * from.w / 4.0, to_cx - toward * to.w / 4.0)
+            };
+            vec![
+                (from_x, from_y),
+                (from_x, mid_y),
+                (to_x, mid_y),
+                (to_x, to_y),
+            ]
         };
-        let to_x = if going_right {
-            self.to.x
-        } else {
-            self.to.right()
+        let horizontal = {
+            let right = to_cx > from_cx;
+            let from_x = if right { from.right() } else { from.x };
+            let to_x = if right { to.x } else { to.right() };
+            let mid_x = (from_x + to_x) / 2.0;
+            vec![
+                (from_x, from_cy),
+                (mid_x, from_cy),
+                (mid_x, to_cy),
+                (to_x, to_cy),
+            ]
         };
-        let mid_y = (from_cy + to_cy) / 2.0;
-        let points = vec![
-            (from_x, from_cy),
-            (from_x, mid_y),
-            (to_x, mid_y),
-            (to_x, to_cy),
-        ];
-        if !blockers.orthogonal_clear(&points) {
-            return None;
+        // The middle leg crosses this gap, so the states need room between them.
+        let v_gap = (to.y - from.bottom()).max(from.y - to.bottom());
+        let h_gap = (to.x - from.right()).max(from.x - to.right());
+        let mut candidates = [(v_gap, vertical), (h_gap, horizontal)];
+        if h_gap > v_gap {
+            candidates.reverse();
         }
+        let points = candidates
+            .into_iter()
+            .filter(|(gap, _)| *gap >= 16.0)
+            .map(|(_, points)| points)
+            .find(|points| blockers.orthogonal_clear(points))?;
+        let label_anchor = (
+            (points[1].0 + points[2].0) / 2.0,
+            (points[1].1 + points[2].1) / 2.0,
+        );
         Some(StateRoute {
             points,
-            label_anchor: ((from_x + to_x) / 2.0, mid_y),
+            label_anchor,
         })
     }
 
@@ -2573,6 +2603,83 @@ Note right of Child: child note"#,
             .filter(|&(x, y)| (x + 3 < left || x > right + 3) && ink(x, y))
             .count();
         assert_eq!(side_ink, 0, "edge detours beside the states");
+    }
+
+    /// Routes a transition from `from` to `to` around `blocker`, which sits
+    /// on the straight line between them.
+    fn route_around(from: Rect, to: Rect, blocker: Rect) -> Vec<(f32, f32)> {
+        let transition = StateTransition {
+            from: "A".into(),
+            to: "B".into(),
+            label: None,
+        };
+        let edge = StateEdge::new(&from, &to, RouteSlot::new(&transition, 0, 1));
+        assert!(!edge.verticalish);
+        let obstacles = [from, to, blocker];
+        let blockers = Blockers::new(&obstacles, edge.from_center, edge.to_center);
+        assert!(
+            blockers.crosses(edge.start, edge.end),
+            "blocker misses the chord"
+        );
+        edge.route(&blockers).points
+    }
+
+    #[test]
+    fn stacked_states_join_through_facing_borders() {
+        // B sits up and to the right of A; the diagonal is blocked.
+        let (a, b) = (
+            Rect::new(0.0, 300.0, 120.0, 40.0),
+            Rect::new(300.0, 0.0, 120.0, 40.0),
+        );
+        let points = route_around(a, b, Rect::new(120.0, 230.0, 30.0, 30.0));
+        let [(x1, y1), (x2, y2), (x3, y3), (x4, y4)] = points[..] else {
+            panic!("expected a Z route, got {points:?}");
+        };
+        assert!(
+            x1 == x2 && x3 == x4 && y2 == y3,
+            "not a vertical Z: {points:?}"
+        );
+        assert!(
+            y1 == a.y && (a.x..a.right()).contains(&x1),
+            "leaves A off its top: {points:?}"
+        );
+        assert!(
+            y4 == b.bottom() && (b.x..b.right()).contains(&x4),
+            "enters B off its bottom: {points:?}"
+        );
+        assert!(
+            y2 < a.y && y2 > b.bottom(),
+            "middle leg outside the gap: {points:?}"
+        );
+    }
+
+    #[test]
+    fn side_by_side_states_join_through_facing_sides() {
+        // B sits to the right of A and a little lower; the diagonal is blocked.
+        let (a, b) = (
+            Rect::new(0.0, 0.0, 120.0, 40.0),
+            Rect::new(300.0, 100.0, 120.0, 40.0),
+        );
+        let points = route_around(a, b, Rect::new(140.0, 40.0, 20.0, 20.0));
+        let [(x1, y1), (x2, y2), (x3, y3), (x4, y4)] = points[..] else {
+            panic!("expected a Z route, got {points:?}");
+        };
+        assert!(
+            y1 == y2 && y3 == y4 && x2 == x3,
+            "not a horizontal Z: {points:?}"
+        );
+        assert!(
+            x1 == a.right() && y1 == a.center().1,
+            "leaves A off its right side: {points:?}"
+        );
+        assert!(
+            x4 == b.x && y4 == b.center().1,
+            "enters B off its left side: {points:?}"
+        );
+        assert!(
+            x2 > a.right() && x2 < b.x,
+            "middle leg outside the gap: {points:?}"
+        );
     }
 
     #[test]
