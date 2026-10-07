@@ -577,96 +577,77 @@ impl<T: TextMeasure> MathLayout<'_, T> {
                     svg: format!("{}{}{}", num_rendered.svg, rule_svg, den_rendered.svg),
                 }
             }
-            MathNode::Sqrt { radicand } => {
-                let inner = self.extent(radicand, font_size);
-
-                let radical_width = font_size * 0.6;
-                let padding = font_size * 0.1;
-                let overbar_gap = font_size * 0.15;
-                let total_width = radical_width + inner.width + padding;
-
-                let inner_box = self.layout(radicand, font_size, x + radical_width, baseline_y);
-
-                let top_y = baseline_y - inner_box.ascent - overbar_gap;
-                let bottom_y = baseline_y + inner_box.descent;
-
-                let radical_svg = format!(
-                    r#"<path d="M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}" stroke="{}" stroke-width="1.2" fill="none" />"#,
-                    x,
-                    baseline_y - font_size * 0.15,
-                    x + radical_width * 0.35,
-                    baseline_y,
-                    x + radical_width * 0.6,
-                    top_y,
-                    x + radical_width + inner_box.width + padding,
-                    top_y,
-                    self.color
-                );
-
-                let ascent = (baseline_y - top_y).max(inner_box.ascent + overbar_gap);
-                let descent = inner_box.descent.max(bottom_y - baseline_y);
-
-                MathBox {
-                    width: total_width,
-                    ascent,
-                    descent,
-                    svg: format!("{}{}", radical_svg, inner_box.svg),
-                }
-            }
+            MathNode::Sqrt { radicand } => self.radical(radicand, None, font_size, x, baseline_y),
             MathNode::Root { radicand, index } => {
-                let inner = self.extent(radicand, font_size);
-                let index_size = font_size * 0.6;
-
-                let radical_width = font_size * 0.6;
-                let index_width = font_size * 0.5;
-                let padding = font_size * 0.1;
-                let overbar_gap = font_size * 0.15;
-                let total_width = index_width + radical_width + inner.width + padding;
-
-                let inner_box = self.layout(
-                    radicand,
-                    font_size,
-                    x + index_width + radical_width,
-                    baseline_y,
-                );
-
-                let top_y = baseline_y - inner_box.ascent - overbar_gap;
-                let bottom_y = baseline_y + inner_box.descent;
-
-                // Render the index (nth root degree) in the notch
-                let index_baseline = baseline_y - inner_box.ascent * 0.3;
-                let index_box = self.layout(index, index_size, x, index_baseline);
-
-                // Radical symbol with notch for index
-                let radical_svg = format!(
-                    r#"<path d="M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}" stroke="{}" stroke-width="1.2" fill="none" />"#,
-                    x + index_width,
-                    baseline_y - font_size * 0.15,
-                    x + index_width + radical_width * 0.35,
-                    baseline_y,
-                    x + index_width + radical_width * 0.6,
-                    top_y,
-                    x + index_width + radical_width + inner_box.width + padding,
-                    top_y,
-                    x + index_width + radical_width + inner_box.width + padding - font_size * 0.1,
-                    top_y - font_size * 0.05,
-                    self.color
-                );
-
-                let ascent = (baseline_y - top_y).max(inner_box.ascent + overbar_gap);
-                let descent = inner_box.descent.max(bottom_y - baseline_y);
-
-                MathBox {
-                    width: total_width,
-                    ascent,
-                    descent,
-                    svg: format!("{}{}{}", index_box.svg, radical_svg, inner_box.svg),
-                }
+                self.radical(radicand, Some(index), font_size, x, baseline_y)
             }
             MathNode::Table { rows } => self.table(rows, font_size, x, baseline_y),
             MathNode::StretchyOp { op, form } => {
                 self.regular_stretchy_operator(op, form, font_size, x, baseline_y)
             }
+        }
+    }
+
+    /// Lays out a square root, or an nth root when `index` is given.
+    fn radical(
+        &mut self,
+        radicand: &MathNode,
+        index: Option<&MathNode>,
+        font_size: f32,
+        x: f32,
+        baseline_y: f32,
+    ) -> MathBox {
+        let inner = self.extent(radicand, font_size);
+
+        let index_width = index.map_or(0.0, |_| font_size * 0.5);
+        let radical_width = font_size * 0.6;
+        let padding = font_size * 0.1;
+        let overbar_gap = font_size * 0.15;
+        let total_width = index_width + radical_width + inner.width + padding;
+
+        let sign_x = x + index_width;
+        let inner_box = self.layout(radicand, font_size, sign_x + radical_width, baseline_y);
+
+        let top_y = baseline_y - inner_box.ascent - overbar_gap;
+        let bottom_y = baseline_y + inner_box.descent;
+        let bar_end = sign_x + radical_width + inner_box.width + padding;
+
+        // The index sits in the notch, and its overbar ends in a short hook.
+        let (index_svg, hook) = match index {
+            Some(index) => {
+                let index_baseline = baseline_y - inner_box.ascent * 0.3;
+                let index_box = self.layout(index, font_size * 0.6, x, index_baseline);
+                let hook = format!(
+                    " L {:.2} {:.2}",
+                    bar_end - font_size * 0.1,
+                    top_y - font_size * 0.05
+                );
+                (index_box.svg, hook)
+            }
+            None => (String::new(), String::new()),
+        };
+
+        let radical_svg = format!(
+            r#"<path d="M {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2} L {:.2} {:.2}{hook}" stroke="{}" stroke-width="1.2" fill="none" />"#,
+            sign_x,
+            baseline_y - font_size * 0.15,
+            sign_x + radical_width * 0.35,
+            baseline_y,
+            sign_x + radical_width * 0.6,
+            top_y,
+            bar_end,
+            top_y,
+            self.color
+        );
+
+        let ascent = (baseline_y - top_y).max(inner_box.ascent + overbar_gap);
+        let descent = inner_box.descent.max(bottom_y - baseline_y);
+
+        MathBox {
+            width: total_width,
+            ascent,
+            descent,
+            svg: format!("{index_svg}{radical_svg}{}", inner_box.svg),
         }
     }
 
