@@ -13,7 +13,7 @@ pub(super) fn read_zip_image_bytes(
     let mut image_indexes = Vec::new();
     for i in 0..archive.len() {
         let file = archive.by_index_raw(i)?;
-        if !file.is_dir() && has_image_extension(file.name()) {
+        if !file.is_dir() && has_image_extension(&file.name()?) {
             image_indexes.push(i);
         }
     }

@@ -23,7 +23,7 @@ image = { version = "0.25", default-features = false, features = [
   "tiff",
 ] }
 latex2mathml = "0.2"
-lopdf = "0.45"
+lopdf = "0.46"
 pulldown-cmark = "0.13"
 quick-xml = "0.42"
 rand = "0.10"
@@ -31,7 +31,7 @@ rar5 = { git = "https://codeberg.org/librar/rar-rs.git", rev = "4189b38" }
 regex = "1.13"
 resvg = "0.48"
 rustix = { version = "1.1", features = ["fs", "process", "stdio", "termios"] }
-sevenz-rust2 = { version = "0.23", default-features = false, features = [
+sevenz-rust2 = { version = "0.24", default-features = false, features = [
   "aes256",
   "compress",
   "deflate",
@@ -41,7 +41,7 @@ syntect = { version = "5.3", default-features = false, features = [
 ] }
 tar = "0.4"
 tiny-skia = "0.12"
-zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 temp-env = "0.3"
